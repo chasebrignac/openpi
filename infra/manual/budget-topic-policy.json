@@ -1,0 +1,37 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AccountOwnerAdministration",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::752160877725:root"
+      },
+      "Action": [
+        "SNS:GetTopicAttributes",
+        "SNS:SetTopicAttributes",
+        "SNS:AddPermission",
+        "SNS:RemovePermission",
+        "SNS:DeleteTopic",
+        "SNS:Subscribe",
+        "SNS:ListSubscriptionsByTopic",
+        "SNS:Publish"
+      ],
+      "Resource": "arn:aws:sns:us-east-2:752160877725:pi05-repro-budget-alerts"
+    },
+    {
+      "Sid": "AllowBudgetsToPublish",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "budgets.amazonaws.com"
+      },
+      "Action": "SNS:Publish",
+      "Resource": "arn:aws:sns:us-east-2:752160877725:pi05-repro-budget-alerts",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceAccount": "752160877725"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "BudgetName": "pi05-repro-hard-cap",
+  "BudgetLimit": {
+    "Amount": "3000",
+    "Unit": "USD"
+  },
+  "CostTypes": {
+    "IncludeTax": true,
+    "IncludeSubscription": true,
+    "UseBlended": false,
+    "IncludeRefund": false,
+    "IncludeCredit": false,
+    "IncludeUpfront": true,
+    "IncludeRecurring": true,
+    "IncludeOtherSubscription": true,
+    "IncludeSupport": true,
+    "IncludeDiscount": true,
+    "UseAmortized": false
+  },
+  "TimeUnit": "MONTHLY",
+  "BudgetType": "COST"
+}

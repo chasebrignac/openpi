@@ -1,0 +1,62 @@
+[
+  {
+    "Notification": {
+      "NotificationType": "ACTUAL",
+      "ComparisonOperator": "GREATER_THAN",
+      "Threshold": 1500,
+      "ThresholdType": "ABSOLUTE_VALUE",
+      "NotificationState": "ALARM"
+    },
+    "Subscribers": [
+      {
+        "SubscriptionType": "SNS",
+        "Address": "arn:aws:sns:us-east-2:752160877725:pi05-repro-budget-alerts"
+      }
+    ]
+  },
+  {
+    "Notification": {
+      "NotificationType": "ACTUAL",
+      "ComparisonOperator": "GREATER_THAN",
+      "Threshold": 2400,
+      "ThresholdType": "ABSOLUTE_VALUE",
+      "NotificationState": "ALARM"
+    },
+    "Subscribers": [
+      {
+        "SubscriptionType": "SNS",
+        "Address": "arn:aws:sns:us-east-2:752160877725:pi05-repro-budget-alerts"
+      }
+    ]
+  },
+  {
+    "Notification": {
+      "NotificationType": "ACTUAL",
+      "ComparisonOperator": "GREATER_THAN",
+      "Threshold": 2700,
+      "ThresholdType": "ABSOLUTE_VALUE",
+      "NotificationState": "ALARM"
+    },
+    "Subscribers": [
+      {
+        "SubscriptionType": "SNS",
+        "Address": "arn:aws:sns:us-east-2:752160877725:pi05-repro-budget-alerts"
+      }
+    ]
+  },
+  {
+    "Notification": {
+      "NotificationType": "FORECASTED",
+      "ComparisonOperator": "GREATER_THAN",
+      "Threshold": 3000,
+      "ThresholdType": "ABSOLUTE_VALUE",
+      "NotificationState": "ALARM"
+    },
+    "Subscribers": [
+      {
+        "SubscriptionType": "SNS",
+        "Address": "arn:aws:sns:us-east-2:752160877725:pi05-repro-budget-alerts"
+      }
+    ]
+  }
+]

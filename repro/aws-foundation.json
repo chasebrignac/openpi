@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-08-03T22:04:33Z",
+  "project": "pi05-aws-repro",
+  "account_id": "752160877725",
+  "region": "us-east-2",
+  "caller_arn": "arn:aws:iam::752160877725:user/chase",
+  "source": {
+    "openpi_import_commit": "15a9616a00943ada6c20a0f158e3adb39df2ccac",
+    "reproduction_head_at_validation": "c7ad045bc21f994b60c9eb998268a8661d3377a1"
+  },
+  "scope": {
+    "purchase_option": "On-Demand only",
+    "ec2_instances_launched": 0,
+    "capacity_reservations_or_blocks_purchased": 0,
+    "datasets_transferred_bytes": 0
+  },
+  "network": {
+    "vpc_id": "vpc-0b8deb3b4af5473ff",
+    "vpc_cidr": "172.31.0.0/16",
+    "default_vpc": true,
+    "subnets": [
+      {
+        "subnet_id": "subnet-02b3d2aff3f50bf4a",
+        "availability_zone": "us-east-2a"
+      },
+      {
+        "subnet_id": "subnet-0b49463b4ceee4d0f",
+        "availability_zone": "us-east-2b"
+      },
+      {
+        "subnet_id": "subnet-06510c52d562c79fd",
+        "availability_zone": "us-east-2c"
+      }
+    ],
+    "security_group": {
+      "name": "pi05-repro-workbench-no-ingress",
+      "id": "sg-05e45a674dacd5e01",
+      "arn": "arn:aws:ec2:us-east-2:752160877725:security-group/sg-05e45a674dacd5e01",
+      "ingress_rule_count": 0,
+      "egress": "all IPv4; required for SSM and artifact endpoints until VPC endpoints exist"
+    }
+  },
+  "resources": {
+    "s3": {
+      "bucket": "pi05-repro-752160877725-us-east-2",
+      "arn": "arn:aws:s3:::pi05-repro-752160877725-us-east-2",
+      "created_at_utc": "2026-08-03T22:02:14Z",
+      "object_ownership": "BucketOwnerEnforced",
+      "versioning": "Enabled",
+      "default_encryption": "AES256",
+      "public_access_block": true,
+      "tls_only_policy": true,
+      "abort_incomplete_multipart_days": 7
+    },
+    "ecr": {
+      "repository": "pi05-repro",
+      "arn": "arn:aws:ecr:us-east-2:752160877725:repository/pi05-repro",
+      "uri": "752160877725.dkr.ecr.us-east-2.amazonaws.com/pi05-repro",
+      "created_at_utc": "2026-08-03T22:02:19.289Z",
+      "image_tag_mutability": "IMMUTABLE",
+      "scan_on_push": true,
+      "encryption": "AES256",
+      "untagged_retention_days": 7
+    },
+    "iam": {
+      "role_name": "pi05-repro-ssm-instance-role",
+      "role_arn": "arn:aws:iam::752160877725:role/pi05-repro-ssm-instance-role",
+      "instance_profile_name": "pi05-repro-ssm-instance-profile",
+      "instance_profile_arn": "arn:aws:iam::752160877725:instance-profile/pi05-repro-ssm-instance-profile",
+      "managed_policies": [
+        "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      ],
+      "inline_policies": [
+        "pi05-repro-artifact-and-logging"
+      ]
+    },
+    "cloudwatch_logs": {
+      "log_group": "/pi05-repro/jobs",
+      "arn": "arn:aws:logs:us-east-2:752160877725:log-group:/pi05-repro/jobs:*",
+      "retention_days": 30
+    },
+    "budget_alert_transport": {
+      "sns_topic_arn": "arn:aws:sns:us-east-2:752160877725:pi05-repro-budget-alerts",
+      "sqs_queue_url": "https://sqs.us-east-2.amazonaws.com/752160877725/pi05-repro-budget-alerts",
+      "sqs_queue_arn": "arn:aws:sqs:us-east-2:752160877725:pi05-repro-budget-alerts",
+      "sqs_sse": "SQS_MANAGED",
+      "message_retention_seconds": 1209600,
+      "subscription_arn": "arn:aws:sns:us-east-2:752160877725:pi05-repro-budget-alerts:1d2cc017-8b68-4e29-bd5c-cab339cf41f3",
+      "delivery_test": "passed and test message purged"
+    }
+  },
+  "budget": {
+    "name": "pi05-repro-hard-cap",
+    "type": "COST",
+    "time_unit": "MONTHLY",
+    "limit_usd": 3000.0,
+    "actual_alerts_usd": [1500.0, 2400.0, 2700.0],
+    "forecast_alert_usd": 3000.0,
+    "notification_sink": "SQS through SNS; no email address required",
+    "scope": "entire AWS account; intentionally conservative",
+    "account_actual_spend_at_validation_usd": 327.962,
+    "account_forecast_spend_at_validation_usd": 496.321,
+    "warning": "This monthly account budget is a backstop, not the project hard-stop. The cross-month project ledger and pre-launch cost guard remain authoritative."
+  },
+  "cost_allocation": {
+    "tag_key": "Project",
+    "status": "Active",
+    "activated_at_utc": "2026-08-03T22:05:04Z",
+    "tag_value": "pi05-aws-repro"
+  },
+  "verification": {
+    "configuration_checks": "passed",
+    "iam_allowed_actions_simulated": [
+      "s3:PutObject on the artifact bucket",
+      "ecr:PutImage on the reproduction repository",
+      "logs:PutLogEvents on the reproduction log group"
+    ],
+    "iam_denied_actions_simulated": [
+      "ec2:RunInstances",
+      "s3:DeleteObject",
+      "ecr:DeleteRepository",
+      "logs:DeleteLogGroup"
+    ]
+  },
+  "manual_adjustments": [
+    "Two concurrent S3 control-plane writes returned OperationAborted immediately after bucket creation; encryption and tagging were retried serially and verified.",
+    "The repository-scoped IAM policy was expanded from ECR pull-only to push-and-pull so the workbench can publish the digest-pinned image.",
+    "An encrypted SQS sink was added after the new SNS topic was observed to have zero consumers; an end-to-end test message was received and then purged."
+  ]
+}
