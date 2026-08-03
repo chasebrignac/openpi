@@ -157,6 +157,13 @@ dmypy.json
 # pytype static type analyzer
 .pytype/
 
+# Local reproduction state. Durable run artifacts are uploaded to versioned S3;
+# only schemas, templates, and sanitized examples are committed.
+.repro/
+*.engine
+*.plan
+*.onnx.data
+
 # Cython debug symbols
 cython_debug/
 

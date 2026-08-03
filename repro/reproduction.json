@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "project": "pi05-aws-repro",
+  "aws": {
+    "account_id": "752160877725",
+    "region": "us-east-2",
+    "purchase_option": "On-Demand",
+    "hard_cap_usd": 3000.0,
+    "alert_thresholds_usd": [1500.0, 2400.0, 2700.0],
+    "category_caps_usd": {
+      "workbench_setup": 350.0,
+      "shallow_training": 1200.0,
+      "snapflow_bc": 250.0,
+      "export_compile_quantize": 200.0,
+      "evaluation": 250.0,
+      "storage_logs": 150.0,
+      "corrective_run": 500.0,
+      "headroom": 100.0
+    },
+    "approved_instances": {
+      "g6e.4xlarge": {"hourly_usd": 3.00424, "purpose": "workbench/evaluation"},
+      "g7e.2xlarge": {"hourly_usd": 3.36312, "purpose": "SnapFlow"},
+      "g7e.4xlarge": {"hourly_usd": 3.99816, "purpose": "export/compile/latency or fallback training"},
+      "g7e.12xlarge": {"hourly_usd": 8.28608, "purpose": "two-GPU Shallow training"}
+    },
+    "forbidden_capacity": ["Spot", "Reserved", "Capacity Block", "Dedicated Host"],
+    "forbidden_instance_families": ["p5", "p6"]
+  },
+  "source": {
+    "openpi_commit": "15a9616a00943ada6c20a0f158e3adb39df2ccac",
+    "molmoact2_droid_repo": "allenai/MolmoAct2-DROID-Dataset",
+    "molmoact2_droid_revision": "resolve-before-transfer",
+    "molmoact2_droid_expected_bytes": 259000000000,
+    "libero_repo": "openvla/modified_libero_rlds",
+    "libero_revision": "resolve-before-transfer"
+  },
+  "training": {
+    "student_layers": 9,
+    "teacher_layers": 18,
+    "layer_map": [0, 2, 4, 6, 8, 11, 13, 15, 17],
+    "overfit_steps": 300,
+    "pilot_steps": 2000,
+    "checkpoints": [5000, 10000, 20000, 30000],
+    "maximum_initial_steps": 30000,
+    "bc": {
+      "steps": 1500,
+      "first_expert_fraction": 0.25,
+      "optional_second_expert_fraction": 0.5,
+      "maximum_teacher_trajectories": 100
+    },
+    "snapflow": {
+      "pilot_steps": 5000,
+      "checkpoints": [5000, 10000, 20000, 30000],
+      "maximum_steps": 30000,
+      "batch_size": 4,
+      "precision": "bfloat16"
+    }
+  },
+  "evaluation": {
+    "libero_intermediate_episodes": 400,
+    "libero_final_episodes": 2000,
+    "robolab_intermediate_episodes_per_task": 50,
+    "robolab_final_max_episodes_per_task": 200
+  },
+  "benchmark": {
+    "warmups": 500,
+    "iterations": 10000,
+    "batch_size": 1,
+    "jax_pytorch_cosine_min": 0.999,
+    "onnx_cosine_min": 0.999,
+    "fp8_cosine_min": 0.995,
+    "shallow_speedup_min": 1.7,
+    "snapflow_denoise_speedup_min": 8.0,
+    "snapflow_total_speedup_min": 1.8,
+    "tensorrt_speedup_min": 1.1,
+    "fp8_speedup_min": 1.25,
+    "cumulative_aws_speedup_min": 6.0
+  }
+}
