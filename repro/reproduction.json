@@ -23,16 +23,24 @@
       "g7e.4xlarge": {"hourly_usd": 3.99816, "purpose": "export/compile/latency or fallback training"},
       "g7e.12xlarge": {"hourly_usd": 8.28608, "purpose": "two-GPU Shallow training"}
     },
+    "base_ami": {
+      "id": "ami-01901bc01d5d9bb55",
+      "name": "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20260724"
+    },
+    "base_container": {
+      "uri": "763104351884.dkr.ecr.us-east-2.amazonaws.com/pytorch-training@sha256:f861e28dd9b8ecc86722bd37306b2f7b7e74336bc9c98dba37223cf031d04a7a",
+      "source_tag": "2.7.1-gpu-py312-cu128-ubuntu22.04-ec2-v1.42-2026-04-22-18-04-12"
+    },
     "forbidden_capacity": ["Spot", "Reserved", "Capacity Block", "Dedicated Host"],
     "forbidden_instance_families": ["p5", "p6"]
   },
   "source": {
     "openpi_commit": "15a9616a00943ada6c20a0f158e3adb39df2ccac",
     "molmoact2_droid_repo": "allenai/MolmoAct2-DROID-Dataset",
-    "molmoact2_droid_revision": "resolve-before-transfer",
+    "molmoact2_droid_revision": "e44d3138c64cfeb1c24fbbce087b475fb1233728",
     "molmoact2_droid_expected_bytes": 259000000000,
     "libero_repo": "openvla/modified_libero_rlds",
-    "libero_revision": "resolve-before-transfer"
+    "libero_revision": "a4336d589d589045d1c56423ffdf3b88a0e19b1f"
   },
   "training": {
     "student_layers": 9,
