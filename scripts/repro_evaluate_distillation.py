@@ -21,6 +21,7 @@ if __package__:
     from scripts.repro_checkpoint import checkpoint_step
     from scripts.repro_checkpoint import resolve_checkpoint
     from scripts.repro_checkpoint import resolve_weights_directory
+    from scripts.repro_checkpoint import validate_training_checkpoint
     from scripts.repro_make_golden import canonical_sha256
     from scripts.repro_make_golden import config_provenance
     from scripts.repro_make_golden import sha256_file
@@ -29,6 +30,7 @@ else:
     from repro_checkpoint import checkpoint_step
     from repro_checkpoint import resolve_checkpoint
     from repro_checkpoint import resolve_weights_directory
+    from repro_checkpoint import validate_training_checkpoint
     from repro_make_golden import canonical_sha256
     from repro_make_golden import config_provenance
     from repro_make_golden import sha256_file
@@ -125,6 +127,111 @@ def checkpoint_training_provenance(
     }
 
 
+def checkpoint_initialization_lineage(checkpoint_dir: pathlib.Path) -> dict[str, Any]:
+    """Read the validated source-model identity recorded by a numeric checkpoint."""
+
+    state_path = checkpoint_dir / "resume-state.json"
+    try:
+        state = json.loads(state_path.read_text())
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Training checkpoint resume state not found: {state_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Training checkpoint resume state is invalid JSON: {state_path}") from exc
+    lineage = state.get("initialization_lineage")
+    if not isinstance(lineage, dict) or set(lineage) != {"kind", "model_sha256"}:
+        raise ValueError("Training checkpoint initialization lineage is missing or malformed")
+    model_sha256 = lineage.get("model_sha256")
+    if (
+        lineage.get("kind") not in {"shallow_teacher_transplant", "pytorch_source", "random_initialization"}
+        or (
+            lineage.get("kind") != "random_initialization"
+            and (
+                not isinstance(model_sha256, str)
+                or len(model_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in model_sha256)
+            )
+        )
+        or (lineage.get("kind") == "random_initialization" and model_sha256 is not None)
+    ):
+        raise ValueError("Training checkpoint initialization lineage has an invalid source-model identity")
+    return dict(lineage)
+
+
+def validate_snapflow_teacher_lineage(
+    student_checkpoint: pathlib.Path,
+    teacher_checkpoint: pathlib.Path,
+) -> dict[str, Any]:
+    """Require evaluation against the exact numeric checkpoint that initialized SnapFlow."""
+
+    lineage = checkpoint_initialization_lineage(student_checkpoint)
+    teacher_model_sha256 = sha256_file(teacher_checkpoint / "model.safetensors")
+    if lineage != {"kind": "pytorch_source", "model_sha256": teacher_model_sha256}:
+        raise ValueError(
+            "SnapFlow evaluation teacher differs from the checkpoint that initialized the student: "
+            f"lineage={lineage}, teacher_model_sha256={teacher_model_sha256}"
+        )
+    return lineage
+
+
+def validate_shallow_teacher_lineage(
+    student_checkpoint: pathlib.Path,
+    teacher_checkpoint: pathlib.Path,
+) -> dict[str, Any]:
+    """Require a distilled student to retain the selected full-depth teacher identity."""
+
+    lineage = checkpoint_initialization_lineage(student_checkpoint)
+    teacher_model_sha256 = sha256_file(teacher_checkpoint / "model.safetensors")
+    if lineage != {"kind": "shallow_teacher_transplant", "model_sha256": teacher_model_sha256}:
+        raise ValueError(
+            "Shallow-pi evaluation teacher differs from the checkpoint that initialized the student: "
+            f"lineage={lineage}, teacher_model_sha256={teacher_model_sha256}"
+        )
+    return lineage
+
+
+SNAPFLOW_TEACHER_CONFIGS = {
+    "pi05_libero_l09_snapflow": {"pi05_libero_l09_distill"},
+    "pi05_droid_l09_snapflow": {
+        "pi05_droid_l09_distill",
+        "pi05_droid_l09_expert_bc_25",
+        "pi05_droid_l09_expert_bc_50",
+    },
+}
+SNAPFLOW_CANONICAL_GOLDEN_CONFIG = {
+    "pi05_libero_l09_snapflow": "pi05_libero_l09_distill",
+    "pi05_droid_l09_snapflow": "pi05_droid_l09_distill",
+}
+SHALLOW_TEACHER_CONFIGS = {
+    "pi05_libero_l09_distill": "pi05_libero",
+    "pi05_droid_l09_distill": "pi05_droid_jointpos",
+    "pi05_droid_l09_expert_bc_25": "pi05_droid_jointpos",
+    "pi05_droid_l09_expert_bc_50": "pi05_droid_jointpos",
+}
+
+
+def canonical_snapflow_golden_config(student_config_name: str, teacher_config_name: str) -> str:
+    """Validate the exact per-track SnapFlow teacher and return its canonical golden source."""
+
+    accepted_teachers = SNAPFLOW_TEACHER_CONFIGS.get(student_config_name)
+    if accepted_teachers is None or teacher_config_name not in accepted_teachers:
+        raise ValueError(
+            "SnapFlow evaluation requires the exact accepted per-track Shallow/BC teacher config: "
+            f"student={student_config_name!r}, teacher={teacher_config_name!r}"
+        )
+    return SNAPFLOW_CANONICAL_GOLDEN_CONFIG[student_config_name]
+
+
+def validate_shallow_teacher_config(student_config_name: str, teacher_config_name: str) -> None:
+    """Require the exact released full-depth teacher for a Shallow or BC student."""
+
+    expected_teacher = SHALLOW_TEACHER_CONFIGS.get(student_config_name)
+    if expected_teacher is None or teacher_config_name != expected_teacher:
+        raise ValueError(
+            "Shallow-pi evaluation requires the exact released per-track full-depth teacher config: "
+            f"student={student_config_name!r}, teacher={teacher_config_name!r}, expected={expected_teacher!r}"
+        )
+
+
 def gap_closed_fraction(*, student_mse: float, naive_mse: float) -> float:
     """Fraction of the naive one-step error removed by SnapFlow."""
     if naive_mse < 0 or student_mse < 0:
@@ -141,6 +248,7 @@ def validate_golden_provenance(
     actual_hash: str,
     student_provenance: dict[str, Any],
     teacher_provenance: dict[str, Any],
+    additional_source_provenances: tuple[dict[str, Any], ...] = (),
 ) -> None:
     """Require the golden corpus to resolve to this run and model/data contract."""
     if metadata.get("schema_version") != 2:
@@ -149,18 +257,19 @@ def validate_golden_provenance(
         raise ValueError(f"Golden run_id mismatch: {metadata.get('run_id')!r} != {run_id!r}")
     if metadata.get("sha256") != actual_hash:
         raise ValueError(f"Golden corpus hash mismatch: expected {metadata.get('sha256')}, got {actual_hash}")
-    if metadata.get("dataset") != student_provenance["dataset"]:
-        raise ValueError("Golden dataset provenance does not match the resolved student config")
-    if metadata.get("dataset_revision") != student_provenance["dataset"]["revision"]:
-        raise ValueError("Golden dataset_revision does not match the resolved student config")
+    expected_dataset = student_provenance["dataset"]
+    if metadata.get("dataset") != expected_dataset:
+        raise ValueError("Golden dataset provenance does not match the approved evaluation source config")
+    if metadata.get("dataset_revision") != expected_dataset["revision"]:
+        raise ValueError("Golden dataset_revision does not match the approved evaluation source config")
     if metadata.get("action_horizon") != student_provenance["action_horizon"]:
         raise ValueError("Golden action horizon does not match the resolved student config")
     if metadata.get("action_dim") != student_provenance["action_dim"]:
         raise ValueError("Golden action dimension does not match the resolved student config")
     source = metadata.get("resolved_config")
     accepted = {
-        student_provenance["name"]: student_provenance,
-        teacher_provenance["name"]: teacher_provenance,
+        provenance["name"]: provenance
+        for provenance in (student_provenance, teacher_provenance, *additional_source_provenances)
     }
     if not isinstance(source, dict) or source.get("name") not in accepted:
         raise ValueError("Golden source config is neither the resolved student nor teacher config")
@@ -186,6 +295,12 @@ def evaluate(
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    named_snapflow = student_config_name in SNAPFLOW_TEACHER_CONFIGS
+    if named_snapflow:
+        canonical_distill_name = canonical_snapflow_golden_config(student_config_name, teacher_config_name)
+    else:
+        canonical_distill_name = None
+        validate_shallow_teacher_config(student_config_name, teacher_config_name)
     device = torch.device(device_name)
     student_train_config, student = load_model(student_config_name, student_checkpoint, device)
     teacher_train_config, teacher = load_model(teacher_config_name, teacher_checkpoint, device)
@@ -195,10 +310,17 @@ def evaluate(
     teacher_provenance = config_provenance(teacher_train_config, require_dataset=False)
 
     is_snapflow = isinstance(student_config, _pi0_config.SnapFlowPi0Config)
-    if is_snapflow and not isinstance(teacher_config, _pi0_config.DistilledPi0Config):
-        raise ValueError("SnapFlow evaluation requires an accepted DistilledPi0Config teacher")
-    if isinstance(student_config, _pi0_config.DistilledPi0Config) and isinstance(
-        teacher_config, _pi0_config.DistilledPi0Config | _pi0_config.SnapFlowPi0Config
+    if is_snapflow != named_snapflow:
+        raise ValueError("Resolved student model type differs from its reviewed evaluation-stage config")
+    if is_snapflow and not isinstance(teacher_config, _pi0_config.DistilledPi0Config | _pi0_config.ShallowPi0Config):
+        raise ValueError("SnapFlow evaluation requires an accepted distilled or expert-BC Shallow-pi teacher")
+    if not is_snapflow and not isinstance(
+        student_config, _pi0_config.DistilledPi0Config | _pi0_config.ShallowPi0Config
+    ):
+        raise ValueError("Shallow-pi evaluation requires a reviewed distilled or expert-BC student config")
+    if not is_snapflow and isinstance(
+        teacher_config,
+        _pi0_config.DistilledPi0Config | _pi0_config.ShallowPi0Config | _pi0_config.SnapFlowPi0Config,
     ):
         raise ValueError("Shallow-pi evaluation requires a full-depth teacher")
     if (student_config.action_horizon, student_config.action_dim) != (
@@ -206,6 +328,32 @@ def evaluate(
         teacher_config.action_dim,
     ):
         raise ValueError("Student and teacher action shapes differ")
+
+    snapflow_teacher_training = None
+    student_initialization_lineage = None
+    additional_golden_sources: tuple[dict[str, Any], ...] = ()
+    if is_snapflow:
+        assert canonical_distill_name is not None
+        validate_training_checkpoint(teacher_checkpoint)
+        teacher_step = checkpoint_step(teacher_checkpoint)
+        snapflow_teacher_training = checkpoint_training_provenance(
+            teacher_checkpoint,
+            expected_config_name=teacher_config_name,
+            expected_step=teacher_step,
+            expected_model=dataclasses.asdict(teacher_train_config.model),
+            expected_holdout_samples=teacher_train_config.offline_holdout_samples,
+        )
+        student_initialization_lineage = validate_snapflow_teacher_lineage(student_checkpoint, teacher_checkpoint)
+        canonical_distill = config_provenance(_config.get_config(canonical_distill_name))
+        additional_golden_sources = (canonical_distill,)
+    elif isinstance(student_config, _pi0_config.DistilledPi0Config):
+        student_initialization_lineage = validate_shallow_teacher_lineage(student_checkpoint, teacher_checkpoint)
+    else:
+        student_initialization_lineage = checkpoint_initialization_lineage(student_checkpoint)
+        if student_initialization_lineage["kind"] != "pytorch_source":
+            raise ValueError("Expert-BC evaluation requires a checkpoint initialized from an accepted Shallow model")
+        canonical_distill = config_provenance(_config.get_config("pi05_droid_l09_distill"))
+        additional_golden_sources = (canonical_distill,)
 
     metadata_path = corpus_path.with_suffix(".json")
     metadata = json.loads(metadata_path.read_text())
@@ -216,6 +364,7 @@ def evaluate(
         actual_hash=actual_hash,
         student_provenance=student_provenance,
         teacher_provenance=teacher_provenance,
+        additional_source_provenances=additional_golden_sources,
     )
     with np.load(corpus_path) as loaded:
         arrays = {key: loaded[key] for key in loaded.files}
@@ -303,11 +452,21 @@ def evaluate(
             "step": checkpoint_step(student_checkpoint),
             "model_sha256": sha256_file(student_weights),
             "metadata_sha256": student_training["metadata_sha256"],
+            "initialization_lineage": student_initialization_lineage,
         },
         "teacher_config": teacher_provenance,
         "teacher_checkpoint": {
             "path": str(teacher_checkpoint),
             "model_sha256": sha256_file(teacher_weights),
+            **(
+                {
+                    "step": checkpoint_step(teacher_checkpoint),
+                    "training_fingerprint_sha256": snapflow_teacher_training["training_fingerprint_sha256"],
+                    "metadata_sha256": snapflow_teacher_training["metadata_sha256"],
+                }
+                if snapflow_teacher_training is not None
+                else {}
+            ),
         },
         "dataset": student_provenance["dataset"],
         "golden": {

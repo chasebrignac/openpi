@@ -95,6 +95,60 @@ def test_golden_provenance_rejects_wrong_run_dataset_and_config_fingerprint():
         )
 
 
+def test_golden_provenance_accepts_canonical_distill_source_for_bc_teacher():
+    student = repro_make_golden.config_provenance(training_config.get_config("pi05_droid_l09_snapflow"))
+    teacher = repro_make_golden.config_provenance(training_config.get_config("pi05_droid_l09_expert_bc_25"))
+    canonical = repro_make_golden.config_provenance(training_config.get_config("pi05_droid_l09_distill"))
+    metadata = {
+        "schema_version": 2,
+        "run_id": "run-001",
+        "sha256": "a" * 64,
+        "action_horizon": student["action_horizon"],
+        "action_dim": student["action_dim"],
+        "dataset": student["dataset"],
+        "dataset_revision": student["dataset"]["revision"],
+        "config_name": canonical["name"],
+        "resolved_config": canonical,
+    }
+
+    repro_evaluate_distillation.validate_golden_provenance(
+        metadata,
+        run_id="run-001",
+        actual_hash="a" * 64,
+        student_provenance=student,
+        teacher_provenance=teacher,
+        additional_source_provenances=(canonical,),
+    )
+
+
+def test_golden_provenance_accepts_canonical_droid_corpus_for_bc_student():
+    student = repro_make_golden.config_provenance(training_config.get_config("pi05_droid_l09_expert_bc_25"))
+    teacher = repro_make_golden.config_provenance(
+        training_config.get_config("pi05_droid_jointpos"), require_dataset=False
+    )
+    canonical = repro_make_golden.config_provenance(training_config.get_config("pi05_droid_l09_distill"))
+    metadata = {
+        "schema_version": 2,
+        "run_id": "run-001",
+        "sha256": "a" * 64,
+        "action_horizon": student["action_horizon"],
+        "action_dim": student["action_dim"],
+        "dataset": canonical["dataset"],
+        "dataset_revision": canonical["dataset"]["revision"],
+        "config_name": canonical["name"],
+        "resolved_config": canonical,
+    }
+
+    repro_evaluate_distillation.validate_golden_provenance(
+        metadata,
+        run_id="run-001",
+        actual_hash="a" * 64,
+        student_provenance=student,
+        teacher_provenance=teacher,
+        additional_source_provenances=(canonical,),
+    )
+
+
 def test_checkpoint_training_provenance_hashes_resolved_saved_config(tmp_path):
     checkpoint = tmp_path / "5000"
     checkpoint.mkdir()
@@ -116,3 +170,85 @@ def test_checkpoint_training_provenance_hashes_resolved_saved_config(tmp_path):
             expected_config_name="student",
             expected_step=10_000,
         )
+
+
+def test_snapflow_teacher_must_equal_recorded_initialization_checkpoint(tmp_path):
+    student = tmp_path / "student" / "5000"
+    teacher = tmp_path / "teacher" / "10000"
+    student.mkdir(parents=True)
+    teacher.mkdir(parents=True)
+    teacher_weights = b"accepted shallow weights"
+    (teacher / "model.safetensors").write_bytes(teacher_weights)
+    teacher_sha256 = repro_make_golden.sha256_file(teacher / "model.safetensors")
+    (student / "resume-state.json").write_text(
+        '{"initialization_lineage":{"kind":"pytorch_source","model_sha256":"' + teacher_sha256 + '"}}\n'
+    )
+
+    lineage = repro_evaluate_distillation.validate_snapflow_teacher_lineage(student, teacher)
+    assert lineage == {"kind": "pytorch_source", "model_sha256": teacher_sha256}
+
+    (teacher / "model.safetensors").write_bytes(b"different shallow weights")
+    with pytest.raises(ValueError, match="differs from the checkpoint that initialized"):
+        repro_evaluate_distillation.validate_snapflow_teacher_lineage(student, teacher)
+
+
+def test_shallow_teacher_must_equal_recorded_transplant_checkpoint(tmp_path):
+    student = tmp_path / "student" / "5000"
+    teacher = tmp_path / "teacher"
+    student.mkdir(parents=True)
+    teacher.mkdir(parents=True)
+    (teacher / "model.safetensors").write_bytes(b"released full-depth teacher")
+    teacher_sha256 = repro_make_golden.sha256_file(teacher / "model.safetensors")
+    (student / "resume-state.json").write_text(
+        '{"initialization_lineage":{"kind":"shallow_teacher_transplant","model_sha256":"' + teacher_sha256 + '"}}\n'
+    )
+
+    lineage = repro_evaluate_distillation.validate_shallow_teacher_lineage(student, teacher)
+    assert lineage == {"kind": "shallow_teacher_transplant", "model_sha256": teacher_sha256}
+
+    (teacher / "model.safetensors").write_bytes(b"different full-depth teacher")
+    with pytest.raises(ValueError, match="differs from the checkpoint that initialized"):
+        repro_evaluate_distillation.validate_shallow_teacher_lineage(student, teacher)
+
+
+def test_snapflow_teacher_config_is_exactly_allowlisted_per_track():
+    assert (
+        repro_evaluate_distillation.canonical_snapflow_golden_config(
+            "pi05_libero_l09_snapflow", "pi05_libero_l09_distill"
+        )
+        == "pi05_libero_l09_distill"
+    )
+    for teacher in (
+        "pi05_droid_l09_distill",
+        "pi05_droid_l09_expert_bc_25",
+        "pi05_droid_l09_expert_bc_50",
+    ):
+        assert (
+            repro_evaluate_distillation.canonical_snapflow_golden_config("pi05_droid_l09_snapflow", teacher)
+            == "pi05_droid_l09_distill"
+        )
+
+    with pytest.raises(ValueError, match="exact accepted per-track"):
+        repro_evaluate_distillation.canonical_snapflow_golden_config(
+            "pi05_libero_l09_snapflow", "pi05_droid_l09_distill"
+        )
+    with pytest.raises(ValueError, match="exact accepted per-track"):
+        repro_evaluate_distillation.canonical_snapflow_golden_config("unreviewed_snapflow", "pi05_droid_l09_distill")
+
+
+def test_shallow_teacher_config_is_exactly_allowlisted_per_track():
+    accepted = {
+        "pi05_libero_l09_distill": "pi05_libero",
+        "pi05_droid_l09_distill": "pi05_droid_jointpos",
+        "pi05_droid_l09_expert_bc_25": "pi05_droid_jointpos",
+        "pi05_droid_l09_expert_bc_50": "pi05_droid_jointpos",
+    }
+    for student, teacher in accepted.items():
+        repro_evaluate_distillation.validate_shallow_teacher_config(student, teacher)
+
+    with pytest.raises(ValueError, match="exact released per-track"):
+        repro_evaluate_distillation.validate_shallow_teacher_config(
+            "pi05_droid_l09_distill", "pi05_droid_l09_expert_bc_25"
+        )
+    with pytest.raises(ValueError, match="exact released per-track"):
+        repro_evaluate_distillation.validate_shallow_teacher_config("unreviewed_student", "pi05_libero")

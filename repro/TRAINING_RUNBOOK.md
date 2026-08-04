@@ -94,13 +94,15 @@ torchrun --standalone --nproc-per-node=2 scripts/train_pytorch.py pi05_libero_l0
   --exp-name "$LIBERO_SHALLOW_OVERFIT_EXP" --checkpoint-base-dir "$RUNS" \
   --teacher-pytorch-weight-path "$LIBERO_TEACHER" \
   --seed "$TRAIN_SEED" --num-train-steps 300 --save-interval 300 --log-interval 10 \
-  --one-batch-overfit --one-batch-overfit-min-relative-decline 0.20
+  --one-batch-overfit --one-batch-overfit-min-relative-decline 0.20 \
+  --num-workers 0 --no-wandb-enabled
 
 torchrun --standalone --nproc-per-node=2 scripts/train_pytorch.py pi05_droid_l09_distill \
   --exp-name "$DROID_SHALLOW_OVERFIT_EXP" --checkpoint-base-dir "$RUNS" \
   --teacher-pytorch-weight-path "$DROID_TEACHER" \
   --seed "$TRAIN_SEED" --num-train-steps 300 --save-interval 300 --log-interval 10 \
-  --one-batch-overfit --one-batch-overfit-min-relative-decline 0.20
+  --one-batch-overfit --one-batch-overfit-min-relative-decline 0.20 \
+  --num-workers 0 --no-wandb-enabled
 ```
 
 The trainer aborts coherently on every rank before publishing step 300 if any
@@ -121,18 +123,29 @@ After selecting an accepted Shallow checkpoint, run the same 300-step
 diagnostic for each SnapFlow track, supplying the numeric source directory:
 
 ```bash
+: "${LIBERO_SNAPFLOW_SOURCE:?Set the accepted numeric LIBERO Shallow checkpoint}"
+: "${DROID_SNAPFLOW_SOURCE:?Set the accepted numeric DROID Shallow or BC checkpoint}"
 python scripts/train_pytorch.py pi05_libero_l09_snapflow \
   --exp-name "$LIBERO_SNAPFLOW_OVERFIT_EXP" --checkpoint-base-dir "$RUNS" \
-  --pytorch-weight-path "$LIBERO_SHALLOW_ROOT/5000" \
+  --pytorch-weight-path "$LIBERO_SNAPFLOW_SOURCE" \
   --seed "$TRAIN_SEED" --num-train-steps 300 --save-interval 300 --log-interval 10 \
-  --one-batch-overfit --one-batch-overfit-min-relative-decline 0.20
+  --one-batch-overfit --one-batch-overfit-min-relative-decline 0.20 \
+  --num-workers 0 --no-wandb-enabled
 
 python scripts/train_pytorch.py pi05_droid_l09_snapflow \
   --exp-name "$DROID_SNAPFLOW_OVERFIT_EXP" --checkpoint-base-dir "$RUNS" \
-  --pytorch-weight-path "$DROID_SHALLOW_ROOT/5000" \
+  --pytorch-weight-path "$DROID_SNAPFLOW_SOURCE" \
   --seed "$TRAIN_SEED" --num-train-steps 300 --save-interval 300 --log-interval 10 \
-  --one-batch-overfit --one-batch-overfit-min-relative-decline 0.20
+  --one-batch-overfit --one-batch-overfit-min-relative-decline 0.20 \
+  --num-workers 0 --no-wandb-enabled
 ```
+
+The current trainer rejects one-batch mode unless `num_workers` is exactly
+zero. One-batch mode itself fixes the diagnostic to its single materialized
+batch; disabled W&B removes unnecessary logging while enabled W&B would reuse
+that same batch. Declare its numeric checkpoint as an ordinary retained
+output, never a `publish_destination`; diagnostic weights are not eligible
+SnapFlow inputs.
 
 ## 3. Shallow-pi pilots and bounded continuation
 
@@ -193,8 +206,11 @@ python scripts/repro_checkpoint.py "$LIBERO_SHALLOW_ROOT" --step 10000
 
 ## 4. SnapFlow pilots and bounded continuation
 
-Replace `SHALLOW_STEP` with the accepted Shallow step. The initial SnapFlow
-pilot is 5k; later commands resume to exact totals.
+Resolve each accepted source to its exact numeric checkpoint directory. The
+DROID source may be the accepted distillation checkpoint or the selected
+25/75 or 50/50 expert-BC recovery checkpoint; do not relabel BC weights as the
+distillation config. The initial SnapFlow pilot is 5k; later commands resume to
+exact totals.
 
 The initial 5k SnapFlow worker is a fresh run and points
 `--pytorch-weight-path` at the staged accepted Shallow descriptor under
@@ -203,10 +219,18 @@ The initial 5k SnapFlow worker is a fresh run and points
 model-only `--pytorch-weight-path` is not a valid 5k-to-10k resume.
 
 ```bash
-export SHALLOW_STEP=10000
+export LIBERO_SNAPFLOW_SOURCE="$LIBERO_SHALLOW_ROOT/10000"
+export DROID_SNAPFLOW_SOURCE="$DROID_SHALLOW_ROOT/10000"
+# If recovery was selected, replace both values below together, for example:
+# export DROID_SNAPFLOW_SOURCE="$RUNS/pi05_droid_l09_expert_bc_25/EXPERIMENT/1500"
+# export DROID_SNAPFLOW_TEACHER_CONFIG=pi05_droid_l09_expert_bc_25
+export DROID_SNAPFLOW_TEACHER_CONFIG=pi05_droid_l09_distill
+python scripts/repro_checkpoint.py "$LIBERO_SNAPFLOW_SOURCE"
+python scripts/repro_checkpoint.py "$DROID_SNAPFLOW_SOURCE"
+
 python scripts/train_pytorch.py pi05_libero_l09_snapflow \
   --exp-name "$LIBERO_SNAPFLOW_EXP" --checkpoint-base-dir "$RUNS" \
-  --pytorch-weight-path "$LIBERO_SHALLOW_ROOT/$SHALLOW_STEP" \
+  --pytorch-weight-path "$LIBERO_SNAPFLOW_SOURCE" \
   --seed "$TRAIN_SEED" --num-train-steps 5000 --save-interval 5000
 python scripts/train_pytorch.py pi05_libero_l09_snapflow \
   --exp-name "$LIBERO_SNAPFLOW_EXP" --checkpoint-base-dir "$RUNS" --resume --seed "$TRAIN_SEED" --num-train-steps 10000 --save-interval 5000
@@ -217,15 +241,29 @@ python scripts/train_pytorch.py pi05_libero_l09_snapflow \
 
 python scripts/train_pytorch.py pi05_droid_l09_snapflow \
   --exp-name "$DROID_SNAPFLOW_EXP" --checkpoint-base-dir "$RUNS" \
-  --pytorch-weight-path "$DROID_SHALLOW_ROOT/$SHALLOW_STEP" \
-  --seed "$TRAIN_SEED" --num-train-steps 5000 --save-interval 5000
+  --pytorch-weight-path "$DROID_SNAPFLOW_SOURCE" \
+  --seed "$TRAIN_SEED" --num-train-steps 5000 --save-interval 5000 \
+  --num-workers 0 --no-wandb-enabled
 python scripts/train_pytorch.py pi05_droid_l09_snapflow \
-  --exp-name "$DROID_SNAPFLOW_EXP" --checkpoint-base-dir "$RUNS" --resume --seed "$TRAIN_SEED" --num-train-steps 10000 --save-interval 5000
+  --exp-name "$DROID_SNAPFLOW_EXP" --checkpoint-base-dir "$RUNS" --resume \
+  --seed "$TRAIN_SEED" --num-train-steps 10000 --save-interval 5000 \
+  --num-workers 0 --no-wandb-enabled
 python scripts/train_pytorch.py pi05_droid_l09_snapflow \
-  --exp-name "$DROID_SNAPFLOW_EXP" --checkpoint-base-dir "$RUNS" --resume --seed "$TRAIN_SEED" --num-train-steps 20000 --save-interval 5000
+  --exp-name "$DROID_SNAPFLOW_EXP" --checkpoint-base-dir "$RUNS" --resume \
+  --seed "$TRAIN_SEED" --num-train-steps 20000 --save-interval 5000 \
+  --num-workers 0 --no-wandb-enabled
 python scripts/train_pytorch.py pi05_droid_l09_snapflow \
-  --exp-name "$DROID_SNAPFLOW_EXP" --checkpoint-base-dir "$RUNS" --resume --seed "$TRAIN_SEED" --num-train-steps 30000 --save-interval 5000
+  --exp-name "$DROID_SNAPFLOW_EXP" --checkpoint-base-dir "$RUNS" --resume \
+  --seed "$TRAIN_SEED" --num-train-steps 30000 --save-interval 5000 \
+  --num-workers 0 --no-wandb-enabled
 ```
+
+The DROID commands intentionally keep `num_workers=0` and W&B disabled on the
+64 GiB `g7e.2xlarge` host. This avoids duplicating the memory-mapped dataset in
+loader processes until the first retained pilot records enough host-memory
+headroom to justify a controlled change. Resume commands preserve both values
+as worker-launch invariants; W&B is also embedded in the resume contract,
+while `num_workers` is enforced by the reviewed worker command.
 
 ## 5. Offline evidence at every checkpoint
 
@@ -248,21 +286,37 @@ python scripts/repro_evaluate_distillation.py \
   --normalization-low -1 --normalization-high 1 \
   --output "$EVIDENCE/libero-shallow-$STEP.json"
 
-# SnapFlow example; teacher-step is the accepted numeric Shallow checkpoint.
+# SnapFlow example; the teacher path is the exact checkpoint that initialized
+# this SnapFlow run. The evaluator checks the recorded initialization hash.
 python scripts/repro_evaluate_distillation.py \
   --run-id "$REPRO_RUN_ID" \
   --student-config-name pi05_libero_l09_snapflow \
   --student-run-root "$LIBERO_SNAPFLOW_ROOT" --student-step 5000 \
   --teacher-config-name pi05_libero_l09_distill \
-  --teacher-checkpoint "$LIBERO_SHALLOW_ROOT" --teacher-step "$SHALLOW_STEP" \
+  --teacher-checkpoint "$LIBERO_SNAPFLOW_SOURCE" \
   --corpus "$EVIDENCE/libero-heldout.npz" \
   --normalization-low -1 --normalization-high 1 \
   --output "$EVIDENCE/libero-snapflow-5000.json"
 ```
 
-Use the same forms with the DROID config, run root, teacher and corpus. The
-default saturation limits are normalized `[-1, 1]`; override them only if the
-recorded normalization manifest proves different limits.
+The Shallow evaluator accepts only `pi05_libero` for the LIBERO distilled
+student and `pi05_droid_jointpos` for the DROID distilled/BC students. For a
+distilled checkpoint it also requires the selected teacher model hash to equal
+the checkpoint's recorded `shallow_teacher_transplant` lineage; config names
+alone are not sufficient.
+
+Use the same form with `pi05_droid_l09_snapflow`,
+`$DROID_SNAPFLOW_ROOT`, `$DROID_SNAPFLOW_TEACHER_CONFIG`,
+`$DROID_SNAPFLOW_SOURCE`, and the DROID corpus. The evaluator accepts the
+distilled or expert-BC nine-layer teacher config, verifies its numeric
+checkpoint metadata, and requires its model hash to equal the SnapFlow
+checkpoint's recorded `pytorch_source` lineage. The default saturation limits
+are normalized `[-1, 1]`; override them only if the recorded normalization
+manifest proves different limits. Offline evaluation of a BC25/BC50 student
+reuses the immutable canonical DROID distillation corpus rather than attempting
+to generate a zero-sample corpus from the recovery config. Treat that result as
+a fixed paired diagnostic for recovery regression, not as a BC-held-out
+generalization estimate.
 
 ## 6. Promotion and 30k stop decision
 

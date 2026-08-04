@@ -431,6 +431,179 @@ def _uses_multi_process_torchrun(command: Sequence[str]) -> bool:
     return True
 
 
+SNAPFLOW_SOURCE_CONFIGS = {
+    "pi05_libero_l09_snapflow": {"pi05_libero_l09_distill"},
+    "pi05_droid_l09_snapflow": {
+        "pi05_droid_l09_distill",
+        "pi05_droid_l09_expert_bc_25",
+        "pi05_droid_l09_expert_bc_50",
+    },
+}
+SNAPFLOW_ALLOWED_OPTIONS = {
+    "--batch-size",
+    "--checkpoint-base-dir",
+    "--exp-name",
+    "--gradient-accumulation-steps",
+    "--log-interval",
+    "--no-wandb-enabled",
+    "--num-train-steps",
+    "--num-workers",
+    "--one-batch-overfit",
+    "--one-batch-overfit-min-relative-decline",
+    "--pytorch-training-precision",
+    "--pytorch-weight-path",
+    "--resume",
+    "--save-interval",
+    "--seed",
+    "--teacher-pytorch-weight-path",
+}
+
+
+def _validate_snapflow_common_command(command: Sequence[str], training_config: str, context: str) -> None:
+    """Reject ambiguous argv and recipe changes for every SnapFlow training stage."""
+
+    if training_config not in SNAPFLOW_SOURCE_CONFIGS:
+        raise WorkerError(f"{context} uses an unapproved SnapFlow config: {training_config!r}")
+    train_index = command.index("scripts/train_pytorch.py")
+    if train_index != 1 or pathlib.PurePosixPath(command[0]).name not in {"python", "python3"}:
+        raise WorkerError(f"{context} must use a direct single-process Python argv")
+    unreviewed_options = [value for value in command if value.startswith("-") and value not in SNAPFLOW_ALLOWED_OPTIONS]
+    if unreviewed_options:
+        raise WorkerError(f"{context} forbids unreviewed or equals-form options: {unreviewed_options}")
+    for flag in ("--no-wandb-enabled", "--one-batch-overfit", "--resume"):
+        if command.count(flag) > 1:
+            raise WorkerError(f"{context} must not repeat {flag}")
+
+    recipe_overrides = {
+        "--batch-size": "4",
+        "--gradient-accumulation-steps": "1",
+        "--pytorch-training-precision": "bfloat16",
+    }
+    for option, expected in recipe_overrides.items():
+        positions = [index for index, value in enumerate(command) if value == option]
+        if positions and (
+            len(positions) != 1 or positions[0] + 1 >= len(command) or command[positions[0] + 1] != expected
+        ):
+            raise WorkerError(f"{context} {option} override must preserve the published value {expected}")
+    log_positions = [index for index, value in enumerate(command) if value == "--log-interval"]
+    if log_positions and (
+        len(log_positions) != 1 or log_positions[0] + 1 >= len(command) or command[log_positions[0] + 1] != "10"
+    ):
+        raise WorkerError(f"{context} --log-interval override must be exactly 10")
+    if training_config == "pi05_droid_l09_snapflow" and (
+        _single_command_option(command, "--num-workers", context) != "0" or command.count("--no-wandb-enabled") != 1
+    ):
+        raise WorkerError(f"{context} DROID runs require num_workers=0 and disabled W&B on g7e.2xlarge")
+
+
+def validate_fresh_snapflow_training_contract(
+    command: Sequence[str],
+    training_config: str,
+    artifacts: Sequence[Mapping[str, Any]],
+    expected_outputs: Sequence[Mapping[str, Any]],
+) -> None:
+    """Bind a fresh single-GPU SnapFlow run to one exact accepted Shallow checkpoint."""
+
+    context = "fresh SnapFlow training command"
+    _validate_snapflow_common_command(command, training_config, context)
+    source_path = pathlib.PurePosixPath(_single_command_option(command, "--pytorch-weight-path", context))
+    checkpoint_root = pathlib.PurePosixPath("/mnt/openpi/checkpoints")
+    try:
+        source_destination = source_path.relative_to(checkpoint_root)
+    except ValueError as exc:
+        raise WorkerError(f"{context} --pytorch-weight-path must be below {checkpoint_root}") from exc
+    if len(source_destination.parts) != 3 or not source_destination.parts[2].isdigit():
+        raise WorkerError(f"{context} source must be an exact CONFIG/EXPERIMENT/POSITIVE_STEP checkpoint")
+    if int(source_destination.parts[2]) <= 0:
+        raise WorkerError(f"{context} source checkpoint step must be positive")
+
+    if source_destination.parts[0] not in SNAPFLOW_SOURCE_CONFIGS[training_config]:
+        raise WorkerError(f"{context} source config is not an accepted Shallow checkpoint for {training_config}")
+    matching_sources = [
+        artifact
+        for artifact in artifacts
+        if artifact["kind"] == "checkpoint" and artifact["destination"] == source_destination.as_posix()
+    ]
+    if len(matching_sources) != 1:
+        raise WorkerError(f"{context} must select exactly one staged accepted Shallow checkpoint")
+    if "--teacher-pytorch-weight-path" in command:
+        raise WorkerError(f"{context} must not load an external distillation teacher")
+
+    experiment = _single_command_option(command, "--exp-name", context)
+    try:
+        target_step = int(_single_command_option(command, "--num-train-steps", context))
+    except ValueError as exc:
+        raise WorkerError(f"{context} --num-train-steps must be an integer") from exc
+    if target_step <= 0:
+        raise WorkerError(f"{context} --num-train-steps must be positive")
+    expected_path = f"checkpoints/{training_config}/{experiment}/{target_step}"
+    expected_destination = f"{training_config}/{experiment}/{target_step}"
+    matching_outputs = [
+        output for output in expected_outputs if output["kind"] == "checkpoint" and output["path"] == expected_path
+    ]
+    if len(matching_outputs) != 1:
+        raise WorkerError(f"{context} must declare its exact numeric checkpoint output")
+
+    if "--one-batch-overfit" in command:
+        if command.count("--one-batch-overfit") != 1 or target_step != 300:
+            raise WorkerError(f"{context} one-batch diagnostic must run exactly 300 optimizer steps")
+        if _single_command_option(command, "--num-workers", context) != "0" or command.count("--no-wandb-enabled") != 1:
+            raise WorkerError(f"{context} one-batch diagnostic requires num_workers=0 and disabled W&B")
+        try:
+            minimum_decline = float(
+                _single_command_option(command, "--one-batch-overfit-min-relative-decline", context)
+            )
+        except ValueError as exc:
+            raise WorkerError(f"{context} one-batch decline gate must be numeric") from exc
+        if minimum_decline != 0.20:
+            raise WorkerError(f"{context} one-batch diagnostic must retain the 20% decline gate")
+        if matching_outputs[0].get("publish_destination") is not None:
+            raise WorkerError(f"{context} one-batch diagnostic checkpoint must not be published as a worker input")
+    else:
+        if "--one-batch-overfit-min-relative-decline" in command:
+            raise WorkerError(f"{context} pilot must not carry a one-batch decline override")
+        if target_step != 5000:
+            raise WorkerError(f"{context} initial pilot must target exactly 5000 optimizer steps")
+        if (
+            training_config == "pi05_libero_l09_snapflow"
+            and "--num-workers" in command
+            and _single_command_option(command, "--num-workers", context) != "4"
+        ):
+            raise WorkerError(f"{context} LIBERO pilot must retain the configured four loader workers")
+        if matching_outputs[0].get("publish_destination") != expected_destination:
+            raise WorkerError(f"{context} pilot must publish its exact numeric checkpoint for continuation")
+    if _single_command_option(command, "--save-interval", context) != str(target_step):
+        raise WorkerError(f"{context} must save exactly at its terminal diagnostic or pilot step")
+
+
+def validate_snapflow_resume_training_contract(
+    command: Sequence[str],
+    training_config: str,
+    *,
+    source_step: int,
+    target_step: int,
+) -> None:
+    """Keep every continued SnapFlow run on the reviewed single-GPU stage ladder."""
+
+    context = "SnapFlow resume training command"
+    _validate_snapflow_common_command(command, training_config, context)
+    if "--pytorch-weight-path" in command or "--teacher-pytorch-weight-path" in command:
+        raise WorkerError(f"{context} must restore full state without a model-only or teacher override")
+    if "--one-batch-overfit" in command or "--one-batch-overfit-min-relative-decline" in command:
+        raise WorkerError(f"{context} cannot be a one-batch diagnostic")
+    allowed_transitions = {(5000, 10000), (10000, 20000), (20000, 30000)}
+    if (source_step, target_step) not in allowed_transitions:
+        raise WorkerError(f"{context} must follow the reviewed 5k->10k->20k->30k continuation ladder")
+    if (
+        training_config == "pi05_libero_l09_snapflow"
+        and "--num-workers" in command
+        and _single_command_option(command, "--num-workers", context) != "4"
+    ):
+        raise WorkerError(f"{context} LIBERO continuation must retain the configured four loader workers")
+    if _single_command_option(command, "--save-interval", context) != "5000":
+        raise WorkerError(f"{context} must retain the 5000-step checkpoint interval")
+
+
 def validate_compiled_pipeline_command(spec: Mapping[str, Any]) -> None:
     """Keep hardware-bound compiler writes on the worker-owned output mount."""
     command = spec["container"]["command"]
@@ -882,6 +1055,8 @@ def validate_worker_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
     validate_compiled_pipeline_command(spec)
 
     resume = spec.get("resume_checkpoint")
+    if resume is None and train_positions and training_config.endswith("_snapflow"):
+        validate_fresh_snapflow_training_contract(command, training_config, artifacts, expected_outputs)
     if resume is not None:
         if not isinstance(resume, dict):
             raise WorkerError("worker spec.resume_checkpoint must be an object")
@@ -934,6 +1109,13 @@ def validate_worker_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
         if len(matching_outputs) != 1:
             raise WorkerError(
                 "resume worker must declare one published checkpoint output at its exact target config/experiment/step"
+            )
+        if training_config.endswith("_snapflow"):
+            validate_snapflow_resume_training_contract(
+                command,
+                training_config,
+                source_step=source_step,
+                target_step=target_step,
             )
     elif train_positions and ("--resume" in command or "--overwrite" in command):
         raise WorkerError("fresh training worker commands forbid --resume and --overwrite; use a unique experiment ID")

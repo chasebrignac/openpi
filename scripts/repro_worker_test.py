@@ -134,6 +134,108 @@ def make_resume_spec(tmp_path: pathlib.Path) -> dict:
     return spec
 
 
+def make_snapflow_spec(tmp_path: pathlib.Path, *, diagnostic: bool = False) -> dict:
+    spec = make_spec(tmp_path)
+    source = {
+        "name": "accepted_shallow_checkpoint",
+        "kind": "checkpoint",
+        "revision": "e" * 64,
+        "manifest": {
+            "s3_uri": "s3://pi05-repro-752160877725-us-east-2/runs/shallow/manifests/worker-input.json",
+            "version_id": "manifest-v2",
+            "sha256": "f" * 64,
+        },
+        "payload_s3_uri": (
+            "s3://pi05-repro-752160877725-us-east-2/runs/shallow/"
+            "checkpoints/pi05_libero_l09_distill/libero-shallow/5000/"
+        ),
+        "destination": "pi05_libero_l09_distill/libero-shallow/5000",
+    }
+    spec["artifacts"].append(source)
+    experiment = "libero-snapflow-overfit" if diagnostic else "libero-snapflow"
+    target_step = 300 if diagnostic else 5000
+    spec["container"]["command"] = [
+        "python",
+        "scripts/train_pytorch.py",
+        "pi05_libero_l09_snapflow",
+        "--exp-name",
+        experiment,
+        "--checkpoint-base-dir",
+        "/mnt/openpi/runs",
+        "--pytorch-weight-path",
+        "/mnt/openpi/checkpoints/pi05_libero_l09_distill/libero-shallow/5000",
+        "--seed",
+        "7",
+        "--num-train-steps",
+        str(target_step),
+        "--save-interval",
+        str(target_step),
+    ]
+    if diagnostic:
+        spec["container"]["command"].extend(
+            [
+                "--one-batch-overfit",
+                "--one-batch-overfit-min-relative-decline",
+                "0.20",
+                "--num-workers",
+                "0",
+                "--no-wandb-enabled",
+            ]
+        )
+    output = {
+        "name": "snapflow_checkpoint",
+        "kind": "checkpoint",
+        "path": f"checkpoints/pi05_libero_l09_snapflow/{experiment}/{target_step}",
+    }
+    if not diagnostic:
+        output["publish_destination"] = f"pi05_libero_l09_snapflow/{experiment}/{target_step}"
+    spec["expected_outputs"] = [output]
+    return spec
+
+
+def make_droid_snapflow_resume_spec(tmp_path: pathlib.Path) -> dict:
+    spec = make_resume_spec(tmp_path)
+    spec["run_id"] = "droid-snapflow-continue-10000"
+    spec["output"]["s3_uri"] = "s3://pi05-repro-752160877725-us-east-2/runs/droid-snapflow-continue-10000/"
+    spec["image"]["lerobot_runtime"] = "v3"
+    spec["image"]["lerobot_revision"] = repro_worker.LEROBOT_REVISIONS["v3"]
+    spec["artifacts"][0].update({"name": "droid", "destination": "molmoact2-droid"})
+    resume_artifact = spec["artifacts"][1]
+    resume_artifact["destination"] = "pi05_droid_l09_snapflow/droid-snapflow/5000"
+    resume_artifact["payload_s3_uri"] = (
+        "s3://pi05-repro-752160877725-us-east-2/runs/source/checkpoints/pi05_droid_l09_snapflow/droid-snapflow/5000/"
+    )
+    spec["container"]["command"] = [
+        "python",
+        "scripts/train_pytorch.py",
+        "pi05_droid_l09_snapflow",
+        "--exp-name",
+        "droid-snapflow",
+        "--checkpoint-base-dir",
+        "/mnt/openpi/runs",
+        "--resume",
+        "--num-train-steps",
+        "10000",
+        "--save-interval",
+        "5000",
+        "--seed",
+        "7",
+        "--num-workers",
+        "0",
+        "--no-wandb-enabled",
+    ]
+    spec["resume_checkpoint"]["target"] = "pi05_droid_l09_snapflow/droid-snapflow/5000"
+    spec["expected_outputs"] = [
+        {
+            "name": "continued_checkpoint",
+            "kind": "checkpoint",
+            "path": "checkpoints/pi05_droid_l09_snapflow/droid-snapflow/10000",
+            "publish_destination": "pi05_droid_l09_snapflow/droid-snapflow/10000",
+        }
+    ]
+    return spec
+
+
 def make_launch_metadata(deadline: str) -> dict:
     return {
         "project": "pi05-aws-repro",
@@ -1157,6 +1259,177 @@ def test_resume_contract_binds_input_target_training_command_and_output(tmp_path
     unreported_target["expected_outputs"] = []
     with pytest.raises(repro_worker.WorkerError, match="declare one published checkpoint"):
         repro_worker.validate_worker_spec(unreported_target)
+
+
+def test_fresh_snapflow_contract_binds_accepted_source_recipe_and_output(tmp_path):
+    spec = repro_worker.validate_worker_spec(make_snapflow_spec(tmp_path))
+    assert spec["container"]["command"][0] == "python"
+
+    missing_source = make_snapflow_spec(tmp_path)
+    option = missing_source["container"]["command"].index("--pytorch-weight-path")
+    del missing_source["container"]["command"][option : option + 2]
+    with pytest.raises(repro_worker.WorkerError, match="--pytorch-weight-path"):
+        repro_worker.validate_worker_spec(missing_source)
+
+    wrong_source = make_snapflow_spec(tmp_path)
+    option = wrong_source["container"]["command"].index("--pytorch-weight-path")
+    wrong_source["container"]["command"][option + 1] = (
+        "/mnt/openpi/checkpoints/pi05_libero_l09_distill/other-shallow/5000"
+    )
+    with pytest.raises(repro_worker.WorkerError, match="exactly one staged accepted Shallow"):
+        repro_worker.validate_worker_spec(wrong_source)
+
+    wrong_batch = make_snapflow_spec(tmp_path)
+    wrong_batch["container"]["command"].extend(["--batch-size", "8"])
+    with pytest.raises(repro_worker.WorkerError, match="published value 4"):
+        repro_worker.validate_worker_spec(wrong_batch)
+
+    unpublishable = make_snapflow_spec(tmp_path)
+    unpublishable["expected_outputs"][0].pop("publish_destination")
+    with pytest.raises(repro_worker.WorkerError, match="publish its exact numeric checkpoint"):
+        repro_worker.validate_worker_spec(unpublishable)
+
+    unbounded_fresh = make_snapflow_spec(tmp_path)
+    option = unbounded_fresh["container"]["command"].index("--num-train-steps")
+    unbounded_fresh["container"]["command"][option + 1] = "30000"
+    unbounded_fresh["expected_outputs"][0]["path"] = "checkpoints/pi05_libero_l09_snapflow/libero-snapflow/30000"
+    unbounded_fresh["expected_outputs"][0]["publish_destination"] = "pi05_libero_l09_snapflow/libero-snapflow/30000"
+    with pytest.raises(repro_worker.WorkerError, match="initial pilot must target exactly 5000"):
+        repro_worker.validate_worker_spec(unbounded_fresh)
+
+    equals_override = make_snapflow_spec(tmp_path)
+    equals_override["container"]["command"].append("--batch-size=8")
+    with pytest.raises(repro_worker.WorkerError, match="equals-form"):
+        repro_worker.validate_worker_spec(equals_override)
+
+    unreviewed_model_override = make_snapflow_spec(tmp_path)
+    unreviewed_model_override["container"]["command"].extend(["--model.snapflow-alpha", "1.0"])
+    with pytest.raises(repro_worker.WorkerError, match="unreviewed"):
+        repro_worker.validate_worker_spec(unreviewed_model_override)
+
+    wrong_save_interval = make_snapflow_spec(tmp_path)
+    option = wrong_save_interval["container"]["command"].index("--save-interval")
+    wrong_save_interval["container"]["command"][option + 1] = "1000"
+    with pytest.raises(repro_worker.WorkerError, match="save exactly"):
+        repro_worker.validate_worker_spec(wrong_save_interval)
+
+
+def test_snapflow_one_batch_contract_requires_safe_loader_and_nonpromotable_output(tmp_path):
+    repro_worker.validate_worker_spec(make_snapflow_spec(tmp_path, diagnostic=True))
+
+    unsafe_loader = make_snapflow_spec(tmp_path, diagnostic=True)
+    option = unsafe_loader["container"]["command"].index("--num-workers")
+    unsafe_loader["container"]["command"][option + 1] = "4"
+    with pytest.raises(repro_worker.WorkerError, match="num_workers=0"):
+        repro_worker.validate_worker_spec(unsafe_loader)
+
+    promoted_diagnostic = make_snapflow_spec(tmp_path, diagnostic=True)
+    promoted_diagnostic["expected_outputs"][0]["publish_destination"] = (
+        "pi05_libero_l09_snapflow/libero-snapflow-overfit/300"
+    )
+    with pytest.raises(repro_worker.WorkerError, match="must not be published"):
+        repro_worker.validate_worker_spec(promoted_diagnostic)
+
+    negated_diagnostic = make_snapflow_spec(tmp_path, diagnostic=True)
+    negated_diagnostic["container"]["command"].append("--no-one-batch-overfit")
+    with pytest.raises(repro_worker.WorkerError, match="unreviewed"):
+        repro_worker.validate_worker_spec(negated_diagnostic)
+
+
+def test_droid_snapflow_contract_accepts_exact_expert_bc_source():
+    source = "pi05_droid_l09_expert_bc_25/droid-bc25/1500"
+    command = [
+        "python",
+        "scripts/train_pytorch.py",
+        "pi05_droid_l09_snapflow",
+        "--exp-name",
+        "droid-snapflow",
+        "--checkpoint-base-dir",
+        "/mnt/openpi/runs",
+        "--pytorch-weight-path",
+        f"/mnt/openpi/checkpoints/{source}",
+        "--seed",
+        "42",
+        "--num-train-steps",
+        "5000",
+        "--save-interval",
+        "5000",
+        "--num-workers",
+        "0",
+        "--no-wandb-enabled",
+    ]
+    artifacts = [{"name": "bc25", "kind": "checkpoint", "destination": source}]
+    outputs = [
+        {
+            "name": "snapflow",
+            "kind": "checkpoint",
+            "path": "checkpoints/pi05_droid_l09_snapflow/droid-snapflow/5000",
+            "publish_destination": "pi05_droid_l09_snapflow/droid-snapflow/5000",
+        }
+    ]
+
+    repro_worker.validate_fresh_snapflow_training_contract(
+        command,
+        "pi05_droid_l09_snapflow",
+        artifacts,
+        outputs,
+    )
+
+    unsafe_loader = command.copy()
+    option = unsafe_loader.index("--num-workers")
+    del unsafe_loader[option : option + 2]
+    with pytest.raises(repro_worker.WorkerError, match="--num-workers"):
+        repro_worker.validate_fresh_snapflow_training_contract(
+            unsafe_loader,
+            "pi05_droid_l09_snapflow",
+            artifacts,
+            outputs,
+        )
+
+
+def test_snapflow_resume_contract_enforces_single_gpu_recipe_and_reviewed_ladder(tmp_path):
+    repro_worker.validate_worker_spec(make_droid_snapflow_resume_spec(tmp_path))
+
+    unsafe_loader = make_droid_snapflow_resume_spec(tmp_path)
+    option = unsafe_loader["container"]["command"].index("--num-workers")
+    del unsafe_loader["container"]["command"][option : option + 2]
+    with pytest.raises(repro_worker.WorkerError, match="--num-workers"):
+        repro_worker.validate_worker_spec(unsafe_loader)
+
+    wandb_enabled = make_droid_snapflow_resume_spec(tmp_path)
+    wandb_enabled["container"]["command"].remove("--no-wandb-enabled")
+    with pytest.raises(repro_worker.WorkerError, match="disabled W&B"):
+        repro_worker.validate_worker_spec(wandb_enabled)
+
+    multi_gpu = make_droid_snapflow_resume_spec(tmp_path)
+    multi_gpu["container"]["command"][:1] = ["torchrun", "--standalone", "--nproc-per-node=2"]
+    with pytest.raises(repro_worker.WorkerError, match="direct single-process Python"):
+        repro_worker.validate_worker_spec(multi_gpu)
+
+    skipped_gate = make_droid_snapflow_resume_spec(tmp_path)
+    option = skipped_gate["container"]["command"].index("--num-train-steps")
+    skipped_gate["container"]["command"][option + 1] = "20000"
+    skipped_gate["expected_outputs"][0]["path"] = "checkpoints/pi05_droid_l09_snapflow/droid-snapflow/20000"
+    skipped_gate["expected_outputs"][0]["publish_destination"] = "pi05_droid_l09_snapflow/droid-snapflow/20000"
+    with pytest.raises(repro_worker.WorkerError, match="continuation ladder"):
+        repro_worker.validate_worker_spec(skipped_gate)
+
+    equals_override = make_droid_snapflow_resume_spec(tmp_path)
+    equals_override["container"]["command"].append("--gradient-accumulation-steps=9")
+    with pytest.raises(repro_worker.WorkerError, match="equals-form"):
+        repro_worker.validate_worker_spec(equals_override)
+
+    negated_resume = make_droid_snapflow_resume_spec(tmp_path)
+    negated_resume["container"]["command"].append("--no-resume")
+    with pytest.raises(repro_worker.WorkerError, match="unreviewed"):
+        repro_worker.validate_worker_spec(negated_resume)
+
+    model_only_override = make_droid_snapflow_resume_spec(tmp_path)
+    model_only_override["container"]["command"].extend(
+        ["--pytorch-weight-path", "/mnt/openpi/checkpoints/pi05_droid_l09_distill/other/5000"]
+    )
+    with pytest.raises(repro_worker.WorkerError, match="full state"):
+        repro_worker.validate_worker_spec(model_only_override)
 
 
 def test_shallow_worker_stages_every_config_path_at_the_expected_container_location(tmp_path):

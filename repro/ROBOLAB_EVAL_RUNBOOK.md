@@ -398,10 +398,15 @@ export FINAL_CHECKPOINT=/mnt/openpi/runs/pi05_droid_l09_snapflow/droid-snapflow/
 ```
 
 Replace the example numeric steps only with checkpoints accepted by the
-offline gate. For manual debugging, create one uniquely named internal bridge
-and put the policy server in a non-root container on that bridge. Never expose
-port 8000 on the host. The accepted ephemeral worker performs these checks and
-cleanup automatically; the shell below mirrors its network boundary.
+offline gate. If expert-BC recovery was selected, set `SHALLOW_CONFIG` to the
+actual `pi05_droid_l09_expert_bc_25` or `pi05_droid_l09_expert_bc_50` config
+and `SHALLOW_CHECKPOINT` to that exact numeric checkpoint. It must be the same
+model hash recorded as the SnapFlow run's initialization source and in the
+offline SnapFlow report. For manual debugging, create one uniquely named
+internal bridge and put the policy server in a non-root container on that
+bridge. Never expose port 8000 on the host. The accepted ephemeral worker
+performs these checks and cleanup automatically; the shell below mirrors its
+network boundary.
 
 ```bash
 export OPENPI_SOURCE="$(git rev-parse --show-toplevel)"

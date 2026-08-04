@@ -256,6 +256,45 @@ replace the three-item `torchrun --standalone --nproc-per-node=2` prefix with
 is not an eligible input. This exception does not alter the ordinary worker or
 launcher matrices and does not authorize a second pilot or a different track.
 
+A fresh SnapFlow worker is a direct single-process Python job on one
+`g7e.2xlarge`; never reuse the two-process Shallow prefix. Stage the track's
+dataset, the original JAX checkpoint that supplies normalization assets, and
+exactly one accepted numeric Shallow worker output. The accepted checkpoint's
+descriptor must retain its complete `CONFIG/EXPERIMENT/STEP` destination, and
+the command must point to that exact destination, for example:
+
+```json
+"command": [
+  "python", "scripts/train_pytorch.py", "pi05_libero_l09_snapflow",
+  "--exp-name", "libero-snapflow-20260804T180000Z-a1",
+  "--checkpoint-base-dir", "/mnt/openpi/runs",
+  "--pytorch-weight-path",
+  "/mnt/openpi/checkpoints/pi05_libero_l09_distill/libero-shallow-20260804T120000Z-a1/5000",
+  "--seed", "42", "--num-train-steps", "5000", "--save-interval", "5000"
+]
+```
+
+The 5k output must be exactly
+`checkpoints/pi05_libero_l09_snapflow/EXPERIMENT/5000` and publish to the same
+path without the leading `checkpoints/`. For DROID, the accepted source config
+may be `pi05_droid_l09_distill`, `pi05_droid_l09_expert_bc_25`, or
+`pi05_droid_l09_expert_bc_50`; preserve its real config name and numeric step.
+Fresh SnapFlow specs reject a missing, generic, or differently staged source,
+an external teacher, multi-process launch, recipe overrides away from global
+batch four/BF16/accumulation one, and an output not bound to the command.
+Because `g7e.2xlarge` has 64 GiB of host memory and the compact DROID loader has
+not yet been measured there, every fresh DROID SnapFlow command also includes
+`--num-workers 0 --no-wandb-enabled`. DROID continuations preserve those
+settings through the resume contract; only a separately recorded memory pilot
+may justify changing them.
+
+The 300-step SnapFlow diagnostic uses the same source binding plus
+`--one-batch-overfit --one-batch-overfit-min-relative-decline 0.20
+--num-workers 0 --no-wandb-enabled`. Its exact numeric checkpoint is retained
+without `publish_destination`; diagnostic weights are never eligible as the
+5k source. A 5k-to-10k/20k/30k continuation uses the ordinary full-state
+`resume_checkpoint` contract below and does not repeat `--pytorch-weight-path`.
+
 `image.purpose` is mandatory; the worker rejects older ambiguous specs. Use
 `policy` for training, policy export, dataset/calibration generation, and eager
 non-simulator policy evaluation. A policy image must declare the approved
