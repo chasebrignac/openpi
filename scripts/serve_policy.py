@@ -1,8 +1,12 @@
 import dataclasses
 import enum
 import logging
+import random
 import socket
 
+import jax
+import numpy as np
+import torch
 import tyro
 
 from openpi.policies import policy as _policy
@@ -48,6 +52,8 @@ class Args:
 
     # Port to serve the policy on.
     port: int = 8000
+    # Seeds JAX inference and the process-global Python, NumPy, and Torch generators.
+    seed: int = 0
     # Record the policy's behavior for debugging.
     record: bool = False
 
@@ -76,27 +82,43 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+def create_default_policy(
+    env: EnvMode, *, default_prompt: str | None = None, rng: jax.Array | None = None
+) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt, rng=rng
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
 
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
+    rng = jax.random.key(args.seed)
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                rng=rng,
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(args.env, default_prompt=args.default_prompt, rng=rng)
+
+
+def seed_process(seed: int) -> None:
+    """Seed inference randomness without changing the policy-server wire protocol."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def main(args: Args) -> None:
+    seed_process(args.seed)
     policy = create_policy(args)
     policy_metadata = policy.metadata
 

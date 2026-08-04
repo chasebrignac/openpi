@@ -9,6 +9,7 @@ def test_identical_outputs_pass_exactly():
     metrics = repro_offline_metrics.compute_metrics(actions, actions)
     assert metrics["kd_mse"] == 0
     assert metrics["kd_cosine_mean"] == pytest.approx(1)
+    assert metrics["action_chunk_rmse"] == 0
     assert metrics["final_chunk_rmse"] == 0
 
 
@@ -23,7 +24,8 @@ def test_reports_limits_and_per_joint_error():
         action_low=np.array([-2, -2]),
         action_high=np.array([2, 4]),
     )
-    assert metrics["action_limit_violations"] == 1
+    assert metrics["normalization_range_excursions"] == 1
+    assert "action_limit_violations" not in metrics
     assert len(metrics["per_joint_normalized_rmse"]) == 2
 
 

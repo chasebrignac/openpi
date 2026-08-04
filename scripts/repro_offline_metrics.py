@@ -3,8 +3,8 @@
 
 Input is an ``npz`` containing ``student`` and ``teacher`` arrays shaped
 ``[samples, horizon, joints]``. Optional keys are ``ground_truth``,
-``action_low`` and ``action_high``. The command emits stable JSON suitable for
-the run manifest and promotion-gate tooling.
+``action_low`` and ``action_high`` in normalized model space. The command emits
+stable JSON suitable for the run manifest and promotion-gate tooling.
 """
 
 from __future__ import annotations
@@ -72,18 +72,22 @@ def compute_metrics(
         "kd_cosine_mean": float(np.mean(cosine)),
         "kd_cosine_p05": float(np.quantile(cosine, 0.05)),
         "per_joint_normalized_rmse": normalized_rmse(student, teacher).tolist(),
+        "action_chunk_rmse": float(np.sqrt(np.mean(np.square(difference)))),
         "final_chunk_rmse": float(np.sqrt(np.mean(np.square(difference[:, -1, :])))),
         "student_roughness_mean": float(np.mean(trajectory_roughness(student))),
         "teacher_roughness_mean": float(np.mean(trajectory_roughness(teacher))),
     }
+    result["roughness_absolute_delta"] = abs(result["student_roughness_mean"] - result["teacher_roughness_mean"])
     if ground_truth is not None:
-        result["ground_truth_mse"] = float(np.mean(np.square(student.astype(np.float64) - ground_truth)))
+        ground_truth_difference = student.astype(np.float64) - ground_truth.astype(np.float64)
+        result["ground_truth_mse"] = float(np.mean(np.square(ground_truth_difference)))
+        result["ground_truth_action_chunk_rmse"] = float(np.sqrt(result["ground_truth_mse"]))
     if (action_low is None) != (action_high is None):
         raise ValueError("action_low and action_high must be supplied together")
     if action_low is not None and action_high is not None:
-        result["student_saturation_rate"] = saturation_rate(student, action_low, action_high)
-        result["teacher_saturation_rate"] = saturation_rate(teacher, action_low, action_high)
-        result["action_limit_violations"] = int(np.sum((student < action_low) | (student > action_high)))
+        result["student_normalization_saturation_rate"] = saturation_rate(student, action_low, action_high)
+        result["teacher_normalization_saturation_rate"] = saturation_rate(teacher, action_low, action_high)
+        result["normalization_range_excursions"] = int(np.sum((student < action_low) | (student > action_high)))
     return result
 
 
@@ -100,9 +104,9 @@ def main() -> int:
         metrics = compute_metrics(
             corpus["student"],
             corpus["teacher"],
-            ground_truth=corpus["ground_truth"] if "ground_truth" in corpus else None,
-            action_low=corpus["action_low"] if "action_low" in corpus else None,
-            action_high=corpus["action_high"] if "action_high" in corpus else None,
+            ground_truth=corpus.get("ground_truth"),
+            action_low=corpus.get("action_low"),
+            action_high=corpus.get("action_high"),
         )
     payload = json.dumps(metrics, indent=2, sort_keys=True) + "\n"
     if args.output is None:

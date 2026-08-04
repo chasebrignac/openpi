@@ -7,6 +7,7 @@ import jax.numpy as jnp
 
 import openpi.models.model as _model
 import openpi.policies.policy as _policy
+from openpi.shared import array_typing as at
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
@@ -22,6 +23,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    rng: at.KeyArrayLike | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -37,6 +39,7 @@ def create_trained_policy(
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
+        rng: Initial JAX inference key. PyTorch inference uses the process-global Torch generator.
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
@@ -91,4 +94,5 @@ def create_trained_policy(
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
+        rng=rng,
     )

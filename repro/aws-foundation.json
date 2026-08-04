@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "recorded_at_utc": "2026-08-03T22:04:33Z",
+  "recorded_at_utc": "2026-08-04T02:24:50Z",
   "project": "pi05-aws-repro",
   "account_id": "752160877725",
   "region": "us-east-2",
@@ -11,9 +11,38 @@
   },
   "scope": {
     "purchase_option": "On-Demand only",
-    "ec2_instances_launched": 0,
+    "ec2_instances_launched": 2,
     "capacity_reservations_or_blocks_purchased": 0,
-    "datasets_transferred_bytes": 0
+    "datasets_transferred_bytes": 293651519885
+  },
+  "launch_amis": {
+    "base": {
+      "id": "ami-01901bc01d5d9bb55",
+      "name": "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20260724",
+      "owner": "amazon",
+      "owner_id": "898082745236",
+      "architecture": "x86_64",
+      "platform_details": "Linux/UNIX",
+      "virtualization_type": "hvm",
+      "root_device_name": "/dev/sda1",
+      "ubuntu_version": "24.04",
+      "nvidia_driver_version": "595.71.05",
+      "driver_evidence": "observed on the first paid workbench"
+    },
+    "evaluation": {
+      "id": "ami-06517bc7fad3c6a48",
+      "name": "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) 20260403",
+      "owner": "amazon",
+      "owner_id": "898082745236",
+      "architecture": "x86_64",
+      "platform_details": "Linux/UNIX",
+      "virtualization_type": "hvm",
+      "root_device_name": "/dev/sda1",
+      "ubuntu_version": "22.04",
+      "nvidia_driver_version": "580.126.09",
+      "supported_instance_families": ["g6e", "g7e"],
+      "driver_evidence": "AWS Deep Learning AMI GPU driver release notes and observed on the first paid evaluator"
+    }
   },
   "network": {
     "vpc_id": "vpc-0b8deb3b4af5473ff",
@@ -75,6 +104,70 @@
         "pi05-repro-artifact-and-logging"
       ]
     },
+    "scheduler_deadline": {
+      "role_name": "pi05-repro-scheduler-deadline-role",
+      "role_arn": "arn:aws:iam::752160877725:role/pi05-repro-scheduler-deadline-role",
+      "schedule_name": "pi05-deadline-ae4bc2fd-6384-49d0-ac9a-fb5e5891ef2e",
+      "schedule_arn": "arn:aws:scheduler:us-east-2:752160877725:schedule/default/pi05-deadline-ae4bc2fd-6384-49d0-ac9a-fb5e5891ef2e",
+      "expression": "at(2026-08-04T05:26:34)",
+      "target": "arn:aws:scheduler:::aws-sdk:ec2:stopInstances"
+    },
+    "first_workbench": {
+      "instance_id": "i-038112fe75c610517",
+      "instance_type": "g6e.4xlarge",
+      "availability_zone": "us-east-2a",
+      "ami_id": "ami-01901bc01d5d9bb55",
+      "ami_name": "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20260724",
+      "nvidia_driver_version": "595.71.05",
+      "purchase_option": "On-Demand",
+      "reservation_id": "ae4bc2fd-6384-49d0-ac9a-fb5e5891ef2e",
+      "reserved_compute_usd": 18.7765,
+      "requested_runtime_hours": 6.0,
+      "deadline_utc": "2026-08-04T05:26:34.171255+00:00",
+      "root_volume_id": "vol-0de00b022d7154c96",
+      "root_volume_gib": 1024,
+      "root_volume_iops": 3000,
+      "root_volume_original_throughput_mibps": 125,
+      "root_volume_current_throughput_mibps": 500,
+      "root_volume_throughput_modified_at_utc": "2026-08-04T01:29:43Z",
+      "instance_store_mount": "/opt/dlami/nvme"
+    },
+    "first_evaluation_smoke": {
+      "instance_id": "i-011eb2c219aea0e3e",
+      "instance_type": "g6e.4xlarge",
+      "availability_zone": "us-east-2a",
+      "ami_id": "ami-06517bc7fad3c6a48",
+      "nvidia_driver_version": "580.126.09",
+      "purchase_option": "On-Demand",
+      "reservation_id": "96c5e984-1279-42c5-b795-ba7699683422",
+      "reserved_compute_usd": 3.7553,
+      "requested_runtime_hours": 1.0,
+      "deadline_utc": "2026-08-04T01:52:03.533429+00:00",
+      "deadline_schedule": "pi05-deadline-96c5e984-1279-42c5-b795-ba7699683422",
+      "evaluator_image_digest": "sha256:2d17c15e62887c9fc8b4c41b7ee3d39c4c187348eb55b4273fd24e785a3325e7",
+      "test_count": 128,
+      "smoke_exit_code": 0,
+      "finished_at_utc": "2026-08-04T01:03:42Z",
+      "log_s3_uri": "s3://pi05-repro-752160877725-us-east-2/manual-smoke/robolab/20260804T005329Z-i-011eb2c219aea0e3e.log",
+      "log_version_id": "AIVks2vssJ5y8yT5.WDeKbiJA0rsvngM",
+      "log_sha256": "dba12538bda077a51f2de816196dfa54d285da47a4fbb8f6cde1d998e6794c5d"
+    },
+    "dataset_staging": {
+      "libero": {
+        "revision": "a4336d589d589045d1c56423ffdf3b88a0e19b1f",
+        "payload_files": 1699,
+        "payload_bytes": 34938927454,
+        "manifest_sha256": "a195fab74ceb43dcc50438f3401f8174a8c477f90f47385ec806048c04537f5f",
+        "manifest_version_id": "30NitaqVRt8BpxA4TAzzxG27icirmyLF"
+      },
+      "droid": {
+        "revision": "e44d3138c64cfeb1c24fbbce087b475fb1233728",
+        "payload_files": 1414,
+        "payload_bytes": 258712592431,
+        "manifest_sha256": "04fd47ec9acc3d211e3ed16e3f44b7f6c73c7b82ca22a98da017f37493854326",
+        "manifest_version_id": "T0MmQScu_e_I_.n824j5XWXHFzUr6n8_"
+      }
+    },
     "cloudwatch_logs": {
       "log_group": "/pi05-repro/jobs",
       "arn": "arn:aws:logs:us-east-2:752160877725:log-group:/pi05-repro/jobs:*",
@@ -113,6 +206,8 @@
     "configuration_checks": "passed",
     "iam_allowed_actions_simulated": [
       "s3:PutObject on the artifact bucket",
+      "s3:GetEncryptionConfiguration on the artifact bucket",
+      "ecr:BatchGetImage on the exact AWS DLC pytorch-training repository",
       "ecr:PutImage on the reproduction repository",
       "logs:PutLogEvents on the reproduction log group"
     ],
@@ -126,6 +221,18 @@
   "manual_adjustments": [
     "Two concurrent S3 control-plane writes returned OperationAborted immediately after bucket creation; encryption and tagging were retried serially and verified.",
     "The repository-scoped IAM policy was expanded from ECR pull-only to push-and-pull so the workbench can publish the digest-pinned image.",
-    "An encrypted SQS sink was added after the new SNS topic was observed to have zero consumers; an end-to-end test message was received and then purged."
+    "An encrypted SQS sink was added after the new SNS topic was observed to have zero consumers; an end-to-end test message was received and then purged.",
+    "Pre-launch review found that the worker's encryption boundary check needed s3:GetEncryptionConfiguration; the bucket-scoped permission was added to the live inline role policy and policy simulation returned allowed.",
+    "Pre-launch review found that the instance role could not pull the pinned cross-account AWS DLC; exact-repository ECR pull permissions were added for 763104351884/pytorch-training while push remains restricted to the project repository.",
+    "The first workbench launch added a one-time EventBridge Scheduler stop deadline outside the guest and retained the guest systemd timer as defense in depth.",
+    "Live storage discovery found the DLAMI-managed LVM/ext4 instance store at /opt/dlami/nvme; workers must reuse that mount and must not format the device.",
+    "Camera-enabled startup in the untouched Isaac Lab 2.2.0 base reproduced the NVIDIA-known Isaac Sim RTX crash on base AMI ami-01901bc01d5d9bb55 with driver 595.71.05, while non-camera startup succeeded. Evaluation launches are therefore pinned to amazon-owned ami-06517bc7fad3c6a48 (Ubuntu 22.04, NVIDIA driver 580.126.09).",
+    "RoboLab dependency resolution selected typing-extensions 4.16.0 and typeguard 4.6.0, breaking the bundled Torch 2.7.0 import path; the image was rebuilt with typeguard 4.4.2 and typing_extensions 4.12.2 and now proves both imports during build.",
+    "Host-side ECR verification required ecr:DescribeImages; the action was added only for the project repository, applied live, simulated as allowed, and verified without replacing the workbench.",
+    "The first paid evaluator on the R580 AMI passed all 128 upstream camera/task smoke tests, wrote a versioned evidence log with smoke_exit_code=0, and self-terminated.",
+    "The workbench staging environment lacked polars; the frozen-lock version 1.30.0 was installed in place before the DROID parquet validation.",
+    "The first real DROID gate exposed that LeRobot v3 video features live in MP4 subtrees referenced by episode metadata rather than data-parquet columns; the validator was corrected against the pinned snapshot before accepting any manifest.",
+    "The exact 1 TiB workbench gp3 volume was increased in place from 125 to 500 MiB/s during large integrity hashing; it remains scheduled for termination with the workbench and the bounded added throughput cost stays inside the non-compute reserve.",
+    "The final episode-derived DROID validator passed exact schema, parquet, video-reference, timestamp, file-count, and byte-count gates before a versioned S3 upload; an independent version-specific manifest fetch and payload listing reproduced its hash and totals."
   ]
 }

@@ -22,6 +22,7 @@
 from typing import Callable, Optional, Union
 
 import torch
+import torch.utils.checkpoint
 from torch import nn
 
 from ...activations import ACT2FN
@@ -523,18 +524,27 @@ class GemmaModel(GemmaPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_values,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                adarms_cond=adarms_cond,
+            layer_kwargs = {
+                "attention_mask": causal_mask,
+                "position_ids": position_ids,
+                "past_key_value": past_key_values,
+                "output_attentions": output_attentions,
+                "use_cache": use_cache,
+                "cache_position": cache_position,
+                "position_embeddings": position_embeddings,
+                "adarms_cond": adarms_cond,
                 **kwargs,
-            )
+            }
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    decoder_layer,
+                    hidden_states,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                    **layer_kwargs,
+                )
+            else:
+                layer_outputs = decoder_layer(hidden_states, **layer_kwargs)
 
             hidden_states = layer_outputs[0]
 

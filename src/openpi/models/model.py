@@ -114,10 +114,17 @@ class Observation(Generic[ArrayT]):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
-            if data["image"][key].dtype == np.uint8:
-                data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+            image = data["image"][key]
+            if isinstance(image, torch.Tensor):
+                # Torch convolution paths consume BCHW, including the float
+                # fake dataset used by the paid-worker preflight smoke.
+                if image.ndim == 4 and image.shape[-1] == 3:
+                    image = image.permute(0, 3, 1, 2)
+                if image.dtype == torch.uint8:
+                    image = image.to(torch.float32) / 255.0 * 2.0 - 1.0
+                data["image"][key] = image
+            elif image.dtype == np.uint8:
+                data["image"][key] = image.astype(np.float32) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],

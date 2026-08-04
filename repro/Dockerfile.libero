@@ -1,0 +1,118 @@
+# Reproduction-only LIBERO evaluator. The parent is either the digest-pinned
+# eager v2 policy image or the combined TensorRT-policy image. The policy
+# server and simulator share one network-disabled worker container while
+# keeping independent Python runtimes.
+ARG POLICY_BASE_IMAGE
+FROM ${POLICY_BASE_IMAGE}
+
+ARG POLICY_BASE_IMAGE
+ARG POLICY_BACKEND=eager
+ARG SOURCE_SHA
+ARG LEROBOT_SHA=0cf864870cf29f4738d3ade893e6fd13fbd7cdb5
+ARG LIBERO_SHA=f78abd68ee283de9f9be3c8f7e2a9ad60246e95c
+ARG LIBERO_REQUIREMENTS_SHA256=124e74d09719941c9e3e75a61330808a8d32ae35a1ebee00c18e1222e966d0c8
+RUN printf '%s\n' "${POLICY_BASE_IMAGE}" \
+      | grep -Eq '^752160877725\.dkr\.ecr\.us-east-2\.amazonaws\.com/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$' \
+    && printf '%s\n' "${POLICY_BACKEND}" | grep -Eq '^(eager|tensorrt)$' \
+    && printf '%s\n' "${SOURCE_SHA}" | grep -Eq '^[0-9a-f]{40}$' \
+    && test "${LEROBOT_SHA}" = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" \
+    && test "${LIBERO_SHA}" = "f78abd68ee283de9f9be3c8f7e2a9ad60246e95c" \
+    && test "${LIBERO_REQUIREMENTS_SHA256}" = "124e74d09719941c9e3e75a61330808a8d32ae35a1ebee00c18e1222e966d0c8"
+
+LABEL org.opencontainers.image.revision=${SOURCE_SHA}
+LABEL ai.openpi.image-purpose="libero-evaluator"
+LABEL ai.openpi.policy-backend=${POLICY_BACKEND}
+LABEL ai.openpi.lerobot-runtime="v2"
+LABEL ai.openpi.lerobot-revision=${LEROBOT_SHA}
+LABEL ai.openpi.libero-simulator-revision=${LIBERO_SHA}
+LABEL ai.openpi.libero-requirements-sha256=${LIBERO_REQUIREMENTS_SHA256}
+LABEL ai.openpi.parent-policy-image="${POLICY_BASE_IMAGE}"
+
+# A compiled evaluator must itself be the image used to export/validate/build
+# and serve its engines. Reject a nominal TensorRT variant whose parent did not
+# actually provide the TensorRT 11 policy runtime and compiler.
+RUN if [ "${POLICY_BACKEND}" = tensorrt ]; then \
+      command -v trtexec >/dev/null \
+      && test -x /opt/modelopt/bin/python \
+      && /opt/modelopt/bin/python -c 'import tensorrt as trt; assert int(trt.__version__.split(".", 1)[0]) == 11'; \
+    fi
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LIBERO_ROOT=/opt/libero \
+    LIBERO_PYTHON=/opt/libero-venv/bin/python \
+    LIBERO_RUNTIME_CONTRACT=/opt/libero-evaluator-contract.json \
+    LIBERO_CONFIG_PATH=/opt/libero-config \
+    MUJOCO_GL=egl \
+    MUJOCO_EGL_DEVICE_ID=0 \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+    PYOPENGL_PLATFORM=egl \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+      clang \
+      g++ \
+      libegl1 \
+      libglew-dev \
+      libglfw3-dev \
+      libgles2-mesa-dev \
+      libglib2.0-0 \
+      libgl1-mesa-glx \
+      libosmesa6-dev \
+      libsm6 \
+      libxext6 \
+      libxrender1 \
+      make \
+    && rm -rf /var/lib/apt/lists/*
+
+# Embed the same reviewed tree identified by SOURCE_SHA. The worker still
+# mounts its separately verified bundle at /workspace/openpi and puts that path
+# first on PYTHONPATH, giving source identity two independent checks.
+WORKDIR /opt/openpi
+COPY . /opt/openpi
+COPY repro/libero-evaluator-requirements.txt /opt/libero-evaluator-requirements.txt
+COPY repro/libero-evaluator-contract.json /opt/libero-evaluator-contract.json
+
+RUN echo "${LIBERO_REQUIREMENTS_SHA256}  /opt/libero-evaluator-requirements.txt" \
+      | sha256sum --check --strict \
+    && uv python install 3.8.20 \
+    && uv venv --python 3.8.20 /opt/libero-venv \
+    && uv pip sync --python /opt/libero-venv/bin/python --no-cache \
+      --extra-index-url https://download.pytorch.org/whl/cu113 \
+      --index-strategy=unsafe-best-match \
+      /opt/libero-evaluator-requirements.txt \
+    && uv pip check --python /opt/libero-venv/bin/python \
+    && test "$(/opt/libero-venv/bin/python -c 'import platform; print(platform.python_version())')" = "3.8.20"
+
+# A normal git archive contains only the third_party/libero gitlink. Fetch the
+# gitlink target explicitly, verify it before deleting Git metadata, and bind
+# the immutable result to the final image digest and OCI revision label.
+RUN git init -q "${LIBERO_ROOT}" \
+    && git -C "${LIBERO_ROOT}" remote add origin https://github.com/Lifelong-Robot-Learning/LIBERO.git \
+    && git -C "${LIBERO_ROOT}" fetch --depth=1 origin "${LIBERO_SHA}" \
+    && test "$(git -C "${LIBERO_ROOT}" rev-parse FETCH_HEAD)" = "${LIBERO_SHA}" \
+    && git -C "${LIBERO_ROOT}" checkout -q --detach FETCH_HEAD \
+    && test "$(git -C "${LIBERO_ROOT}" rev-parse HEAD)" = "${LIBERO_SHA}" \
+    && rm -rf "${LIBERO_ROOT}/.git"
+
+RUN mkdir -p "${LIBERO_CONFIG_PATH}" /usr/share/glvnd/egl_vendor.d \
+    && printf '%s\n' \
+      'benchmark_root: /opt/libero/libero/libero' \
+      'bddl_files: /opt/libero/libero/libero/bddl_files' \
+      'init_states: /opt/libero/libero/libero/init_files' \
+      'datasets: /opt/libero/libero/datasets' \
+      'assets: /opt/libero/libero/libero/assets' \
+      > "${LIBERO_CONFIG_PATH}/config.yaml" \
+    && printf '%s\n' \
+      '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}' \
+      > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
+# This build-time check loads the exact fixed init-state files (which requires
+# torch), checks the official four-suite cardinality, and imports the headless
+# simulator entry point without allocating a GPU environment.
+RUN PYTHONPATH="/opt/openpi/packages/openpi-client/src:${LIBERO_ROOT}" \
+    /opt/libero-venv/bin/python -c \
+      'from libero.libero import benchmark; from libero.libero.envs import OffScreenRenderEnv; suites=("libero_spatial","libero_object","libero_goal","libero_10"); objects=[benchmark.get_benchmark_dict()[name]() for name in suites]; assert all(item.n_tasks == 10 for item in objects); assert all(len(item.get_task_init_states(i)) >= 50 for item in objects for i in range(item.n_tasks)); print(OffScreenRenderEnv, suites)'
+
+ENTRYPOINT []
+CMD ["bash"]

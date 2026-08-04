@@ -7,6 +7,7 @@
       "Action": [
         "s3:GetBucketLocation",
         "s3:GetBucketVersioning",
+        "s3:GetEncryptionConfiguration",
         "s3:ListBucket",
         "s3:ListBucketMultipartUploads",
         "s3:ListBucketVersions"
@@ -39,12 +40,23 @@
         "ecr:BatchCheckLayerAvailability",
         "ecr:BatchGetImage",
         "ecr:CompleteLayerUpload",
+        "ecr:DescribeImages",
         "ecr:GetDownloadUrlForLayer",
         "ecr:InitiateLayerUpload",
         "ecr:PutImage",
         "ecr:UploadLayerPart"
       ],
       "Resource": "arn:aws:ecr:us-east-2:752160877725:repository/pi05-repro"
+    },
+    {
+      "Sid": "PullPinnedAwsDeepLearningContainerBase",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer"
+      ],
+      "Resource": "arn:aws:ecr:us-east-2:763104351884:repository/pytorch-training"
     },
     {
       "Sid": "WriteReproductionLogs",

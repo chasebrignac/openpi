@@ -1,0 +1,60 @@
+# The caller must supply a digest-pinned TensorRT 11 image mirrored into the
+# account's ECR, for example:
+#   --build-arg TENSORRT_IMAGE=$ECR/tensorrt@sha256:...
+ARG TENSORRT_IMAGE
+FROM ${TENSORRT_IMAGE}
+
+ARG SOURCE_SHA
+ARG OPENPI_SHA=15a9616a00943ada6c20a0f158e3adb39df2ccac
+ARG TENSORRT_VERSION=11.0.0.114
+ARG CUDA_VERSION=13.3.0
+ARG MODELOPT_VERSION=0.45.0
+ARG TORCH_VERSION=2.8.0
+ARG ONNX_VERSION=1.21.0
+ARG ONNXRUNTIME_GPU_VERSION=1.24.2
+RUN printf '%s\n' "${SOURCE_SHA}" | grep -Eq '^[0-9a-f]{40}$' \
+    && test "${TENSORRT_VERSION}:${CUDA_VERSION}:${MODELOPT_VERSION}:${TORCH_VERSION}:${ONNX_VERSION}:${ONNXRUNTIME_GPU_VERSION}" \
+      = "11.0.0.114:13.3.0:0.45.0:2.8.0:1.21.0:1.24.2"
+LABEL org.opencontainers.image.revision=${SOURCE_SHA}
+LABEL ai.openpi.upstream-revision=${OPENPI_SHA}
+LABEL ai.openpi.image-purpose="tensorrt-compiler"
+LABEL ai.openpi.tensorrt-version=${TENSORRT_VERSION}
+LABEL ai.openpi.cuda-version=${CUDA_VERSION}
+LABEL ai.openpi.modelopt-version=${MODELOPT_VERSION}
+LABEL ai.openpi.torch-version=${TORCH_VERSION}
+LABEL ai.openpi.onnx-version=${ONNX_VERSION}
+LABEL ai.openpi.onnxruntime-gpu-version=${ONNXRUNTIME_GPU_VERSION}
+LABEL org.opencontainers.image.title="pi05-aws-repro-tensorrt"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/workspace/openpi/src:/workspace/openpi:/opt/openpi/src:/opt/openpi \
+    PATH=/opt/modelopt/bin:/opt/tensorrt/bin:${PATH}
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends git jq \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir uv==0.11.32
+
+WORKDIR /opt/openpi
+COPY . /opt/openpi
+
+# ModelOpt 0.45 requires Torch >=2.8, ONNX ~=1.21, and a newer ml-dtypes than
+# OpenPI/JAX. Keep that toolchain isolated from the pinned Torch 2.7.1 training
+# image; it consumes ONNX and NPZ artifacts and never imports the policy model.
+RUN uv venv --system-site-packages /opt/modelopt --python python3 \
+    && uv pip install --no-config --python /opt/modelopt/bin/python --no-cache-dir \
+        torch==${TORCH_VERSION} \
+        onnx==${ONNX_VERSION} \
+        onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION} \
+        "nvidia-modelopt[onnx]==${MODELOPT_VERSION}" \
+        pytest==8.4.1
+
+RUN python -c "import modelopt, onnx, onnxruntime, tensorrt, torch; actual = (tensorrt.__version__, modelopt.__version__, torch.__version__.split('+', 1)[0], onnx.__version__, onnxruntime.__version__); expected = ('${TENSORRT_VERSION}', '${MODELOPT_VERSION}', '${TORCH_VERSION}', '${ONNX_VERSION}', '${ONNXRUNTIME_GPU_VERSION}'); print(actual); assert actual == expected, (actual, expected)" \
+    && command -v trtexec \
+    && trtexec --help > /tmp/trtexec-help.txt 2>&1 \
+    && grep -F 'TensorRT.trtexec [TensorRT v110000] [b114]' /tmp/trtexec-help.txt \
+    && rm -f /tmp/trtexec-help.txt
+
+ENTRYPOINT []
+CMD ["bash"]

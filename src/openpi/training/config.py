@@ -5,7 +5,9 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
+import re
 from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
@@ -32,6 +34,46 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
+
+SAFE_CHECKPOINT_COMPONENT_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$")
+
+
+def _safe_checkpoint_component(value: object, label: str) -> str:
+    if not isinstance(value, str) or SAFE_CHECKPOINT_COMPONENT_RE.fullmatch(value) is None:
+        raise ValueError(
+            f"{label} must be 1-128 ASCII letters, digits, '.', '_' or '-', start and end with a letter or "
+            "digit, and must not contain '..'"
+        )
+    return value
+
+
+def _reject_symlink_ancestors(path: pathlib.Path) -> None:
+    for candidate in reversed((path, *path.parents)):
+        if candidate.is_symlink():
+            raise ValueError(f"Checkpoint path must not contain symlinks: {candidate}")
+
+
+def resolve_checkpoint_dir(
+    checkpoint_base_dir: str | pathlib.Path,
+    config_name: object,
+    exp_name: object,
+) -> pathlib.Path:
+    """Resolve one experiment directory without permitting path or symlink escapes."""
+
+    safe_config_name = _safe_checkpoint_component(config_name, "config name")
+    safe_exp_name = _safe_checkpoint_component(exp_name, "--exp-name")
+    unresolved_base_dir = pathlib.Path(os.path.abspath(pathlib.Path(checkpoint_base_dir).expanduser()))
+    _reject_symlink_ancestors(unresolved_base_dir)
+    base_dir = unresolved_base_dir.resolve()
+    config_dir = base_dir / safe_config_name
+    checkpoint_dir = config_dir / safe_exp_name
+
+    if config_dir.parent != base_dir or checkpoint_dir.parent != config_dir:
+        raise ValueError("Checkpoint directory is not a strict child of its resolved config directory")
+    _reject_symlink_ancestors(checkpoint_dir)
+    if config_dir.resolve() != config_dir or checkpoint_dir.resolve() != checkpoint_dir:
+        raise ValueError("Checkpoint directory resolves outside its symlink-free config directory")
+    return checkpoint_dir
 
 
 @dataclasses.dataclass(frozen=True)
@@ -89,6 +131,21 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+    # Optional exact local root and immutable Hub revision for LeRobot datasets.
+    lerobot_root: str | None = None
+    lerobot_revision: str | None = None
+    lerobot_codebase_version: str | None = None
+    # Optional episode_index -> task parquet, relative to lerobot_root.
+    episode_prompt_path: str | None = None
+
+    # Conditional RoboLab expert-BC recovery. These remain unset for every
+    # normal training/evaluation config, keeping the path dormant by default.
+    robolab_expert_manifest_path: str | None = None
+    robolab_expert_fraction: float | None = None
+    robolab_expert_seed: int = 42
+    robolab_rerun_decision_path: str | None = None
+    # Populated only after the loader validates the sealed manifest and mix.
+    recovery_provenance: dict[str, Any] | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -462,6 +519,78 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         )
 
 
+MOLMOACT2_DROID_REVISION = "e44d3138c64cfeb1c24fbbce087b475fb1233728"
+LIBERO_REVISION = "a4336d589d589045d1c56423ffdf3b88a0e19b1f"
+PI05_DROID_JOINTPOS_CHECKPOINT = "gs://openpi-assets-simeval/pi05_droid_jointpos"
+
+
+@dataclasses.dataclass(frozen=True)
+class MolmoAct2DROIDDataConfig(DataConfigFactory):
+    """Adapter for the released MolmoAct2-filtered DROID LeRobot schema."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/exterior_image_1_left": "observation.images.exterior_1_left",
+                        "observation/wrist_image_left": "observation.images.wrist_left",
+                        "observation/joint_position": "observation.state.joint_position",
+                        "observation/gripper_position": "observation.state.gripper_position",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            outputs=[droid_policy.DroidOutputs()],
+        )
+        # MolmoAct2's ``action`` is an absolute 7-DoF joint-position target
+        # followed by an absolute gripper command. Match the released
+        # pi05_droid_jointpos checkpoint's internal delta-joint action space.
+        delta_action_mask = _transforms.make_bool_mask(7, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class MolmoAct2DROIDExpertBCDataConfig(MolmoAct2DROIDDataConfig):
+    """MolmoAct2 DROID mixed with sealed successful RoboLab Stack episodes."""
+
+    expert_manifest_path: str = tyro.MISSING
+    expert_fraction: float = 0.25
+    expert_seed: int = 42
+    rerun_decision_path: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.expert_fraction not in {0.25, 0.5}:
+            raise ValueError("RoboLab expert_fraction must be exactly 0.25 or 0.5")
+        if self.expert_fraction == 0.25 and self.rerun_decision_path is not None:
+            raise ValueError("The initial 25/75 expert-BC run must not require a rerun decision")
+        if self.expert_fraction == 0.5 and self.rerun_decision_path is None:
+            raise ValueError("The optional 50/50 expert-BC run requires an approved rerun decision")
+        return dataclasses.replace(
+            super().create(assets_dirs, model_config),
+            robolab_expert_manifest_path=self.expert_manifest_path,
+            robolab_expert_fraction=self.expert_fraction,
+            robolab_expert_seed=self.expert_seed,
+            robolab_rerun_decision_path=self.rerun_decision_path,
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
@@ -481,6 +610,9 @@ class TrainConfig:
 
     # Optional path to a PyTorch checkpoint to load weights from.
     pytorch_weight_path: str | None = None
+
+    # Full-depth PyTorch checkpoint used only for Shallow-pi initialization and KD.
+    teacher_pytorch_weight_path: str | None = None
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
@@ -504,11 +636,26 @@ class TrainConfig:
     seed: int = 42
     # Global batch size.
     batch_size: int = 32
+    # Number of microbatches accumulated before each optimizer step. The
+    # optimizer batch size is ``batch_size * gradient_accumulation_steps``.
+    gradient_accumulation_steps: int = 1
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
+
+    # Repeat one materialized batch for the entire run. This is a bounded,
+    # deterministic optimizer smoke test, not a training mode for promoted
+    # checkpoints.
+    one_batch_overfit: bool = False
+    # Minimum relative decline between the mean loss over the first and last
+    # 20 optimizer steps of a one-batch diagnostic. The diagnostic fails
+    # closed before publishing its final checkpoint when this is not met.
+    one_batch_overfit_min_relative_decline: float = 0.20
+    # Reserve the first deterministic records for the fixed offline corpus.
+    # Training never samples these records when this value is nonzero.
+    offline_holdout_samples: int = 0
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
@@ -542,9 +689,7 @@ class TrainConfig:
     @property
     def checkpoint_dir(self) -> pathlib.Path:
         """Get the checkpoint directory for this config."""
-        if not self.exp_name:
-            raise ValueError("--exp_name must be set")
-        return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
+        return resolve_checkpoint_dir(self.checkpoint_base_dir, self.name, self.exp_name)
 
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
@@ -554,6 +699,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if not 0.0 < self.one_batch_overfit_min_relative_decline < 1.0:
+            raise ValueError("one_batch_overfit_min_relative_decline must be between zero and one")
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -634,6 +781,27 @@ _CONFIGS = [
             data_transforms=lambda model: _transforms.Group(
                 inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
                 outputs=[droid_policy.DroidOutputs()],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+    ),
+    # Exact joint-position inference contract from xuningy/openpi commit
+    # aa6420561529593114160d05e5ad155792b272f3, used by RoboLab commit
+    # 0aef241fb088ca21bb4ebd24448940ed56620d17. The released checkpoint lives at
+    # PI05_DROID_JOINTPOS_CHECKPOINT and supplies the ``droid`` norm stats.
+    TrainConfig(
+        name="pi05_droid_jointpos",
+        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
+        data=SimpleDataConfig(
+            assets=AssetsConfig(asset_id="droid"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
+                outputs=[
+                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
+                    droid_policy.DroidOutputs(),
+                ],
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
@@ -760,6 +928,80 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_libero_l09_distill",
+        model=pi0_config.DistilledPi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            teacher_config="pi05_libero",
+            fm_loss_weight=1.0,
+            kd_loss_weight=1.0,
+            pytorch_compile_mode=None,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir="/mnt/openpi/checkpoints/pi05_libero/assets"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                lerobot_root="/mnt/openpi/datasets/libero",
+                lerobot_revision=LIBERO_REVISION,
+                lerobot_codebase_version="v2.0",
+            ),
+            extra_delta_transform=False,
+        ),
+        teacher_pytorch_weight_path="/mnt/openpi/checkpoints/pi05_libero_pytorch",
+        batch_size=8,
+        gradient_accumulation_steps=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=30_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        num_workers=4,
+        offline_holdout_samples=256,
+    ),
+    TrainConfig(
+        name="pi05_libero_l09_snapflow",
+        model=pi0_config.SnapFlowPi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            pytorch_compile_mode=None,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir="/mnt/openpi/checkpoints/pi05_libero/assets"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                lerobot_root="/mnt/openpi/datasets/libero",
+                lerobot_revision=LIBERO_REVISION,
+                lerobot_codebase_version="v2.0",
+            ),
+            extra_delta_transform=False,
+        ),
+        pytorch_weight_path="/mnt/openpi/checkpoints/pi05_libero_l09_distill",
+        batch_size=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=0.0,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=30_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        num_workers=4,
+        offline_holdout_samples=256,
     ),
     #
     # Fine-tuning Aloha configs.
@@ -915,6 +1157,169 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_droid_l09_distill",
+        model=pi0_config.DistilledPi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            teacher_config="pi05_droid_jointpos",
+            fm_loss_weight=0.0,
+            kd_loss_weight=1.0,
+            pytorch_compile_mode=None,
+        ),
+        data=MolmoAct2DROIDDataConfig(
+            repo_id="allenai/MolmoAct2-DROID-Dataset",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                lerobot_root="/mnt/openpi/datasets/molmoact2-droid",
+                lerobot_revision=MOLMOACT2_DROID_REVISION,
+                lerobot_codebase_version="v3.0",
+                episode_prompt_path="meta/tasks_annotated.parquet",
+            ),
+            assets=AssetsConfig(
+                assets_dir="/mnt/openpi/checkpoints/pi05_droid_jointpos/assets",
+                asset_id="droid",
+            ),
+        ),
+        teacher_pytorch_weight_path="/mnt/openpi/checkpoints/pi05_droid_jointpos_pytorch",
+        batch_size=8,
+        gradient_accumulation_steps=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=30_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        num_workers=4,
+        offline_holdout_samples=256,
+    ),
+    TrainConfig(
+        name="pi05_droid_l09_expert_bc_25",
+        model=pi0_config.ShallowPi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            pytorch_compile_mode=None,
+        ),
+        data=MolmoAct2DROIDExpertBCDataConfig(
+            repo_id="allenai/MolmoAct2-DROID-Dataset",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                lerobot_root="/mnt/openpi/datasets/molmoact2-droid",
+                lerobot_revision=MOLMOACT2_DROID_REVISION,
+                lerobot_codebase_version="v3.0",
+                episode_prompt_path="meta/tasks_annotated.parquet",
+            ),
+            assets=AssetsConfig(
+                assets_dir="/mnt/openpi/checkpoints/pi05_droid_jointpos/assets",
+                asset_id="droid",
+            ),
+            expert_manifest_path="/mnt/openpi/datasets/robolab-stack-expert/expert_bc_manifest.json",
+            expert_fraction=0.25,
+            expert_seed=42,
+        ),
+        pytorch_weight_path="/mnt/openpi/checkpoints/pi05_droid_l09_distill",
+        batch_size=8,
+        gradient_accumulation_steps=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=2.5e-5,
+            decay_steps=1_500,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=1_500,
+        save_interval=500,
+        keep_period=500,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi05_droid_l09_expert_bc_50",
+        model=pi0_config.ShallowPi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            pytorch_compile_mode=None,
+        ),
+        data=MolmoAct2DROIDExpertBCDataConfig(
+            repo_id="allenai/MolmoAct2-DROID-Dataset",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                lerobot_root="/mnt/openpi/datasets/molmoact2-droid",
+                lerobot_revision=MOLMOACT2_DROID_REVISION,
+                lerobot_codebase_version="v3.0",
+                episode_prompt_path="meta/tasks_annotated.parquet",
+            ),
+            assets=AssetsConfig(
+                assets_dir="/mnt/openpi/checkpoints/pi05_droid_jointpos/assets",
+                asset_id="droid",
+            ),
+            expert_manifest_path="/mnt/openpi/datasets/robolab-stack-expert/expert_bc_manifest.json",
+            expert_fraction=0.5,
+            expert_seed=42,
+            rerun_decision_path="/mnt/openpi/datasets/robolab-stack-expert/bc25_rerun_decision.json",
+        ),
+        pytorch_weight_path="/mnt/openpi/checkpoints/pi05_droid_l09_distill",
+        batch_size=8,
+        gradient_accumulation_steps=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=2.5e-5,
+            decay_steps=1_500,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=1_500,
+        save_interval=500,
+        keep_period=500,
+        num_workers=4,
+    ),
+    TrainConfig(
+        name="pi05_droid_l09_snapflow",
+        model=pi0_config.SnapFlowPi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            pytorch_compile_mode=None,
+        ),
+        data=MolmoAct2DROIDDataConfig(
+            repo_id="allenai/MolmoAct2-DROID-Dataset",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                lerobot_root="/mnt/openpi/datasets/molmoact2-droid",
+                lerobot_revision=MOLMOACT2_DROID_REVISION,
+                lerobot_codebase_version="v3.0",
+                episode_prompt_path="meta/tasks_annotated.parquet",
+            ),
+            assets=AssetsConfig(
+                assets_dir="/mnt/openpi/checkpoints/pi05_droid_jointpos/assets",
+                asset_id="droid",
+            ),
+        ),
+        pytorch_weight_path="/mnt/openpi/checkpoints/pi05_droid_l09_distill",
+        batch_size=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=0.0,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=30_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        num_workers=4,
+        offline_holdout_samples=256,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.

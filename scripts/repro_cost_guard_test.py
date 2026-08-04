@@ -1,4 +1,5 @@
 import json
+import math
 
 import pytest
 
@@ -40,6 +41,16 @@ def test_cancelled_reservations_do_not_count(config):
     assert result.total_committed_usd == 0
 
 
+def test_non_compute_reserve_reduces_launchable_hard_cap(config):
+    config["aws"]["hard_cap_non_compute_reserve_usd"] = 25
+    result = repro_cost_guard.project_run(
+        config, {"entries": []}, category="training", instance_type="g.test", instance_count=1, hours=1
+    )
+    assert result.non_compute_reserved_usd == 25
+    assert result.total_committed_usd == 25
+    assert result.remaining_after_usd == 70
+
+
 def test_reservation_is_atomic(tmp_path, config):
     projection = repro_cost_guard.project_run(
         config, {"entries": []}, category="training", instance_type="g.test", instance_count=1, hours=1
@@ -49,3 +60,46 @@ def test_reservation_is_atomic(tmp_path, config):
     payload = json.loads(path.read_text())
     assert payload["entries"][0]["id"] == reservation_id
     assert payload["entries"][0]["usd"] == 5
+
+
+@pytest.mark.parametrize("bad_usd", [-1, math.nan, math.inf, "5"])
+def test_malformed_ledger_cost_fails_closed(config, bad_usd):
+    ledger = {"entries": [{"category": "training", "usd": bad_usd, "state": "launched"}]}
+    with pytest.raises(repro_cost_guard.BudgetError, match="finite"):
+        repro_cost_guard.project_run(
+            config,
+            ledger,
+            category="training",
+            instance_type="g.test",
+            instance_count=1,
+            hours=1,
+        )
+
+
+@pytest.mark.parametrize("hours", [math.nan, math.inf, 0, -1])
+def test_nonfinite_or_nonpositive_runtime_fails_closed(config, hours):
+    with pytest.raises(repro_cost_guard.BudgetError, match="hours"):
+        repro_cost_guard.project_run(
+            config,
+            {"entries": []},
+            category="training",
+            instance_type="g.test",
+            instance_count=1,
+            hours=hours,
+        )
+
+
+def test_stale_local_projection_cannot_overwrite_concurrent_reservation(tmp_path, config):
+    path = tmp_path / "ledger.json"
+    projection = repro_cost_guard.project_run(
+        config,
+        {"entries": []},
+        category="training",
+        instance_type="g.test",
+        instance_count=1,
+        hours=1,
+    )
+    repro_cost_guard.reserve(path, projection, label="first", command="run")
+    with pytest.raises(repro_cost_guard.BudgetError, match="ledger changed"):
+        repro_cost_guard.reserve(path, projection, label="stale", command="run")
+    assert len(json.loads(path.read_text())["entries"]) == 1

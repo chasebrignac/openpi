@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import math
 
@@ -89,6 +90,10 @@ class PI0Pytorch(nn.Module):
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
+        pytorch_gemma_depth = getattr(config, "pytorch_gemma_depth", None)
+        if pytorch_gemma_depth is not None:
+            paligemma_config = dataclasses.replace(paligemma_config, depth=pytorch_gemma_depth)
+            action_expert_config = dataclasses.replace(action_expert_config, depth=pytorch_gemma_depth)
 
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
@@ -161,7 +166,15 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        observation = self.preprocess_observation(observation, train=train)
+        return self._observation_components(observation)
+
+    def preprocess_observation(self, observation, *, train=True):
+        """Preprocess once so a teacher and student can consume identical augmentations."""
+        return _preprocessing.preprocess_observation_pytorch(observation, train=train)
+
+    @staticmethod
+    def _observation_components(observation):
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),
@@ -314,19 +327,19 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+    def predict_velocity(self, observation, actions, noise, time, *, observation_is_preprocessed=False) -> Tensor:
+        """Predict flow velocity for explicit noise and timestep tensors.
 
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
-
-        if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+        Distillation passes the same preprocessed observation, noise, and time
+        to teacher and student through this method.
+        """
+        if observation_is_preprocessed:
+            images, img_masks, lang_tokens, lang_masks, state = self._observation_components(observation)
+        else:
+            images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
@@ -369,7 +382,41 @@ class PI0Pytorch(nn.Module):
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        return self._apply_checkpoint(action_out_proj_func, suffix_out)
+
+    def forward(
+        self,
+        observation,
+        actions,
+        noise=None,
+        time=None,
+        *,
+        observation_is_preprocessed: bool = False,
+        return_velocity: bool = False,
+    ) -> Tensor:
+        """Run a training forward pass.
+
+        ``return_velocity`` is used by Shallow-pi distillation so the student
+        still goes through ``DistributedDataParallel.forward`` while sharing
+        preprocessed observations, noise, and timesteps with its teacher.
+        """
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
+
+        v_t = self.predict_velocity(
+            observation,
+            actions,
+            noise,
+            time,
+            observation_is_preprocessed=observation_is_preprocessed,
+        )
+        if return_velocity:
+            return v_t
+
+        u_t = noise - actions
 
         return F.mse_loss(u_t, v_t, reduction="none")
 

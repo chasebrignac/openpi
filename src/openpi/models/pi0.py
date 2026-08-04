@@ -190,14 +190,38 @@ class Pi0(_model.BaseModel):
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        v_t = self.predict_velocity(
+            observation,
+            actions,
+            noise,
+            time,
+            preprocess_rng=preprocess_rng,
+            train=train,
+        )
+        u_t = noise - actions
+
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+
+    def predict_velocity(
+        self,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        noise: _model.Actions,
+        time: at.Float[at.Array, " b"],
+        *,
+        preprocess_rng: at.KeyArrayLike | None = None,
+        train: bool = False,
+        observation_is_preprocessed: bool = False,
+    ) -> _model.Actions:
+        """Predict velocity for explicit noise/time golden-vector comparisons."""
+        if not observation_is_preprocessed:
+            observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+
         time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -206,12 +230,10 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+        (_prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        return self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
     @override
     def sample_actions(
@@ -271,7 +293,7 @@ class Pi0(_model.BaseModel):
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
-            x_t, time = carry
+            _x_t, time = carry
             # robust to floating-point error
             return time >= -dt / 2
 

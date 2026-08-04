@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "kind": "pi05-libero-evaluator",
+  "simulator": {
+    "repository": "https://github.com/Lifelong-Robot-Learning/LIBERO.git",
+    "revision": "f78abd68ee283de9f9be3c8f7e2a9ad60246e95c"
+  },
+  "python": {
+    "implementation": "CPython",
+    "version": "3.8.20",
+    "environment": "/opt/libero-venv"
+  },
+  "requirements": {
+    "path": "repro/libero-evaluator-requirements.txt",
+    "installed_path": "/opt/libero-evaluator-requirements.txt",
+    "sha256": "124e74d09719941c9e3e75a61330808a8d32ae35a1ebee00c18e1222e966d0c8"
+  },
+  "protocol": {
+    "transport": "loopback-websocket",
+    "client": "openpi_client.websocket_client_policy.WebsocketClientPolicy",
+    "server": "openpi.serving.websocket_policy_server.WebsocketPolicyServer"
+  },
+  "policy_backends": {
+    "eager": {
+      "instance_type": "g6e.4xlarge",
+      "server": "scripts/serve_policy.py"
+    },
+    "tensorrt": {
+      "instance_type": "g7e.4xlarge",
+      "policy_python": "/opt/modelopt/bin/python",
+      "server": "scripts/serve_tensorrt_policy.py",
+      "track": "libero",
+      "dataset": "physical-intelligence/libero",
+      "dataset_revision": "a4336d589d589045d1c56423ffdf3b88a0e19b1f",
+      "precisions": [
+        "bf16",
+        "fp8"
+      ],
+      "placement": "exact-engine-build-instance"
+    }
+  },
+  "compiled_orchestration": {
+    "manual_replays": "direct-final-evaluator-image-on-build-instance",
+    "rendered_exact_instance_spec": "future-non-launchable"
+  },
+  "gpu_environment": {
+    "MUJOCO_GL": "egl",
+    "MUJOCO_EGL_DEVICE_ID": "0",
+    "NVIDIA_DRIVER_CAPABILITIES": "compute,utility,graphics",
+    "PYOPENGL_PLATFORM": "egl"
+  },
+  "suites": [
+    "libero_spatial",
+    "libero_object",
+    "libero_goal",
+    "libero_10"
+  ],
+  "tasks_per_suite": 10,
+  "minimum_fixed_init_states_per_task": 50
+}

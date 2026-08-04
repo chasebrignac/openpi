@@ -26,6 +26,7 @@ Example:
     python examples/convert_jax_model_to_pytorch.py --checkpoint_dir /home/$USER/.cache/openpi/openpi-assets/checkpoints/pi05_droid --output_path /home/$USER/.cache/openpi/openpi-assets/checkpoints/pi05_droid_pytorch
 """
 
+import dataclasses
 import json
 import os
 import pathlib
@@ -35,7 +36,7 @@ from typing import Literal
 from flax.nnx import traversals
 import numpy as np
 import orbax.checkpoint as ocp
-import safetensors
+import safetensors.torch
 import torch
 import tyro
 
@@ -45,6 +46,75 @@ import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 from openpi.training import utils
 import openpi.training.config as _config
+
+_ALLOWED_MISSING_HEADS = {
+    "paligemma_with_expert.paligemma.lm_head.weight",
+    "paligemma_with_expert.gemma_expert.lm_head.weight",
+}
+
+
+def validate_converted_state_keys(incompatible) -> None:
+    """Reject every conversion mismatch except the two unused output heads."""
+    missing = set(incompatible.missing_keys) - _ALLOWED_MISSING_HEADS
+    unexpected = set(incompatible.unexpected_keys)
+    if missing or unexpected:
+        raise ValueError(
+            f"Incomplete JAX-to-PyTorch conversion: missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+        )
+
+
+def initialize_unconverted_heads(model) -> None:
+    """Make the two absent output heads correct or deterministic before save.
+
+    PaliGemma's language head must remain tied to the converted token embedding.
+    The action expert never produces vocabulary logits and has no input
+    embedding, so its otherwise-random unused head is zeroed to make repeated
+    conversions byte-stable within the pinned runtime.
+    """
+    paligemma = model.paligemma_with_expert.paligemma
+    token_embedding = paligemma.model.language_model.embed_tokens.weight
+    if paligemma.lm_head.weight is not token_embedding:
+        raise ValueError("PaliGemma lm_head is not tied to its converted token embedding")
+    with torch.no_grad():
+        model.paligemma_with_expert.gemma_expert.lm_head.weight.zero_()
+
+
+def copy_checkpoint_assets(checkpoint_dir: str, output_path: str) -> None:
+    """Copy normalization assets nested in a locally staged checkpoint."""
+    if checkpoint_dir.startswith("gs://"):
+        raise ValueError("Stage the GCS checkpoint locally before conversion so assets can be hashed and copied")
+    assets_source = pathlib.Path(checkpoint_dir).expanduser().resolve() / "assets"
+    if not assets_source.is_dir():
+        raise FileNotFoundError(f"Checkpoint normalization assets not found: {assets_source}")
+    assets_dest = pathlib.Path(output_path).expanduser().resolve() / "assets"
+    if assets_dest.exists():
+        raise FileExistsError(f"Refusing to replace existing converted assets: {assets_dest}")
+    shutil.copytree(assets_source, assets_dest)
+
+
+def prepare_conversion_output(checkpoint_dir: str, output_path: str) -> pathlib.Path:
+    """Require a fresh, non-overlapping output directory before expensive restore."""
+    if checkpoint_dir.startswith("gs://"):
+        raise ValueError("Stage the GCS checkpoint locally before conversion")
+    source = pathlib.Path(checkpoint_dir).expanduser().resolve()
+    output = pathlib.Path(output_path).expanduser().resolve()
+    if source == output or source in output.parents or output in source.parents:
+        raise ValueError(f"Conversion source and output directories overlap: {source} / {output}")
+    if output.exists() and any(output.iterdir()):
+        raise FileExistsError(f"Refusing to write into non-empty conversion output: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    return output
+
+
+def apply_conversion_precision(model: torch.nn.Module, model_config, precision: str) -> torch.nn.Module:
+    """Apply the requested storage precision without erasing BF16's FP32 exceptions."""
+    if precision == "float32":
+        return model.to(torch.float32)
+    if precision == "bfloat16":
+        if model_config.dtype != "bfloat16":
+            raise ValueError(f"bfloat16 conversion requires a bfloat16 model config, got {model_config.dtype!r}")
+        return model
+    raise ValueError(f"Invalid precision: {precision}")
 
 
 def slice_paligemma_state_dict(state_dict, config):
@@ -268,7 +338,7 @@ def slice_paligemma_state_dict(state_dict, config):
     return final_state_dict, expert_dict
 
 
-def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi05):
+def slice_gemma_state_dict(state_dict, config, *, num_expert, pi05):
     """Convert Gemma JAX parameters to PyTorch format."""
     # Add missing attributes to config if they don't exist
     if not hasattr(config, "vocab_size"):
@@ -290,7 +360,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
     llm_mlp_linear = state_dict.pop(f"llm/layers/mlp_{num_expert}/linear{suffix}")
 
     # Check if we have Dense layers (for pi05/adaptive normalization) or scale layers (for regular pi0)
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization
         llm_input_layernorm_bias = state_dict.pop(f"llm/layers/pre_attention_norm_{num_expert}/Dense_0/bias{suffix}")
         llm_post_attention_layernorm_bias = state_dict.pop(f"llm/layers/pre_ffw_norm_{num_expert}/Dense_0/bias{suffix}")
@@ -345,7 +415,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             i
         ].transpose()
 
-        if "pi05" in checkpoint_dir:
+        if pi05:
             # Pi05 with adaptive normalization - use Dense layer parameters directly
             state_dict[f"paligemma_with_expert.gemma_expert.model.layers.{i}.input_layernorm.dense.bias"] = (
                 llm_input_layernorm_bias[i]
@@ -369,7 +439,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             )
 
     # Handle final norm layer
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization - use Dense layer parameters directly
         final_norm_bias = state_dict.pop(f"llm/final_norm_{num_expert}/Dense_0/bias{suffix}")
         final_norm_kernel = state_dict.pop(f"llm/final_norm_{num_expert}/Dense_0/kernel{suffix}")
@@ -420,19 +490,26 @@ def load_jax_model_and_print_keys(checkpoint_dir: str):
 
 
 def convert_pi0_checkpoint(
-    checkpoint_dir: str, precision: str, output_path: str, model_config: openpi.models.pi0_config.Pi0Config
+    checkpoint_dir: str,
+    precision: str,
+    output_path: str,
+    model_config: openpi.models.pi0_config.Pi0Config,
+    *,
+    config_name: str,
 ):
     """
     Convert PI0 JAX checkpoint to PyTorch format.
 
     Args:
         checkpoint_dir: Path to the JAX checkpoint
-        precision: Model precision (float32, bfloat16, float16)
+        precision: Model precision (float32 or bfloat16)
         output_path: Path to save the converted PyTorch model
         model_config: Model config
+        config_name: Exact OpenPI training config used for conversion
     """
     print(f"Converting PI0 checkpoint from {checkpoint_dir} to {output_path}")
     print(f"Model config: {model_config}")
+    output_root = prepare_conversion_output(checkpoint_dir, output_path)
 
     # Break down orbax ckpts by restoring via JAX to respect dtype
     initial_params = slice_initial_orbax_checkpoint(checkpoint_dir=checkpoint_dir, restore_precision="float32")
@@ -506,49 +583,50 @@ def convert_pi0_checkpoint(
     paligemma_params, expert_params = slice_paligemma_state_dict(initial_params["paligemma_params"], paligemma_config)
 
     # Process Gemma weights from expert_params
-    gemma_params = slice_gemma_state_dict(
-        expert_params, action_expert_config, num_expert=1, checkpoint_dir=checkpoint_dir, pi05=model_config.pi05
-    )
+    gemma_params = slice_gemma_state_dict(expert_params, action_expert_config, num_expert=1, pi05=model_config.pi05)
 
-    # Instantiate model
-    pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_config)
+    # Conversion never calls the compiled sampling entry point.  Disabling the
+    # lazy wrapper keeps checkpoint conversion independent of Triton/compiler
+    # cache state while leaving the model architecture unchanged.
+    conversion_model_config = dataclasses.replace(model_config, pytorch_compile_mode=None)
+    pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(conversion_model_config)
 
     # Combine all parameters (no prefix needed for our model structure)
     all_params = {**paligemma_params, **gemma_params, **projection_params}
 
-    # Load state dict
-    pi0_model.load_state_dict(all_params, strict=False)
+    # Load state dict.  The tied language-model head is intentionally absent;
+    # every other missing or unexpected tensor is a conversion error.  The old
+    # conversion path silently accepted partial checkpoints, which is unsafe for
+    # a numerical-equivalence gate.
+    incompatible = pi0_model.load_state_dict(all_params, strict=False)
+    validate_converted_state_keys(incompatible)
+    initialize_unconverted_heads(pi0_model)
 
-    if precision == "float32":
-        pi0_model = pi0_model.to(torch.float32)
-    elif precision == "bfloat16":
-        pi0_model = pi0_model.to(torch.bfloat16)
-    else:
-        raise ValueError(f"Invalid precision: {precision}")
+    # PI0Pytorch has already applied its intended mixed-BF16 policy.  A blanket
+    # BF16 cast here would undo the model's explicit FP32 exceptions
+    # (normalization/vision-sensitive tensors and projection layers), lose
+    # precision before save, and make the framework-equivalence gate less
+    # representative of the model that training will actually load.
+    pi0_model = apply_conversion_precision(pi0_model, model_config, precision)
 
     # Save the converted model using safetensors
-    os.makedirs(output_path, exist_ok=True)
-
     # Save model weights as SafeTensors using save_model to handle tied weights
-    safetensors.torch.save_model(pi0_model, os.path.join(output_path, "model.safetensors"))
+    safetensors.torch.save_model(pi0_model, output_root / "model.safetensors")
 
-    # Copy assets folder if it exists
-    assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
-    if assets_source.exists():
-        assets_dest = pathlib.Path(output_path) / "assets"
-        if assets_dest.exists():
-            shutil.rmtree(assets_dest)
-        shutil.copytree(assets_source, assets_dest)
+    copy_checkpoint_assets(checkpoint_dir, str(output_root))
 
     # Save config as JSON for reference
     config_dict = {
+        "schema_version": 1,
+        "config_name": config_name,
+        "pi05": model_config.pi05,
         "action_dim": model_config.action_dim,
         "action_horizon": model_config.action_horizon,
         "paligemma_variant": model_config.paligemma_variant,
         "action_expert_variant": model_config.action_expert_variant,
         "precision": precision,
     }
-    with open(os.path.join(output_path, "config.json"), "w") as f:
+    with (output_root / "config.json").open("w") as f:
         json.dump(config_dict, f, indent=2)
 
     print("Model conversion completed successfully!")
@@ -559,7 +637,7 @@ def main(
     checkpoint_dir: str,
     config_name: str,
     output_path: str | None = None,
-    precision: Literal["float32", "bfloat16", "float16"] = "bfloat16",
+    precision: Literal["float32", "bfloat16"] = "bfloat16",
     *,
     inspect_only: bool = False,
 ):
@@ -580,7 +658,13 @@ def main(
         if not output_path:
             print("Error: --output_path is required for conversion. Use --inspect_only to only view keys.")
             return
-        convert_pi0_checkpoint(checkpoint_dir, precision, output_path, model_config)
+        convert_pi0_checkpoint(
+            checkpoint_dir,
+            precision,
+            output_path,
+            model_config,
+            config_name=config_name,
+        )
 
 
 if __name__ == "__main__":

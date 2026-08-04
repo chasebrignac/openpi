@@ -1,0 +1,42 @@
+ARG ISAACLAB_TAG=2.2.0@sha256:b4d8e96cbfb9a6c40067bec6cc5ee180e36d4c0164b25f7215c5f47e31897b94
+FROM nvcr.io/nvidia/isaac-lab:${ISAACLAB_TAG}
+
+ARG ROBOLAB_COMMIT
+ARG OPENPI_COMMIT=aa6420561529593114160d05e5ad155792b272f3
+RUN test -n "${ROBOLAB_COMMIT}" && test -n "${OPENPI_COMMIT}"
+LABEL org.opencontainers.image.revision=${ROBOLAB_COMMIT}
+LABEL ai.openpi.client-revision=${OPENPI_COMMIT}
+LABEL ai.openpi.isaaclab-base-digest=sha256:b4d8e96cbfb9a6c40067bec6cc5ee180e36d4c0164b25f7215c5f47e31897b94
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential git-lfs htop iputils-ping nvtop tmux vim zip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN /workspace/isaaclab/_isaac_sim/python.sh -m pip install --no-cache-dir --no-deps \
+    "openpi-client @ git+https://github.com/xuningy/openpi@${OPENPI_COMMIT}#subdirectory=packages/openpi-client"
+
+COPY assets/robots/ /workspace/robolab/assets/robots/
+COPY assets/materials/ /workspace/robolab/assets/materials/
+COPY assets/fixtures/ /workspace/robolab/assets/fixtures/
+COPY assets/backgrounds/ /workspace/robolab/assets/backgrounds/
+COPY assets/scenes/ /workspace/robolab/assets/scenes/
+COPY assets/objects/ /workspace/robolab/assets/objects/
+
+ENV OMNI_KIT_ACCEPT_EULA=YES \
+    ACCEPT_EULA=Y
+
+COPY . /workspace/robolab
+WORKDIR /workspace/robolab
+
+# RoboLab's unconstrained dependency resolution upgrades typing-extensions to
+# 4.16.0.  Isaac Lab 2.2.0 bundles torch 2.7.0, whose torch._dynamo imports
+# fail with that release.  The resolver also installs typeguard 4.6.0, which
+# requires typing-extensions >=4.14.0.  Pin the last compatible typeguard
+# release together with the base image's known-good typing-extensions, then
+# prove both the Torch and pytest-plugin import paths before sealing.
+RUN GIT_LFS_SKIP_SMUDGE=1 /workspace/isaaclab/_isaac_sim/python.sh -m pip install --no-cache-dir -e . \
+    && /workspace/isaaclab/_isaac_sim/python.sh -m pip install --no-cache-dir --no-deps \
+       typeguard==4.4.2 typing_extensions==4.12.2 \
+    && /workspace/isaaclab/_isaac_sim/python.sh -c \
+       "import importlib.metadata as m, torch, torch._dynamo, typeguard; assert m.version('typing_extensions') == '4.12.2'; assert m.version('typeguard') == '4.4.2'; print(torch.__version__)"
