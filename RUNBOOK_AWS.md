@@ -297,8 +297,11 @@ Use `scripts/repro_aws_launch.py` for every GPU launch. Omitting `--execute` is 
 Every launch declares both a spend `--category` and an underlying
 `--workload`. They are identical for normal runs. A bounded corrective retry
 uses `--category corrective_run` but must retain the actual workload, such as
-`--workload shallow_training`; the launcher applies both hardware matrices, so
-the corrective budget cannot turn a two-GPU Shallow job into a one-GPU job.
+`--workload shallow_training`. The launcher applies the normal workload matrix
+unless an exact corrective-only fallback is declared in source. The sole
+current exception is one `g7e.4xlarge` for a single-process Shallow replay
+after a failed two-GPU runtime gate; ordinary `shallow_training` launches
+remain locked to one `g7e.12xlarge`.
 AMI selection is workload-scoped and has no command-line override. Workload
 `evaluation` deterministically selects Amazon AMI
 `ami-06517bc7fad3c6a48`, exact name
@@ -332,15 +335,30 @@ python3 scripts/repro_aws_launch.py \
   --command-file /tmp/libero-shallow-2k-01.command.sh
 ```
 
-Shallow training is intentionally launch-guarded to `g7e.12xlarge`: its two
-local GPUs match the documented `torchrun --nproc-per-node=2` contract.  If the
+Normal Shallow training is intentionally launch-guarded to `g7e.12xlarge`: its
+two local GPUs match the documented `torchrun --nproc-per-node=2` contract. If the
 first AZ reports insufficient capacity, rerender the same launch with
 `--subnet-id subnet-0b49463b4ceee4d0f`, the other foundation-pinned subnet in
-which preflight found G7e. Do not substitute a
-`g7e.4xlarge`; it has one GPU, and neither the worker nor launcher implements a
-two-node rendezvous.  If both pinned AZs are unavailable, record an AWS
+which preflight found G7e. If both pinned AZs are unavailable, record an AWS
 capacity outage and retry later rather than launching a command that cannot
 run.
+
+The one-GPU fallback is not a capacity-outage substitution and never runs the
+two-process command. Use it only after the exact failed two-GPU manifest and
+successful final-sync evidence have been hash/version verified, and only when
+the worker spec contains direct `python scripts/train_pytorch.py` with no
+`torchrun`, resume, overwrite, or publication destination. Its preparation
+gate must bind those facts before rendering this read-only corrective plan:
+
+```bash
+python3 scripts/repro_aws_launch.py \
+  --category corrective_run \
+  --workload shallow_training \
+  --instance-type g7e.4xlarge \
+  --hours 6 \
+  --label shallow-libero-overfit-single-gpu \
+  --command-file /tmp/libero-shallow-overfit-single-gpu.command.sh
+```
 
 The manual TensorRT replay is intentionally different from an ephemeral
 training worker. It needs one bounded G7e session to survive a failed or
@@ -538,5 +556,6 @@ camera-enabled evaluator smoke, not a policy-quality evaluation.
 84. A3 proved the reviewed network correction on the real two-GPU worker. Container `585ab6305781701c618ec79fef21f4d316e259a15169961326f009a71837a83e` had deterministic hostname `pi05-worker-7c41560b2661d3c3e5984e9179a599d7`, the matching `127.0.0.1` host entry, `NetworkMode=none`, exactly one worker-owned `NCCL_SOCKET_IFNAME=lo` and `GLOO_SOCKET_IFNAME=lo`, read-only source/input mounts, and only declared writable output/cache mounts. Both ranks selected distinct GPUs and completed NCCL bootstrap over loopback. What initially looked like a hang was a 342.68-second NCCL communicator initialization whose timing attributed 342.66/342.35 seconds to device kernels; bootstrap, topology, graphs, and connections were effectively milliseconds. It then connected four rings through `P2P/CUMEM`, passed the first barrier, established local microbatch four on each GPU (global microbatch eight, accumulation eight), loaded the exact LIBERO split and teacher, and began model construction. Replays must allow for this measured first-container initialization latency and must not classify it as a socket failure merely because the log pauses after `Comm config Blocking set to 1`.
 85. During that long silent initialization, three bounded same-node diagnostics were started manually. SSM `a81a6c16-8a52-4363-800e-daa8363ae05b` set each CUDA device before `init_process_group`, passed `device_id`, and timed out after 90 seconds while still in the same slow kernel phase. SSM `cfe2afa6-2c37-43f7-a0dd-b3f494dae5fa` added `NCCL_P2P_DISABLE=1` and timed out after 60 seconds, also before its communicator finished. SSM `709b3fce-4932-4be4-b95a-2df6ebcea5ca` began a socket-only discriminator, but was cancelled as soon as the newly synced A3 segment proved the primary communicator had completed; the child diagnostic container required a separate stop/kill request while the instance was already entering shutdown. A first environment-inspection invocation had malformed JSON and was rejected locally before `SendCommand`. These diagnostic CUDA contexts overlapped the primary process, so A3 is valid failure evidence but not a clean causal test of P2P, cuMem, device ordering, or the image/driver. The next two-GPU diagnostic must run alone on clean GPU contexts; never repeat concurrent CUDA collectives beside a promotion candidate.
 86. A3 failed at `2026-08-04T10:47:41Z`, before its first optimizer step, when both ProcessGroupNCCL watchdogs reported an asynchronous illegal CUDA memory access during DDP construction; rank zero terminated with SIGABRT and the container exited one. No checkpoint, `training-metrics.json`, overfit diagnostic, expected-output marker, or published input exists. The exact terminal log is `runs/libero-shallow-overfit-20260804t101804z-a3-300/logs/container-000005.log`, VersionId `CsF120JJSbhFpQOQvxYfXWTLccjkT0mM`, SHA-256 `0b3837fac1152fea099824be5259f591f5c202bd2ce6254efacf7b485dbc6d7d`. The failed run manifest is VersionId `Ac6SeqISqUJ7KwzMQFBDpZYkzFA3X_96`, SHA-256 `10c5d993b4d7a3bc02986779a460f157382bdf4f1474c423e3d62e27add406da`; final-sync evidence is VersionId `C6UFKyoNpQsO1ZnKxdVq66zvcoFwmyT6`, SHA-256 `0c7277e0d09bc72727760a508f5d3505b130d61a9467fc8086c003f356bf1192`, and records seven receipts plus successful final sync. The prefix contains exactly six append-only log segments and those two manifests, with no delete marker. The worker initiated instance termination immediately. Because overlapping diagnostics confound the illegal-access cause, A3 is diagnostic only and cannot authorize the prepared 2k pilot.
+87. Instance `i-0670a84ff7700440b` reached `terminated` with reason `Client.InstanceInitiatedShutdown` only after the complete A3 final sync. Independent exact-VersionId downloads reproduced every hash in its eight-key prefix; all eight objects are AES256 singleton versions with no delete marker. To continue without DDP, commit `776069268d85d3bfc8feb632f3a4770106b01366` keeps ordinary Shallow launches locked to `g7e.12xlarge` and admits one `g7e.4xlarge` only when both category `corrective_run` and workload `shallow_training` are explicit. A cross-workload fallback remains rejected. Ruff, format, byte compilation, 126 relevant launcher/worker/training/checkpoint tests, and an independent policy review passed. Its 1,774,980-byte HEAD-only complete-history bundle is SHA-256 `e0ef2a041c63617f9c8300de27fbf9f7b71275c18134ced8ee3413725c633644`, key `source/openpi-776069268d85d3bfc8feb632f3a4770106b01366-complete.bundle`, VersionId `1rS.xU8DWM4uyZGaJOU2gSEjEQWi.77g`. The unchanged 8,888-byte bootstrap is SHA-256 `b3a81e2163661789d7a76eba9b62ce6d10ee79eff1784e004a7cfc48f4651d94`, key `bootstrap/worker-bootstrap-controller-776069268d85d3bfc8feb632f3a4770106b01366.sh`, VersionId `HaD15VhZJua_bd_mrFTi9pzDesXAuUkM`. Both create-once keys are AES256 singleton/no-delete objects. Local and exact-VersionId remote audits passed bundle verification, fresh bare and working clones, non-shallow exact detached HEAD, formerly missing-parent presence, full strict fsck, exact hashes, and bootstrap Bash syntax.
 
 Record any future console action or command here before incorporating it into CloudFormation.
