@@ -454,7 +454,10 @@ def test_run_request_is_on_demand_hardened_and_tagged(tmp_path, config, foundati
     assert "amazon-ssm-agent.service" in user_data
     assert "After=network-online.target dlami-nvme.service docker.service" in user_data
     assert "KillSignal=SIGTERM" in user_data
-    assert "ExecStopPost=/usr/bin/systemctl --no-block poweroff" in user_data
+    assert (
+        'ExecStopPost=/bin/sh -c \'if [ "$SERVICE_RESULT" = success ]; then '
+        "/usr/bin/systemctl --no-block poweroff; fi'"
+    ) in user_data
     metadata_line = next(line for line in user_data.splitlines() if line.endswith("> /opt/pi05/launch-metadata.json"))
     metadata = json.loads(base64.b64decode(metadata_line.split("'")[3]))
     assert metadata["reservation_id"] == "reservation-1"

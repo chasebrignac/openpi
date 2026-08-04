@@ -600,7 +600,17 @@ def build_user_data(plan: LaunchPlan, reservation_id: str) -> str:
     on_calendar = dt.datetime.fromisoformat(plan.deadline_utc).astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     job_section = ""
     if plan.command:
-        stop_after_job = "" if plan.retain_after_command else "ExecStopPost=/usr/bin/systemctl --no-block poweroff"
+        # Successful disposable jobs shut down immediately, but a failed job
+        # stays reachable through SSM until the independently scheduled hard
+        # deadline.  This preserves the journal and scratch state needed for a
+        # bounded same-instance diagnosis instead of deleting the only failure
+        # evidence as soon as ExecStart returns nonzero.
+        stop_after_job = (
+            ""
+            if plan.retain_after_command
+            else 'ExecStopPost=/bin/sh -c \'if [ "$SERVICE_RESULT" = success ]; then '
+            "/usr/bin/systemctl --no-block poweroff; fi'"
+        )
         job_section = f"""
 printf '%s' '{command_b64}' | base64 --decode > /opt/pi05/run-command.sh
 chmod 0700 /opt/pi05/run-command.sh
