@@ -8,6 +8,7 @@ ARG LEROBOT_SHA
 ARG LEROBOT_V2_SHA=0cf864870cf29f4738d3ade893e6fd13fbd7cdb5
 ARG LEROBOT_V3_SHA=0b067df57d21d3a02d6c511f1609172fa39ac29b
 ARG PALIGEMMA_TOKENIZER_SHA256=8986bb4f423f07f8c7f70d0dbe3526fb2316056c17bae71b1ea975e77a168fc6
+ARG ONNXRUNTIME_GPU_VERSION=1.26.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/cache/huggingface \
@@ -61,7 +62,7 @@ RUN printf '%s\n' \
     && uv pip install --system --no-cache-dir \
         huggingface-hub==0.33.1 \
         onnx==1.17.0 \
-        onnxruntime-gpu==1.28.0 \
+        onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION} \
         pytest==8.4.1 \
     && rm -f /tmp/dlc-provided-requirements.txt /tmp/openpi-locked-requirements.txt
 
@@ -110,7 +111,7 @@ RUN printf '%s\n' "${SOURCE_SHA}" | grep -Eq '^[0-9a-f]{40}$' \
 RUN TRANSFORMERS_DIR="$(python -c 'import pathlib, transformers; print(pathlib.Path(transformers.__file__).parent)')" \
     && cp -r src/openpi/models_pytorch/transformers_replace/* "${TRANSFORMERS_DIR}/"
 
-RUN python -c "import importlib.metadata as m, importlib.util, onnx, onnxruntime, torch; expected = {'jax': '0.5.3', 'jaxlib': '0.5.3', 'onnx': '1.17.0', 'onnxruntime-gpu': '1.28.0', 'pytest': '8.4.1', 'torch': '2.7.1', 'torchcodec': '0.4.0', 'torchvision': '0.22.1', 'transformers': '4.53.2'}; actual = {name: m.version(name).split('+', 1)[0] for name in expected}; print(actual, torch.version.cuda, onnx.__version__, onnxruntime.__version__); assert actual == expected, (actual, expected); assert all(importlib.util.find_spec(name) is None for name in ('gym_aloha', 'mujoco')); assert onnx.__version__ == expected['onnx']; assert onnxruntime.__version__ == expected['onnxruntime-gpu']; assert torch.version.cuda == '12.8', torch.version.cuda" \
+RUN python -c "import importlib.metadata as m, importlib.util, onnx, onnxruntime, torch; expected = {'jax': '0.5.3', 'jaxlib': '0.5.3', 'onnx': '1.17.0', 'onnxruntime-gpu': '${ONNXRUNTIME_GPU_VERSION}', 'pytest': '8.4.1', 'torch': '2.7.1', 'torchcodec': '0.4.0', 'torchvision': '0.22.1', 'transformers': '4.53.2'}; actual = {name: m.version(name).split('+', 1)[0] for name in expected}; print(actual, torch.version.cuda, onnx.__version__, onnxruntime.__version__); assert actual == expected, (actual, expected); assert all(importlib.util.find_spec(name) is None for name in ('gym_aloha', 'mujoco')); assert onnx.__version__ == expected['onnx']; assert onnxruntime.__version__ == expected['onnxruntime-gpu']; assert torch.version.cuda == '12.8', torch.version.cuda" \
     && python -c "from openpi.training import config; assert config.get_config('pi05_libero_l09_distill').name == 'pi05_libero_l09_distill'; assert config.get_config('pi05_droid_l09_distill').name == 'pi05_droid_l09_distill'" \
     && python scripts/smoke_lerobot_video.py \
     && if [ "${LEROBOT_RUNTIME}" = "v3" ]; then \
@@ -127,6 +128,7 @@ LABEL ai.openpi.lerobot-revision=${LEROBOT_SHA}
 LABEL ai.openpi.paligemma-tokenizer-sha256=${PALIGEMMA_TOKENIZER_SHA256}
 LABEL ai.openpi.simulator-runtime="external"
 LABEL ai.openpi.video-decoder="pyav"
+LABEL ai.openpi.onnxruntime-gpu-version=${ONNXRUNTIME_GPU_VERSION}
 LABEL org.opencontainers.image.title="pi05-aws-repro"
 
 ENTRYPOINT []

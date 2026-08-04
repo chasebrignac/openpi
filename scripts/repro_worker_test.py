@@ -955,6 +955,7 @@ def test_image_digest_must_carry_the_pinned_source_revision(tmp_path):
         "ai.openpi.lerobot-runtime": "v2",
         "ai.openpi.lerobot-revision": "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
         "ai.openpi.video-decoder": "pyav",
+        "ai.openpi.onnxruntime-gpu-version": "1.26.0",
     }
     assert repro_worker.validate_image_identity(spec, [spec["image"]["uri"]], labels) == [spec["image"]["uri"]]
 
@@ -974,6 +975,10 @@ def test_image_digest_must_carry_the_pinned_source_revision(tmp_path):
     wrong_decoder = {**labels, "ai.openpi.video-decoder": "torchcodec"}
     with pytest.raises(repro_worker.WorkerError, match="video decoder"):
         repro_worker.validate_image_identity(spec, [spec["image"]["uri"]], wrong_decoder)
+
+    wrong_ort = {**labels, "ai.openpi.onnxruntime-gpu-version": "1.28.0"}
+    with pytest.raises(repro_worker.WorkerError, match="ONNX Runtime"):
+        repro_worker.validate_image_identity(spec, [spec["image"]["uri"]], wrong_ort)
 
     wrong_purpose = {**labels, "ai.openpi.image-purpose": "tensorrt-compiler"}
     with pytest.raises(repro_worker.WorkerError, match="purpose label"):

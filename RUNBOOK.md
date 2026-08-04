@@ -236,6 +236,8 @@ verify_training_image() {
     "$PALIGEMMA_TOKENIZER_SHA256"
   test "$(docker image inspect --format '{{index .Config.Labels "ai.openpi.video-decoder"}}' "$image")" = \
     pyav
+  test "$(docker image inspect --format '{{index .Config.Labels "ai.openpi.onnxruntime-gpu-version"}}' "$image")" = \
+    1.26.0
 }
 smoke_policy_image() {
   local image="$1" runtime="$2"
