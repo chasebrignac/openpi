@@ -49,20 +49,32 @@ WORKLOAD_AMI_KEYS = {"evaluation": "evaluation"}
 
 # A workload may only launch the machines assigned to that stage in the plan.
 # Spend categories are separate: ``corrective_run`` can fund a bounded retry,
-# but it cannot change the retried workload's hardware contract.
+# but it may change hardware only through an explicit fallback below.
 WORKLOAD_MATRIX: dict[str, dict[str, int]] = {
     "workbench_setup": {"g6e.4xlarge": 1},
     # Every documented Shallow command is one-node, two-process DDP.  Keep the
     # launch guard aligned with that contract: g7e.4xlarge has only one GPU and
-    # this launcher does not implement a multi-node rendezvous.
+    # this launcher does not implement a multi-node rendezvous.  A separately
+    # budgeted single-process fallback is admitted below only as a corrective
+    # run after a failed two-GPU runtime gate.
     "shallow_training": {"g7e.12xlarge": 1},
     "snapflow_bc": {"g7e.2xlarge": 2},
     "export_compile_quantize": {"g7e.4xlarge": 1},
     "evaluation": {"g6e.4xlarge": 4},
 }
 
+# Corrective capacity may narrow a workload's hardware shape when the manual
+# runbook has established that the primary shape cannot pass its runtime gate.
+# Keeping this outside WORKLOAD_MATRIX prevents an ordinary Shallow launch from
+# silently selecting one GPU and preserves the explicit corrective-run audit
+# trail in both the cost ledger and run manifest.
+CORRECTIVE_WORKLOAD_FALLBACKS: dict[str, dict[str, int]] = {
+    "shallow_training": {"g7e.4xlarge": 1},
+}
+
 # The category selects a spend cap. Normal runs use the same-named workload;
-# corrective runs must declare one underlying workload and pass both matrices.
+# corrective runs must declare one underlying workload and match either its
+# primary hardware matrix or one explicit corrective fallback.
 LAUNCH_MATRIX: dict[str, dict[str, int]] = {
     **WORKLOAD_MATRIX,
     "corrective_run": {
@@ -241,8 +253,16 @@ def validate_launch_policy(
     if instance_count != 1:
         raise LaunchError(f"instance count must be exactly 1 per guarded launch, got {instance_count}")
     resolved_workload = resolve_workload(category, workload)
-    if instance_type not in WORKLOAD_MATRIX[resolved_workload]:
+    workload_maximum = WORKLOAD_MATRIX[resolved_workload].get(instance_type)
+    if workload_maximum is None and category == "corrective_run":
+        workload_maximum = CORRECTIVE_WORKLOAD_FALLBACKS.get(resolved_workload, {}).get(instance_type)
+    if workload_maximum is None:
         raise LaunchError(f"{instance_type} is not approved for workload {resolved_workload}")
+    if instance_count > workload_maximum:
+        raise LaunchError(
+            f"instance count {instance_count} exceeds the maximum {workload_maximum} for "
+            f"{resolved_workload} on {instance_type}"
+        )
     return resolved_workload
 
 
@@ -1310,7 +1330,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--workload",
         required=True,
         choices=tuple(WORKLOAD_MATRIX),
-        help="underlying stage identity; corrective_run changes the spend cap, never this hardware contract",
+        help="underlying stage identity; corrective_run may use only an explicitly declared hardware fallback",
     )
     parser.add_argument("--instance-type", required=True)
     parser.add_argument("--instance-count", type=int, default=1)

@@ -204,7 +204,7 @@ def test_shallow_training_rejects_single_gpu_fallback(tmp_path, config, foundati
         )
 
 
-def test_corrective_budget_cannot_bypass_underlying_workload_hardware(tmp_path, config, foundation):
+def test_corrective_budget_allows_only_declared_workload_fallbacks(tmp_path, config, foundation):
     config_path, foundation_path = write_inputs(tmp_path, config, foundation)
 
     with pytest.raises(repro_aws_launch.LaunchError, match="explicit underlying --workload"):
@@ -224,6 +224,17 @@ def test_corrective_budget_cannot_bypass_underlying_workload_hardware(tmp_path, 
             subnet_id=None,
             category="corrective_run",
             workload="shallow_training",
+            instance_type="g7e.2xlarge",
+            instance_count=1,
+        )
+
+    with pytest.raises(repro_aws_launch.LaunchError, match="not approved for workload evaluation"):
+        repro_aws_launch.load_static_inputs(
+            config_path,
+            foundation_path,
+            subnet_id=None,
+            category="corrective_run",
+            workload="evaluation",
             instance_type="g7e.4xlarge",
             instance_count=1,
         )
@@ -238,6 +249,17 @@ def test_corrective_budget_cannot_bypass_underlying_workload_hardware(tmp_path, 
         instance_count=1,
     )
     assert shallow_retry.workload == "shallow_training"
+
+    single_gpu_shallow_retry = repro_aws_launch.load_static_inputs(
+        config_path,
+        foundation_path,
+        subnet_id=None,
+        category="corrective_run",
+        workload="shallow_training",
+        instance_type="g7e.4xlarge",
+        instance_count=1,
+    )
+    assert single_gpu_shallow_retry.workload == "shallow_training"
 
     export_retry = repro_aws_launch.load_static_inputs(
         config_path,
