@@ -90,7 +90,18 @@ aws s3api get-object \
   --region "${EXPECTED_AWS_REGION}" \
   "${source_bundle}" >/dev/null
 printf '%s  %s\n' "${source_pin[3]}" "${source_bundle}" | sha256sum --check --status
-git bundle verify "${source_bundle}" >/dev/null
+verify_repo=/opt/pi05/bundle-verify.git
+if test -e "${verify_repo}"; then
+  echo "bundle verification repository already exists; refusing stale reuse" >&2
+  exit 2
+fi
+git init --bare "${verify_repo}" >/dev/null
+git -C "${verify_repo}" bundle verify "${source_bundle}" >/dev/null
+bundle_head=$(git bundle list-heads "${source_bundle}" HEAD | awk '$2 == "HEAD" {print $1}')
+if test "${bundle_head}" != "${source_pin[4]}"; then
+  echo "source bundle HEAD mismatch" >&2
+  exit 2
+fi
 
 checkout=/opt/pi05/repo
 if test -e "${checkout}"; then

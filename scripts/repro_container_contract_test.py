@@ -41,6 +41,11 @@ def test_training_container_pins_match_reproduction_config() -> None:
     assert "--require-hashes" in dockerfile
     assert "--no-hashes" not in dockerfile
     assert "nvidia-cuda-runtime-cu12" in dockerfile
+    assert "--prune gym-aloha" in dockerfile
+    assert "('gym_aloha', 'mujoco')" in dockerfile
+    assert "config.get_config('pi05_libero_l09_distill')" in dockerfile
+    assert "config.get_config('pi05_droid_l09_distill')" in dockerfile
+    assert 'LABEL ai.openpi.simulator-runtime="external"' in dockerfile
     for package_version in ("0.5.3", "1.17.0", "1.28.0", "2.7.1", "0.4.0", "0.22.1", "4.53.2"):
         assert package_version in dockerfile
 
@@ -152,8 +157,15 @@ def test_source_bundle_seed_and_single_corpus_contracts_are_documented() -> None
     assert 'test -z "$(git status --porcelain)"' in worker_runbook
     assert "status --porcelain=v1 --untracked-files=all" in bootstrap
     assert '"source_clean": True' in bootstrap
+    assert 'git -C "${verify_repo}" bundle verify "${source_bundle}"' in bootstrap
+    assert 'git bundle list-heads "${source_bundle}" HEAD' in bootstrap
+    assert "source bundle HEAD mismatch" in bootstrap
     assert "git bundle list-heads /tmp/openpi.bundle HEAD" in worker_runbook
     assert '--version-id "$SOURCE_VERSION_ID"' in worker_runbook
+    assert 'SOURCE_BUNDLE_KEY="source/openpi-$SOURCE_COMMIT.bundle"' in worker_runbook
+    assert "--if-none-match '*'" in worker_runbook
+    assert "SOURCE_FINAL_HISTORY_JSON" in worker_runbook
+    assert "openpi-SOURCE_GIT_COMMIT.bundle" in worker_runbook
     assert "source-commit=$SOURCE_COMMIT,sha256=$SOURCE_BUNDLE_SHA256" in worker_runbook
     assert '"--seed", "42"' in worker_runbook
     assert '"seed": 42' in worker_runbook

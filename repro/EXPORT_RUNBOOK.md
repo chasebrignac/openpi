@@ -49,9 +49,9 @@ git archive --format=tar "$SOURCE_COMMIT" | docker build --platform linux/amd64 
   --build-arg SOURCE_SHA="$SOURCE_COMMIT" \
   --tag "$COMPILER_LOCAL" -
 
-test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' \
+test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
   "$COMPILER_LOCAL")" = "$SOURCE_COMMIT"
-test "$(docker image inspect --format '{{index .Config.Labels \"ai.openpi.image-purpose\"}}' \
+test "$(docker image inspect --format '{{index .Config.Labels "ai.openpi.image-purpose"}}' \
   "$COMPILER_LOCAL")" = tensorrt-compiler
 docker run --rm --gpus all --network none "$COMPILER_LOCAL" bash -ceu '
 /opt/modelopt/bin/python - <<PY
@@ -134,11 +134,11 @@ git archive --format=tar "$SOURCE_COMMIT" | docker build --platform linux/amd64 
 for TRACK in libero droid; do
   LOCAL="pi05-tensorrt-policy-$TRACK:$SOURCE_COMMIT"
   TAG="tensorrt-policy-$TRACK-$SOURCE_COMMIT"
-  test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' \
+  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
     "$LOCAL")" = "$SOURCE_COMMIT"
-  test "$(docker image inspect --format '{{index .Config.Labels \"ai.openpi.image-purpose\"}}' \
+  test "$(docker image inspect --format '{{index .Config.Labels "ai.openpi.image-purpose"}}' \
     "$LOCAL")" = tensorrt-policy
-  test "$(docker image inspect --format '{{index .Config.Labels \"ai.openpi.parent-tensorrt-compiler-image\"}}' \
+  test "$(docker image inspect --format '{{index .Config.Labels "ai.openpi.parent-tensorrt-compiler-image"}}' \
     "$LOCAL")" = "$TENSORRT_COMPILER_IMAGE"
   docker tag "$LOCAL" "$ECR_REPOSITORY:$TAG"
   docker push "$ECR_REPOSITORY:$TAG"

@@ -297,7 +297,7 @@ the same validator as `scripts/repro_worker.py`.
 ```bash
 python scripts/repro_libero_eval.py render-worker-spec \
   --run-id libero-base-intermediate-01 \
-  --source-s3-uri s3://pi05-repro-752160877725-us-east-2/source/openpi.bundle \
+  --source-s3-uri s3://pi05-repro-752160877725-us-east-2/source/openpi-SOURCE_GIT_COMMIT.bundle \
   --source-version-id SOURCE_VERSION_ID \
   --source-sha256 SOURCE_BUNDLE_SHA256 \
   --source-commit "$PI05_SOURCE_COMMIT" \
@@ -328,7 +328,7 @@ contract as a machine-validated future orchestration artifact:
 ```bash
 python scripts/repro_libero_eval.py render-worker-spec \
   --run-id libero-final-fp8-official-01 \
-  --source-s3-uri s3://pi05-repro-752160877725-us-east-2/source/openpi.bundle \
+  --source-s3-uri s3://pi05-repro-752160877725-us-east-2/source/openpi-SOURCE_GIT_COMMIT.bundle \
   --source-version-id SOURCE_VERSION_ID \
   --source-sha256 SOURCE_BUNDLE_SHA256 \
   --source-commit "$PI05_SOURCE_COMMIT" \

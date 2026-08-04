@@ -23,16 +23,29 @@ test "$(git bundle list-heads /tmp/openpi.bundle HEAD | awk '$2 == "HEAD" {print
   "$SOURCE_COMMIT"
 SOURCE_BUNDLE_SHA256="$(sha256sum /tmp/openpi.bundle | awk '{print $1}')"
 SOURCE_BUNDLE_BYTES="$(wc -c </tmp/openpi.bundle | tr -d '[:space:]')"
+SOURCE_BUNDLE_KEY="source/openpi-$SOURCE_COMMIT.bundle"
+SOURCE_BUNDLE_S3_URI="s3://pi05-repro-752160877725-us-east-2/$SOURCE_BUNDLE_KEY"
+SOURCE_HISTORY_JSON="$(
+  aws s3api list-object-versions \
+    --bucket pi05-repro-752160877725-us-east-2 \
+    --prefix "$SOURCE_BUNDLE_KEY" --region us-east-2 \
+    --expected-bucket-owner 752160877725 --output json
+)"
+test "$(jq --arg key "$SOURCE_BUNDLE_KEY" \
+  '[.Versions[]? | select(.Key == $key)] | length' <<<"$SOURCE_HISTORY_JSON")" -eq 0
+test "$(jq --arg key "$SOURCE_BUNDLE_KEY" \
+  '[.DeleteMarkers[]? | select(.Key == $key)] | length' <<<"$SOURCE_HISTORY_JSON")" -eq 0
 SOURCE_PUT_JSON="$(
   aws s3api put-object --bucket pi05-repro-752160877725-us-east-2 \
-    --key source/openpi.bundle --body /tmp/openpi.bundle --region us-east-2 \
+    --key "$SOURCE_BUNDLE_KEY" --body /tmp/openpi.bundle --region us-east-2 \
     --expected-bucket-owner 752160877725 --server-side-encryption AES256 \
+    --if-none-match '*' \
     --metadata "source-commit=$SOURCE_COMMIT,sha256=$SOURCE_BUNDLE_SHA256" --output json
 )"
 SOURCE_VERSION_ID="$(jq -er '.VersionId | strings | select(length > 0)' <<<"$SOURCE_PUT_JSON")"
 SOURCE_HEAD_JSON="$(
   aws s3api head-object --bucket pi05-repro-752160877725-us-east-2 \
-    --key source/openpi.bundle --version-id "$SOURCE_VERSION_ID" --region us-east-2 \
+    --key "$SOURCE_BUNDLE_KEY" --version-id "$SOURCE_VERSION_ID" --region us-east-2 \
     --expected-bucket-owner 752160877725 --output json
 )"
 test "$(jq -r '.VersionId' <<<"$SOURCE_HEAD_JSON")" = "$SOURCE_VERSION_ID"
@@ -40,8 +53,27 @@ test "$(jq -r '.ContentLength' <<<"$SOURCE_HEAD_JSON")" = "$SOURCE_BUNDLE_BYTES"
 test "$(jq -r '.ServerSideEncryption' <<<"$SOURCE_HEAD_JSON")" = AES256
 test "$(jq -r '.Metadata["source-commit"]' <<<"$SOURCE_HEAD_JSON")" = "$SOURCE_COMMIT"
 test "$(jq -r '.Metadata.sha256' <<<"$SOURCE_HEAD_JSON")" = "$SOURCE_BUNDLE_SHA256"
-printf 'source.commit=%s\nsource.version_id=%s\nsource.sha256=%s\n' \
-  "$SOURCE_COMMIT" "$SOURCE_VERSION_ID" "$SOURCE_BUNDLE_SHA256"
+SOURCE_FINAL_HISTORY_JSON="$(
+  aws s3api list-object-versions \
+    --bucket pi05-repro-752160877725-us-east-2 \
+    --prefix "$SOURCE_BUNDLE_KEY" --region us-east-2 \
+    --expected-bucket-owner 752160877725 --output json
+)"
+test "$(jq --arg key "$SOURCE_BUNDLE_KEY" --arg version "$SOURCE_VERSION_ID" \
+  '[.Versions[]? | select(.Key == $key and .VersionId == $version and .IsLatest == true)] | length' \
+  <<<"$SOURCE_FINAL_HISTORY_JSON")" -eq 1
+test "$(jq --arg key "$SOURCE_BUNDLE_KEY" \
+  '[.Versions[]? | select(.Key == $key)] | length' <<<"$SOURCE_FINAL_HISTORY_JSON")" -eq 1
+test "$(jq --arg key "$SOURCE_BUNDLE_KEY" \
+  '[.DeleteMarkers[]? | select(.Key == $key)] | length' <<<"$SOURCE_FINAL_HISTORY_JSON")" -eq 0
+SOURCE_ROUNDTRIP="$(mktemp /tmp/openpi-bundle-roundtrip.XXXXXX)"
+aws s3api get-object --bucket pi05-repro-752160877725-us-east-2 \
+  --key "$SOURCE_BUNDLE_KEY" --version-id "$SOURCE_VERSION_ID" --region us-east-2 \
+  --expected-bucket-owner 752160877725 "$SOURCE_ROUNDTRIP" >/dev/null
+printf '%s  %s\n' "$SOURCE_BUNDLE_SHA256" "$SOURCE_ROUNDTRIP" | sha256sum --check --status
+rm -f -- "$SOURCE_ROUNDTRIP"
+printf 'source.commit=%s\nsource.s3_uri=%s\nsource.version_id=%s\nsource.sha256=%s\n' \
+  "$SOURCE_COMMIT" "$SOURCE_BUNDLE_S3_URI" "$SOURCE_VERSION_ID" "$SOURCE_BUNDLE_SHA256"
 ```
 
 Copy the three printed values into the worker spec. Never substitute a later
@@ -77,7 +109,7 @@ checks complete before Docker starts.
     "artifact_bucket": "pi05-repro-752160877725-us-east-2"
   },
   "source": {
-    "s3_uri": "s3://pi05-repro-752160877725-us-east-2/source/openpi.bundle",
+    "s3_uri": "s3://pi05-repro-752160877725-us-east-2/source/openpi-SOURCE_GIT_COMMIT.bundle",
     "version_id": "SOURCE_VERSION_ID",
     "sha256": "SOURCE_BUNDLE_SHA256",
     "commit": "SOURCE_GIT_COMMIT"
