@@ -131,6 +131,10 @@ materialize_source() {
     echo "${label} checkout is not clean" >&2
     return 2
   fi
+  # git bundle verify alone accepts a bundle cut from a shallow repository.
+  # A fresh clone can still contain a broken parent edge, so require the full
+  # object graph to be self-contained before this source can control a run.
+  git -C "${checkout}" fsck --full --no-dangling >/dev/null
 }
 
 source_bundle=/opt/pi05/model-source.bundle
@@ -201,11 +205,13 @@ value = {
     "bundle_sha256_actual": source_sha,
     "head_commit": source_commit,
     "source_clean": True,
+    "source_fsck_full": True,
     "bundle_path": source_bundle,
     "checkout_path": source_checkout,
     "controller_bundle_sha256_actual": controller_sha,
     "controller_head_commit": controller_commit,
     "controller_source_clean": True,
+    "controller_source_fsck_full": True,
     "controller_bundle_path": controller_bundle,
     "controller_checkout_path": controller_checkout,
 }

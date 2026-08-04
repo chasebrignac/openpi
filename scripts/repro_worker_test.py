@@ -894,9 +894,11 @@ def test_source_evidence_and_deadline_reserve_are_checked(tmp_path):
         "bundle_sha256_actual": spec["source"]["sha256"],
         "head_commit": spec["source"]["commit"],
         "source_clean": True,
+        "source_fsck_full": True,
         "controller_bundle_sha256_actual": spec["controller_source"]["sha256"],
         "controller_head_commit": spec["controller_source"]["commit"],
         "controller_source_clean": True,
+        "controller_source_fsck_full": True,
         "checkout_path": "/opt/pi05/model-source",
         "controller_checkout_path": "/opt/pi05/controller-source",
     }
@@ -913,6 +915,10 @@ def test_source_evidence_and_deadline_reserve_are_checked(tmp_path):
     with pytest.raises(repro_worker.WorkerError, match="controller bundle"):
         repro_worker.validate_source_evidence(spec, evidence)
     evidence["controller_head_commit"] = spec["controller_source"]["commit"]
+    evidence["source_fsck_full"] = False
+    with pytest.raises(repro_worker.WorkerError, match="full Git object-integrity"):
+        repro_worker.validate_source_evidence(spec, evidence)
+    evidence["source_fsck_full"] = True
     evidence["controller_checkout_path"] = evidence["checkout_path"]
     with pytest.raises(repro_worker.WorkerError, match="fixed distinct checkout"):
         repro_worker.validate_source_evidence(spec, evidence)
@@ -1935,4 +1941,7 @@ def test_controller_v2_bootstrap_independently_materializes_model_and_controller
     assert 'exec python3 "${controller_checkout}/scripts/repro_worker.py"' in text
     assert '"checkout_path": source_checkout' in text
     assert '"controller_checkout_path": controller_checkout' in text
+    assert 'git -C "${checkout}" fsck --full --no-dangling' in text
+    assert '"source_fsck_full": True' in text
+    assert '"controller_source_fsck_full": True' in text
     assert 'schema_version": 2' in text

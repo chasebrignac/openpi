@@ -25,6 +25,8 @@ distinct local paths, object keys, captured VersionIds, and round-trip files.
 ```bash
 set -euo pipefail
 test -z "$(git status --porcelain)"
+test "$(git rev-parse --is-shallow-repository)" = false
+git fsck --full --no-dangling
 SOURCE_COMMIT="$(git rev-parse HEAD)"
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
 git bundle create /tmp/openpi.bundle HEAD
@@ -33,8 +35,14 @@ test "$(git bundle list-heads /tmp/openpi.bundle HEAD | awk '$2 == "HEAD" {print
   "$SOURCE_COMMIT"
 SOURCE_BUNDLE_SHA256="$(sha256sum /tmp/openpi.bundle | awk '{print $1}')"
 SOURCE_BUNDLE_BYTES="$(wc -c </tmp/openpi.bundle | tr -d '[:space:]')"
-SOURCE_BUNDLE_KEY="source/openpi-$SOURCE_COMMIT.bundle"
+SOURCE_BUNDLE_KEY="source/openpi-$SOURCE_COMMIT-complete.bundle"
 SOURCE_BUNDLE_S3_URI="s3://pi05-repro-752160877725-us-east-2/$SOURCE_BUNDLE_KEY"
+SOURCE_AUDIT_ROOT="$(mktemp -d /tmp/openpi-bundle-audit.XXXXXX)"
+git clone --no-checkout /tmp/openpi.bundle "$SOURCE_AUDIT_ROOT/checkout"
+git -C "$SOURCE_AUDIT_ROOT/checkout" checkout --detach "$SOURCE_COMMIT"
+test "$(git -C "$SOURCE_AUDIT_ROOT/checkout" rev-parse --is-shallow-repository)" = false
+git -C "$SOURCE_AUDIT_ROOT/checkout" fsck --full --no-dangling
+test -z "$(git -C "$SOURCE_AUDIT_ROOT/checkout" status --porcelain=v1 --untracked-files=all)"
 SOURCE_HISTORY_JSON="$(
   aws s3api list-object-versions \
     --bucket pi05-repro-752160877725-us-east-2 \
@@ -138,13 +146,13 @@ checks complete before Docker starts.
     "artifact_bucket": "pi05-repro-752160877725-us-east-2"
   },
   "controller_source": {
-    "s3_uri": "s3://pi05-repro-752160877725-us-east-2/source/openpi-CONTROLLER_GIT_COMMIT.bundle",
+    "s3_uri": "s3://pi05-repro-752160877725-us-east-2/source/openpi-CONTROLLER_GIT_COMMIT-complete.bundle",
     "version_id": "CONTROLLER_SOURCE_VERSION_ID",
     "sha256": "CONTROLLER_SOURCE_BUNDLE_SHA256",
     "commit": "CONTROLLER_GIT_COMMIT"
   },
   "source": {
-    "s3_uri": "s3://pi05-repro-752160877725-us-east-2/source/openpi-SOURCE_GIT_COMMIT.bundle",
+    "s3_uri": "s3://pi05-repro-752160877725-us-east-2/source/openpi-SOURCE_GIT_COMMIT-complete.bundle",
     "version_id": "SOURCE_VERSION_ID",
     "sha256": "SOURCE_BUNDLE_SHA256",
     "commit": "SOURCE_GIT_COMMIT"

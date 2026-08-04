@@ -945,10 +945,11 @@ def validate_source_evidence(spec: Mapping[str, Any], evidence: Mapping[str, Any
         or evidence.get("controller_source_clean") is not True
     ):
         raise WorkerError("controller bundle hash or checked-out commit was not verified")
+    if evidence.get("source_fsck_full") is not True or evidence.get("controller_source_fsck_full") is not True:
+        raise WorkerError("model and controller source checkouts must pass a full Git object-integrity check")
     if (
         pathlib.PurePosixPath(str(evidence.get("checkout_path", ""))) != MODEL_SOURCE_CHECKOUT
-        or pathlib.PurePosixPath(str(evidence.get("controller_checkout_path", "")))
-        != CONTROLLER_SOURCE_CHECKOUT
+        or pathlib.PurePosixPath(str(evidence.get("controller_checkout_path", ""))) != CONTROLLER_SOURCE_CHECKOUT
     ):
         raise WorkerError("model and controller evidence must name the fixed distinct checkout paths")
 
