@@ -210,13 +210,17 @@ def test_launch_and_latency_runbooks_match_runnable_hardware_and_artifact_order(
     aws_runbook = (ROOT / "RUNBOOK_AWS.md").read_text()
     export_runbook = (ROOT / "repro/EXPORT_RUNBOOK.md").read_text()
 
-    assert reproduction["aws"]["approved_instances"]["g7e.4xlarge"]["purpose"] == "export/compile/latency"
+    assert (
+        reproduction["aws"]["approved_instances"]["g7e.4xlarge"]["purpose"]
+        == "export/compile/latency and corrective single-GPU Shallow"
+    )
     assert "fallback training" not in json.dumps(reproduction)
     assert "Shallow training is intentionally launch-guarded to `g7e.12xlarge`" in aws_runbook
-    assert "Do not substitute a\n`g7e.4xlarge`" in aws_runbook
+    assert "The sole\ncurrent exception is one `g7e.4xlarge`" in aws_runbook
+    assert "ordinary `shallow_training` launches\nremain locked to one `g7e.12xlarge`" in aws_runbook
     assert "--category corrective_run" in aws_runbook
     assert "--workload shallow_training" in aws_runbook
-    assert "the launcher applies both hardware matrices" in aws_runbook
+    assert "The launcher applies the normal workload matrix\nunless an exact corrective-only fallback" in aws_runbook
 
     assert "baseline quality\n   smoke" in main_runbook
     assert "baseline smoke and eager" not in main_runbook
