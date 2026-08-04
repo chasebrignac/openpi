@@ -135,6 +135,19 @@ converted teacher is accepted only alongside the selected original JAX teacher
 whose revision, GCS source, and expected config it records. These cross-input
 checks complete before Docker starts.
 
+The already-published canonical LIBERO equivalence corpus is not yet a worker
+`asset` input. Its public `pi05-framework-equivalence-evidence` manifest uses
+top-level `evidence_revision` plus `content.files`; the worker artifact schema
+requires `source.revision`, top-level `files`, and `totals`. Supplying its four
+payload VersionIds through `payload_objects` does not bridge that manifest
+schema mismatch, and pointing an `asset` descriptor at it fails before any
+payload download. Do not invent a descriptor or fall back to an unversioned
+prefix sync. Before offline checkpoint evaluation, create and independently
+review a deterministic adapter manifest that inventories the same four
+existing objects, publish only that adapter create-once, then record its exact
+VersionId/hash and all four original payload VersionIds in a worker asset
+descriptor. No such adapter is claimed by this runbook yet.
+
 ```json
 {
   "schema_version": 1,
@@ -347,11 +360,12 @@ cannot override worker-owned `PI05_*`, `HOME`, `PATH`, `PYTHONPATH`,
 `PYTHONDONTWRITEBYTECODE`, or `XDG_CACHE_HOME` values. AWS and Docker control
 variables are likewise rejected.
 
-Graph-only ModelOpt, `trtexec`, TensorRT validation, and engine building use the
-compiler image contract below. Compiled policy latency uses the combined image
-described afterward. The compiler purpose deliberately has no LeRobot fields or
-labels; the worker rejects a compiler image that claims LeRobot or omits any
-pinned toolchain component.
+The compiler image contract below describes the pinned parent used to construct
+and inspect the combined runtime images. It is only for standalone toolchain
+image construction and contract smoke checks; it is not the executing image for
+a production track phase. The compiler purpose deliberately has no LeRobot
+fields or labels; the worker rejects a compiler image that claims LeRobot or
+omits any pinned toolchain component.
 
 ```json
 "image": {
@@ -374,8 +388,8 @@ LIBERO evaluator, policy fields are unexpected on a compiler image, and
 `toolchain` is unexpected on an eager policy image. Every image remains pinned
 by an account-local ECR digest and the source commit label.
 
-Export and serving with the compiled policy stack use a combined image. The v2
-and v3 schemas differ only by their exact LeRobot runtime/revision pair:
+The compiled policy stack has a combined runtime image. The v2 and v3 schemas
+differ only by their exact LeRobot runtime/revision pair:
 
 ```json
 "image": {
@@ -403,6 +417,14 @@ DROID substitutes runtime `v3` and revision
 source, compiler digest/source, policy-runtime labels, and all six toolchain
 labels.
 
+Every production command for a track—ONNX export, CUDA ONNX validation,
+ModelOpt FP8, `trtexec`/engine build, latency, serving, and compiled
+evaluation—must run in one exact final per-track image digest. LIBERO uses the
+final `libero-evaluator` image with `policy_backend=tensorrt`, whose
+`parent_policy_image` is the v2 combined image. DROID uses the final v3
+`tensorrt-policy` combined image. Never switch to the compiler parent between
+phases; the image digest is part of the validation and engine-build identity.
+
 A TensorRT LIBERO evaluator sets `policy_backend` to `tensorrt`, keeps the eager
 evaluator fields, and adds the same three compiler fields shown above. Its
 `parent_policy_image` is the v2 combined image digest. It must also pin the
@@ -420,11 +442,15 @@ requires `--build-instance-id` to match, and injects the validated live values
 as the worker-owned `PI05_INSTANCE_ID` and `PI05_INSTANCE_TYPE` pair. Neither
 value is copied from the worker spec. A replacement instance is rejected.
 
-Ephemeral compile-pipeline specs invoke exactly one reviewed Python entry point:
-`export_pi05_onnx.py`, `validate_pi05_onnx.py`, `quantize_pi05_fp8.py`, or
-`build_tensorrt_engines.py`; latency benchmarking has the same output contract.
-Shell wrappers and help-only commands are rejected;
-the instance and executing image digest must match the spec. Writable
+Compile-pipeline spec validation recognizes exactly one reviewed Python entry
+point: `export_pi05_onnx.py`, `validate_pi05_onnx.py`,
+`quantize_pi05_fp8.py`, or `build_tensorrt_engines.py`; latency benchmarking
+has the same output contract. This exact-existing-instance rendering is a
+future validation contract, not a launchable ephemeral worker path. The
+retained-session direct commands in `EXPORT_RUNBOOK.md` are authoritative for
+both manual replays. Shell wrappers and help-only commands are rejected; the
+instance and executing final per-track image digest must match the spec.
+Writable
 `--output-dir`, `--output`, or `--artifact-dir` paths must be below
 `/output/artifacts` and covered by `expected_outputs`. `/mnt/openpi` is the
 read-only input namespace (apart from explicit training-resume overlays), so it
@@ -595,15 +621,40 @@ advances the deterministic data iterator past already-consumed microbatches.
 Use the same shape for Shallow 5k-to-10k/20k/30k and SnapFlow
 5k-to-10k/20k/30k continuations.
 
-The resume example uses the ordinary two-GPU command prefix. For the one
-evidence-gated single-GPU LIBERO 2k-to-5k continuation authorized by
-`RUNBOOK_AWS.md`, replace that prefix with `python` and change nothing else in
-the resume identity: use a fresh run ID, preserve the 2k experiment ID, copy
-the sole 2k `published_inputs` descriptor unchanged, target its exact
-`CONFIG/EXPERIMENT/2000`, require exactly one `--resume`, forbid
-`--overwrite`, and publish only `CONFIG/EXPERIMENT/5000`. Start it only after
-the 2k worker and any diagnostic GPU process have terminated. This does not
-authorize A4 resume or a generic single-GPU continuation path.
+The resume example uses the ordinary two-GPU command prefix. The corrective
+single-GPU LIBERO path is a separate fail-closed ladder:
+`2000 -> 5000 -> 10000 -> 20000 -> 30000`. Each transition uses a fresh run
+ID, preserves the original experiment ID, copies the sole selected
+`published_inputs` descriptor unchanged, and targets that descriptor's exact
+numeric directory. It publishes only the target directory. The first command
+is exactly:
+
+```json
+[
+  "python", "scripts/train_pytorch.py", "pi05_libero_l09_distill",
+  "--exp-name", "libero-shallow-20260804T120000Z-a1",
+  "--checkpoint-base-dir", "/mnt/openpi/runs", "--resume",
+  "--seed", "42", "--num-train-steps", "5000",
+  "--save-interval", "5000", "--log-interval", "10"
+]
+```
+
+For later transitions, change only the staged source/`resume_checkpoint`
+numeric step, the fresh worker run ID/output prefix, and
+`--num-train-steps`; retain the exact direct-Python option set and ordering.
+Equals-form flags, negated flags, recipe overrides, repeated options,
+`--overwrite`, model/teacher overrides, one-batch flags, `python3`, and
+one-process `torchrun` are rejected. The worker also requires launch metadata
+`category=corrective_run`, `workload=shallow_training`, and
+`instance_type=g7e.4xlarge`; live IMDS must reproduce that instance type.
+Ordinary two-process resumes remain on `g7e.12xlarge`.
+
+Start a transition only after its source worker has succeeded and terminated,
+final sync has bound the exact source manifest, and every diagnostic GPU
+process has terminated. A4 remains non-resumable. This ladder does not
+authorize a second experiment, another track, a checkpoint skip, a sweep, or
+concurrent Shallow training; each paid transition still requires its own
+evidence-bound promotion decision and cost reservation.
 
 At the soft deadline (hard launcher deadline minus the upload buffer), the wrapper stops the container, performs final sync, uploads `manifests/run-manifest.json`, and finally uploads `manifests/final-sync-evidence.json`. The launcher's independent hard shutdown timer remains the last-resort cutoff.
 The run manifest has top-level `metrics`, `metrics_provenance`, and `cost`

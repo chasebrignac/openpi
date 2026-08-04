@@ -134,6 +134,52 @@ def make_resume_spec(tmp_path: pathlib.Path) -> dict:
     return spec
 
 
+def make_single_gpu_shallow_resume_spec(
+    tmp_path: pathlib.Path,
+    *,
+    source_step: int = 2_000,
+    target_step: int = 5_000,
+) -> dict:
+    spec = make_resume_spec(tmp_path)
+    experiment = "libero-shallow"
+    spec["run_id"] = f"libero-shallow-continue-{source_step}-to-{target_step}"
+    spec["output"]["s3_uri"] = f"s3://pi05-repro-752160877725-us-east-2/runs/{spec['run_id']}/"
+    resume_artifact = spec["artifacts"][1]
+    resume_artifact["destination"] = f"pi05_libero_l09_distill/{experiment}/{source_step}"
+    resume_artifact["payload_s3_uri"] = (
+        "s3://pi05-repro-752160877725-us-east-2/runs/source/checkpoints/"
+        f"pi05_libero_l09_distill/{experiment}/{source_step}/"
+    )
+    spec["resume_checkpoint"]["target"] = f"pi05_libero_l09_distill/{experiment}/{source_step}"
+    spec["container"]["command"] = [
+        "python",
+        "scripts/train_pytorch.py",
+        "pi05_libero_l09_distill",
+        "--exp-name",
+        experiment,
+        "--checkpoint-base-dir",
+        "/mnt/openpi/runs",
+        "--resume",
+        "--seed",
+        "7",
+        "--num-train-steps",
+        str(target_step),
+        "--save-interval",
+        "5000",
+        "--log-interval",
+        "10",
+    ]
+    spec["expected_outputs"] = [
+        {
+            "name": "continued_checkpoint",
+            "kind": "checkpoint",
+            "path": f"checkpoints/pi05_libero_l09_distill/{experiment}/{target_step}",
+            "publish_destination": f"pi05_libero_l09_distill/{experiment}/{target_step}",
+        }
+    ]
+    return spec
+
+
 def make_snapflow_spec(tmp_path: pathlib.Path, *, diagnostic: bool = False) -> dict:
     spec = make_spec(tmp_path)
     source = {
@@ -1259,6 +1305,72 @@ def test_resume_contract_binds_input_target_training_command_and_output(tmp_path
     unreported_target["expected_outputs"] = []
     with pytest.raises(repro_worker.WorkerError, match="declare one published checkpoint"):
         repro_worker.validate_worker_spec(unreported_target)
+
+
+def test_single_gpu_shallow_resume_uses_exact_reviewed_ladder_and_argv(tmp_path):
+    for source_step, target_step in ((2_000, 5_000), (5_000, 10_000), (10_000, 20_000), (20_000, 30_000)):
+        validated = repro_worker.validate_worker_spec(
+            make_single_gpu_shallow_resume_spec(
+                tmp_path,
+                source_step=source_step,
+                target_step=target_step,
+            )
+        )
+        assert validated["container"]["command"][0] == "python"
+
+    skipped_checkpoint = make_single_gpu_shallow_resume_spec(tmp_path, source_step=2_000, target_step=10_000)
+    with pytest.raises(repro_worker.WorkerError, match="reviewed 2k->5k->10k->20k->30k ladder"):
+        repro_worker.validate_worker_spec(skipped_checkpoint)
+
+    equals_override = make_single_gpu_shallow_resume_spec(tmp_path)
+    equals_override["container"]["command"].append("--batch-size=8")
+    with pytest.raises(repro_worker.WorkerError, match="equals-form"):
+        repro_worker.validate_worker_spec(equals_override)
+
+    negated_override = make_single_gpu_shallow_resume_spec(tmp_path)
+    negated_override["container"]["command"].append("--no-wandb-enabled")
+    with pytest.raises(repro_worker.WorkerError, match="negated recipe options"):
+        repro_worker.validate_worker_spec(negated_override)
+
+    arbitrary_override = make_single_gpu_shallow_resume_spec(tmp_path)
+    arbitrary_override["container"]["command"].extend(["--batch-size", "8"])
+    with pytest.raises(repro_worker.WorkerError, match="unreviewed options"):
+        repro_worker.validate_worker_spec(arbitrary_override)
+
+    wrong_save_interval = make_single_gpu_shallow_resume_spec(tmp_path)
+    option = wrong_save_interval["container"]["command"].index("--save-interval")
+    wrong_save_interval["container"]["command"][option + 1] = "3000"
+    with pytest.raises(repro_worker.WorkerError, match="exact 5000-step save interval"):
+        repro_worker.validate_worker_spec(wrong_save_interval)
+
+    reordered = make_single_gpu_shallow_resume_spec(tmp_path)
+    seed_index = reordered["container"]["command"].index("--seed")
+    seed_pair = reordered["container"]["command"][seed_index : seed_index + 2]
+    del reordered["container"]["command"][seed_index : seed_index + 2]
+    reordered["container"]["command"].extend(seed_pair)
+    with pytest.raises(repro_worker.WorkerError, match="exact reviewed direct-Python argv"):
+        repro_worker.validate_worker_spec(reordered)
+
+
+def test_single_gpu_shallow_resume_requires_corrective_g7e_launch_metadata(tmp_path):
+    spec = repro_worker.validate_worker_spec(make_single_gpu_shallow_resume_spec(tmp_path))
+    now = dt.datetime.now(dt.UTC)
+    metadata = {
+        **make_launch_metadata((now + dt.timedelta(hours=6)).isoformat()),
+        "category": "corrective_run",
+        "workload": "shallow_training",
+        "instance_type": "g7e.4xlarge",
+    }
+    repro_worker.validate_launch_metadata(spec, metadata, now=now)
+
+    for field, value in (
+        ("category", "shallow_training"),
+        ("workload", "evaluation"),
+        ("instance_type", "g7e.12xlarge"),
+    ):
+        wrong = {**metadata, field: value}
+        with pytest.raises(repro_worker.WorkerError, match="corrective_run/shallow_training on g7e.4xlarge"):
+            repro_worker.validate_launch_metadata(spec, wrong, now=now)
 
 
 def test_fresh_snapflow_contract_binds_accepted_source_recipe_and_output(tmp_path):

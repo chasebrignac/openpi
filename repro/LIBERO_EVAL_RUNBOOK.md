@@ -378,8 +378,9 @@ deterministic claim and every existing version-specific byte are identical.
 
 Do not run a compiled smoke on an arbitrary replacement instance. First build and numerically validate the engines
 inside the final TensorRT LIBERO evaluator image on one On-Demand `g7e.4xlarge`. Both `build_tensorrt_engines.py`
-and `serve_tensorrt_policy.py` bind the final image digest, instance ID, L40S UUID/name/driver inventory, TensorRT
-major version, source SHA, track, dataset revision, checkpoint assets, and precision.
+and `serve_tensorrt_policy.py` bind the final image digest, instance ID, live G7e GPU UUID/name/driver inventory
+(RTX PRO 6000 Blackwell Server Edition on `g7e.4xlarge`), TensorRT major version, source SHA, track, dataset
+revision, checkpoint assets, and precision.
 
 For both clean manual replays, use one deadline-bounded retained G7e session. The launcher bootstrap only prepares
 the host and returns; it is not a completed ephemeral worker that somehow remains available. From SSM, run every

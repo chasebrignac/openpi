@@ -196,6 +196,34 @@ torchrun --standalone --nproc-per-node=2 scripts/train_pytorch.py pi05_droid_l09
   --exp-name "$DROID_SHALLOW_EXP" --checkpoint-base-dir "$RUNS" --resume --seed "$TRAIN_SEED" --num-train-steps 30000 --save-interval 5000
 ```
 
+When an evidence-bound corrective launch selects the one-GPU LIBERO path, do
+not mechanically remove `torchrun` from an ordinary command. The worker accepts
+only this direct-Python ladder and exact argument ordering:
+
+```bash
+python scripts/train_pytorch.py pi05_libero_l09_distill \
+  --exp-name "$LIBERO_SHALLOW_EXP" --checkpoint-base-dir "$RUNS" --resume \
+  --seed "$TRAIN_SEED" --num-train-steps 5000 --save-interval 5000 --log-interval 10
+python scripts/train_pytorch.py pi05_libero_l09_distill \
+  --exp-name "$LIBERO_SHALLOW_EXP" --checkpoint-base-dir "$RUNS" --resume \
+  --seed "$TRAIN_SEED" --num-train-steps 10000 --save-interval 5000 --log-interval 10
+python scripts/train_pytorch.py pi05_libero_l09_distill \
+  --exp-name "$LIBERO_SHALLOW_EXP" --checkpoint-base-dir "$RUNS" --resume \
+  --seed "$TRAIN_SEED" --num-train-steps 20000 --save-interval 5000 --log-interval 10
+python scripts/train_pytorch.py pi05_libero_l09_distill \
+  --exp-name "$LIBERO_SHALLOW_EXP" --checkpoint-base-dir "$RUNS" --resume \
+  --seed "$TRAIN_SEED" --num-train-steps 30000 --save-interval 5000 --log-interval 10
+```
+
+These are four possible transitions, not four commands to run unconditionally.
+For each new worker, restore exactly the immediately preceding numeric source
+(`2000`, `5000`, `10000`, or `20000`) through `resume_checkpoint`, and stop the
+ladder when the full promotion gate passes. Skipping a source step, changing
+the option set/order, using `python3` or one-process `torchrun`, or adding a
+negated/equals-form override is rejected before training. Launch metadata must
+bind this path to `corrective_run`/`shallow_training` on On-Demand
+`g7e.4xlarge`.
+
 Stop after any checkpoint whose complete promotion report passes; do not run
 the later commands. Before launching SnapFlow, resolve the selected directory,
 for example:
@@ -329,8 +357,11 @@ matching offline report:
 
 ```bash
 export OFFLINE="$EVIDENCE/libero-shallow-5000.json"
-export REFERENCE_STAGE="teacher-sha256:$(jq -r '.provenance.teacher_checkpoint.model_sha256' "$OFFLINE")"
-export STUDENT_STAGE="student-sha256:$(jq -r '.provenance.student_checkpoint.model_sha256' "$OFFLINE")"
+export REFERENCE_STAGE="$(jq -r '.provenance.teacher_checkpoint.model_sha256' "$OFFLINE")"
+export STUDENT_STAGE="$(jq -r '.provenance.student_checkpoint.model_sha256' "$OFFLINE")"
+[[ "$REFERENCE_STAGE" =~ ^[0-9a-f]{64}$ ]]
+[[ "$STUDENT_STAGE" =~ ^[0-9a-f]{64}$ ]]
+test "$REFERENCE_STAGE" != "$STUDENT_STAGE"
 
 # Generate paired episode records with REFERENCE_STAGE for the reference
 # policy and STUDENT_STAGE for the student policy, then aggregate them.
@@ -344,6 +375,14 @@ python scripts/repro_quality_evidence.py \
   --offline-report "$OFFLINE" --required-pairs 400 \
   --output "$EVIDENCE/libero-shallow-rollout-5000.json"
 ```
+
+The evaluator's stage identifier is worker-safe ASCII with a 64-character
+maximum. Therefore the stage is the raw complete model SHA-256. Do not prepend
+`teacher-sha256:` or `student-sha256:`: those strings are both syntactically
+invalid for the evaluator and longer than its maximum. The quality report's
+`base_stage` and `candidate_stage` fields carry the roles, while
+`repro_quality_evidence.py` independently requires each raw digest to equal
+the teacher or student model hash in the offline report.
 
 For SnapFlow, use the same conversion and attach the measured denoising
 speedup. The model hashes, step, run, configs, dataset and golden corpus must

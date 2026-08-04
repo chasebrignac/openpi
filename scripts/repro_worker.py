@@ -439,6 +439,26 @@ SNAPFLOW_SOURCE_CONFIGS = {
         "pi05_droid_l09_expert_bc_50",
     },
 }
+
+SHALLOW_RESUME_CONFIGS = {
+    "pi05_libero_l09_distill",
+    "pi05_droid_l09_distill",
+}
+SHALLOW_RESUME_TRANSITIONS = {
+    (2_000, 5_000),
+    (5_000, 10_000),
+    (10_000, 20_000),
+    (20_000, 30_000),
+}
+SHALLOW_RESUME_ALLOWED_OPTIONS = {
+    "--checkpoint-base-dir",
+    "--exp-name",
+    "--log-interval",
+    "--num-train-steps",
+    "--resume",
+    "--save-interval",
+    "--seed",
+}
 SNAPFLOW_ALLOWED_OPTIONS = {
     "--batch-size",
     "--checkpoint-base-dir",
@@ -494,6 +514,83 @@ def _validate_snapflow_common_command(command: Sequence[str], training_config: s
         _single_command_option(command, "--num-workers", context) != "0" or command.count("--no-wandb-enabled") != 1
     ):
         raise WorkerError(f"{context} DROID runs require num_workers=0 and disabled W&B on g7e.2xlarge")
+
+
+def validate_shallow_resume_training_contract(
+    command: Sequence[str],
+    training_config: str,
+    *,
+    source_step: int,
+    target_step: int,
+) -> None:
+    """Keep every Shallow resume on the reviewed checkpoint ladder.
+
+    The single-GPU corrective path is intentionally narrower than an ordinary
+    two-process Shallow worker: only LIBERO may use it, and its argv is matched
+    byte-for-byte after substituting the already validated experiment, seed,
+    and target step. This prevents CLI equals forms, negated flags, and future
+    config options from silently changing the resumed recipe.
+    """
+
+    context = "Shallow resume training command"
+    if training_config not in SHALLOW_RESUME_CONFIGS:
+        raise WorkerError(f"{context} uses an unapproved config: {training_config!r}")
+    if (source_step, target_step) not in SHALLOW_RESUME_TRANSITIONS:
+        raise WorkerError(f"{context} must follow the reviewed 2k->5k->10k->20k->30k ladder")
+
+    train_index = command.index("scripts/train_pytorch.py")
+    training_arguments = command[train_index + 2 :]
+    equals_options = [value for value in training_arguments if value.startswith("-") and "=" in value]
+    if equals_options:
+        raise WorkerError(f"{context} forbids equals-form options: {equals_options}")
+    negated_options = [value for value in training_arguments if value.startswith("--no-")]
+    if negated_options:
+        raise WorkerError(f"{context} forbids negated recipe options: {negated_options}")
+    unreviewed_options = [
+        value for value in training_arguments if value.startswith("-") and value not in SHALLOW_RESUME_ALLOWED_OPTIONS
+    ]
+    if unreviewed_options:
+        raise WorkerError(f"{context} forbids unreviewed options: {unreviewed_options}")
+    for option in SHALLOW_RESUME_ALLOWED_OPTIONS:
+        maximum = 1
+        if command.count(option) > maximum:
+            raise WorkerError(f"{context} must not repeat {option}")
+
+    if _single_command_option(command, "--save-interval", context) != "5000":
+        raise WorkerError(f"{context} must retain the exact 5000-step save interval")
+    if "--log-interval" in command and _single_command_option(command, "--log-interval", context) != "10":
+        raise WorkerError(f"{context} --log-interval override must be exactly 10")
+
+    processes = _torchrun_processes_per_node(command)
+    if processes is not None:
+        if processes != 2:
+            raise WorkerError(f"{context} torchrun path requires exactly two local processes")
+        return
+
+    if training_config != "pi05_libero_l09_distill":
+        raise WorkerError(f"{context} single-GPU direct-Python path is approved only for LIBERO")
+    experiment = _single_command_option(command, "--exp-name", context)
+    seed = _single_command_option(command, "--seed", context)
+    expected = [
+        "python",
+        "scripts/train_pytorch.py",
+        training_config,
+        "--exp-name",
+        experiment,
+        "--checkpoint-base-dir",
+        str(CONTAINER_INPUT_ROOT / "runs"),
+        "--resume",
+        "--seed",
+        seed,
+        "--num-train-steps",
+        str(target_step),
+        "--save-interval",
+        "5000",
+        "--log-interval",
+        "10",
+    ]
+    if list(command) != expected:
+        raise WorkerError(f"{context} single-GPU corrective path must use the exact reviewed direct-Python argv")
 
 
 def validate_fresh_snapflow_training_contract(
@@ -1117,6 +1214,13 @@ def validate_worker_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
                 source_step=source_step,
                 target_step=target_step,
             )
+        elif training_config in SHALLOW_RESUME_CONFIGS:
+            validate_shallow_resume_training_contract(
+                command,
+                training_config,
+                source_step=source_step,
+                target_step=target_step,
+            )
     elif train_positions and ("--resume" in command or "--overwrite" in command):
         raise WorkerError("fresh training worker commands forbid --resume and --overwrite; use a unique experiment ID")
 
@@ -1217,6 +1321,22 @@ def validate_launch_metadata(
         raise WorkerError("launch metadata command hash differs from the executing command file")
     if metadata.get("purchase_option") != "On-Demand" or metadata.get("instance_count") != 1:
         raise WorkerError("launch metadata does not prove one On-Demand instance")
+    container = spec.get("container")
+    command = container.get("command") if isinstance(container, Mapping) else None
+    direct_single_gpu_shallow_resume = (
+        spec.get("resume_checkpoint") is not None
+        and isinstance(command, list)
+        and len(command) >= 3
+        and command[:3] == ["python", "scripts/train_pytorch.py", "pi05_libero_l09_distill"]
+    )
+    if direct_single_gpu_shallow_resume:
+        expected_launch = {
+            "category": "corrective_run",
+            "workload": "shallow_training",
+            "instance_type": "g7e.4xlarge",
+        }
+        if any(metadata.get(key) != value for key, value in expected_launch.items()):
+            raise WorkerError("single-GPU Shallow resume requires corrective_run/shallow_training on g7e.4xlarge")
     reservation_id = metadata.get("reservation_id")
     if not isinstance(reservation_id, str) or UUID_RE.fullmatch(reservation_id) is None:
         raise WorkerError("launch metadata has no valid cost-ledger reservation ID")

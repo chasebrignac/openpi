@@ -18,11 +18,17 @@ else:
 
 
 def model_stage_identity(role: str, model_sha256: str) -> str:
+    """Return the full model digest in the evaluator's worker-safe stage syntax."""
+
     if role not in {"teacher", "student"}:
         raise ValueError(f"Unknown model identity role: {role}")
     if len(model_sha256) != 64 or any(character not in "0123456789abcdef" for character in model_sha256):
         raise ValueError("Model identity requires a lowercase SHA-256 digest")
-    return f"{role}-sha256:{model_sha256}"
+    # repro_libero_eval intentionally permits at most 64 characters and no
+    # colon in a stage identifier. The complete digest is already globally
+    # role-independent and collision-resistant; the quality report fields
+    # (`base_stage` and `candidate_stage`) supply the role.
+    return model_sha256
 
 
 def aggregate_success(groups: dict[str, Any]) -> tuple[int, float, float]:

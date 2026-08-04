@@ -299,6 +299,7 @@ class _TensorRTRunner:
             raise ValueError("TensorRT engine build does not reference a passing action-limit gate")
         self.action_low = np.asarray(action_gate["action_low"], dtype=np.float32)
         self.action_high = np.asarray(action_gate["action_high"], dtype=np.float32)
+        self.action_mask = np.asarray(action_gate["action_mask"], dtype=np.bool_)
 
         self.prefix_engine = _TensorRTEngine(prefix_plan)
         self.decoder_engine = _TensorRTEngine(decoder_plan)
@@ -355,6 +356,7 @@ class _TensorRTRunner:
             candidate.float().cpu().numpy(),
             action_low=self.action_low,
             action_high=self.action_high,
+            action_mask=self.action_mask,
             max_abs_joint_bias=0.01,
         )
         report = {

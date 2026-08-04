@@ -73,13 +73,21 @@ def _run_graph(
     import onnxruntime as ort
 
     available = set(ort.get_available_providers())
+    session_options = ort.SessionOptions()
     if provider == "cuda":
         if "CUDAExecutionProvider" not in available:
             raise RuntimeError(f"CUDAExecutionProvider is required but unavailable; providers={sorted(available)}")
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        session_options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+        providers = ["CUDAExecutionProvider"]
     else:
         providers = ["CPUExecutionProvider"]
-    session = ort.InferenceSession(str(model_path), providers=providers)
+    session = ort.InferenceSession(str(model_path), sess_options=session_options, providers=providers)
+    active_providers = session.get_providers()
+    if provider == "cuda" and active_providers != ["CUDAExecutionProvider"]:
+        raise RuntimeError(
+            "CUDA validation must run exclusively on CUDAExecutionProvider with CPU fallback disabled; "
+            f"active providers={active_providers}"
+        )
     with np.load(input_path, allow_pickle=False) as archive:
         values = {name: archive[name] for name in archive.files}
         if input_overrides:
@@ -98,7 +106,7 @@ def _run_graph(
                 metadata.name: np.asarray(value, dtype=np.float32)
                 for metadata, value in zip(session.get_outputs(), result, strict=True)
             }
-    return outputs, session.get_providers()
+    return outputs, active_providers
 
 
 def _run_cuda_iobinding(session, values: dict[str, np.ndarray]) -> dict[str, np.ndarray]:

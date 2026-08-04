@@ -87,7 +87,10 @@ def build(quality: dict, offline: dict, *, required_pairs: int = 400, denoise_sp
 
 def test_emits_provenance_complete_weighted_quality_evidence():
     offline = offline_report()
-    result = build(quality_report(offline), offline, denoise_speedup=8.5)
+    quality = quality_report(offline)
+    assert quality["base_stage"] == "f" * 64
+    assert quality["candidate_stage"] == "c" * 64
+    result = build(quality, offline, denoise_speedup=8.5)
     assert result["checkpoint_step"] == 5_000
     assert result["provenance"] == offline["provenance"]
     assert result["paired_rollout"] == {
@@ -123,6 +126,21 @@ def test_rejects_unpaired_model_identity():
     quality["candidate_stage"] = repro_quality_evidence.model_stage_identity("student", "9" * 64)
     with pytest.raises(ValueError, match="model identity mismatch"):
         build(quality, offline)
+
+    prefixed = quality_report(offline)
+    prefixed["candidate_stage"] = "student-sha256:" + "c" * 64
+    with pytest.raises(ValueError, match="model identity mismatch"):
+        build(prefixed, offline)
+
+
+def test_model_stage_identity_is_exact_worker_safe_sha256():
+    digest = "a" * 64
+    assert repro_quality_evidence.model_stage_identity("teacher", digest) == digest
+    assert repro_quality_evidence.model_stage_identity("student", digest) == digest
+    with pytest.raises(ValueError, match="Unknown model identity role"):
+        repro_quality_evidence.model_stage_identity("candidate", digest)
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        repro_quality_evidence.model_stage_identity("teacher", "A" * 64)
 
 
 def test_rejects_offline_provenance_that_does_not_match_its_step():

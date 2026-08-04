@@ -104,6 +104,12 @@ def test_episode_records_pair_across_stages():
     }
 
 
+def test_full_model_sha_is_worker_safe_stage_identity():
+    digest = "a" * 64
+    assert repro_libero_eval.STAGE_RE.fullmatch(digest)
+    assert repro_libero_eval.STAGE_RE.fullmatch("teacher-sha256:" + digest) is None
+
+
 def test_trial_selection_is_exact():
     assert list(libero_eval.select_init_indices(requested=2, available=2, suite="libero_10", task_id=0)) == [0, 1]
     with pytest.raises(ValueError, match="must be positive"):

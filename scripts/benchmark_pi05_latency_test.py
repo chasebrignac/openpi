@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import sys
 
+import numpy as np
 import pytest
 
 from scripts import benchmark_pi05_latency
 from scripts.benchmark_pi05_latency import _require_manifest_artifact
+from scripts.benchmark_pi05_latency import _TensorRTRunner
 
 IMAGE = "sha256:" + "1" * 64
 INSTANCE_ID = "i-0123456789abcdef0"
@@ -76,3 +78,24 @@ def test_build_manifest_artifact_check_is_relocatable_and_detects_changes(tmp_pa
     artifact.write_bytes(b"changed")
     with pytest.raises(ValueError, match="no longer matches"):
         _require_manifest_artifact(manifest, artifact)
+
+
+def test_tensorrt_numerical_smoke_ignores_padded_action_dimensions(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    runner = object.__new__(_TensorRTRunner)
+    runner.precision = "bf16"
+    runner.reference_actions = np.zeros((1, 50, 32), dtype=np.float32)
+    runner.action_low = np.zeros(32, dtype=np.float32)
+    runner.action_high = np.zeros(32, dtype=np.float32)
+    runner.action_low[:7] = -1.0
+    runner.action_high[:7] = 1.0
+    runner.action_mask = np.zeros(32, dtype=np.bool_)
+    runner.action_mask[:7] = True
+    runner.total = lambda: {"actions": torch.zeros((1, 50, 32), dtype=torch.float32)}
+
+    report = runner.numerical_smoke()
+
+    assert report["passes"] is True
+    assert report["actions"]["active_action_dimensions"] == list(range(7))

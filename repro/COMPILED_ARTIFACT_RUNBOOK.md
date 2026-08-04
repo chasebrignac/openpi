@@ -22,7 +22,7 @@ export PI05_TRACK=libero
 export PI05_PRECISION=fp8
 export PI05_DATASET=physical-intelligence/libero
 export PI05_DATASET_REVISION=a4336d589d589045d1c56423ffdf3b88a0e19b1f
-export PI05_ARTIFACT_DIR=/opt/pi05/manual-replays/replay-01/artifacts/libero
+export PI05_ARTIFACT_DIR=/opt/pi05/manual-replays/replay-01/artifacts/tensorrt/libero/fp8
 export PI05_ARTIFACT_BUCKET=pi05-repro-752160877725-us-east-2
 export PI05_COMPILED_S3_ROOT="s3://${PI05_ARTIFACT_BUCKET}/compiled"
 export PI05_PUBLICATION_RECEIPT=/opt/pi05/manual-replays/replay-01/libero-fp8-publication.json
@@ -33,7 +33,8 @@ AWS_PAGER='' aws s3api put-object help | grep -- '--if-none-match'
 
 For DROID, use `PI05_TRACK=droid`, dataset
 `allenai/MolmoAct2-DROID-Dataset`, revision
-`e44d3138c64cfeb1c24fbbce087b475fb1233728`, and its artifact directory.
+`e44d3138c64cfeb1c24fbbce087b475fb1233728`, and the exact flat artifact
+directory `/opt/pi05/manual-replays/replay-01/artifacts/tensorrt/droid/fp8`.
 
 First print the non-reading plan, then run the read-only local validation. The
 validator reads live `nvidia-smi` inventory and checks it against the build

@@ -9,6 +9,7 @@ import pytest
 from scripts import validate_pi05_onnx
 from scripts.repro_make_action_limits import write_artifact
 from scripts.validate_pi05_onnx import _merge_candidate_prefix
+from scripts.validate_pi05_onnx import _run_graph
 
 IMAGE = "sha256:" + "1" * 64
 INSTANCE_ID = "i-0123456789abcdef0"
@@ -41,6 +42,81 @@ def test_end_to_end_validation_requires_exact_cache_interface():
             {"prefix_pad_masks": np.ones((1, 1)), "cache_key_00": np.ones(1)},
             {"prefix_pad_masks": np.ones((1, 1))},
         )
+
+
+def test_cuda_graph_validation_disables_cpu_provider_fallback(tmp_path, monkeypatch):
+    input_path = tmp_path / "inputs.npz"
+    np.savez(input_path, input=np.ones((1, 2), dtype=np.float32))
+    observed = {}
+
+    class FakeSessionOptions:
+        def add_session_config_entry(self, key, value):
+            observed["session_config"] = (key, value)
+
+    class FakeSession:
+        def __init__(self, model_path, *, sess_options, providers):
+            observed["model_path"] = model_path
+            observed["session_options"] = sess_options
+            observed["providers"] = providers
+
+        def get_inputs(self):
+            return [type("Input", (), {"name": "input", "type": "tensor(float)"})()]
+
+        def get_providers(self):
+            return ["CUDAExecutionProvider"]
+
+    fake_ort = type(
+        "FakeOrt",
+        (),
+        {
+            "SessionOptions": FakeSessionOptions,
+            "InferenceSession": FakeSession,
+            "get_available_providers": staticmethod(lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"]),
+        },
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+    monkeypatch.setattr(
+        validate_pi05_onnx,
+        "_run_cuda_iobinding",
+        lambda session, values: {"output": values["input"]},
+    )
+
+    outputs, providers = _run_graph(tmp_path / "model.onnx", input_path, "cuda")
+
+    assert outputs["output"].shape == (1, 2)
+    assert providers == ["CUDAExecutionProvider"]
+    assert observed["providers"] == ["CUDAExecutionProvider"]
+    assert observed["session_config"] == ("session.disable_cpu_ep_fallback", "1")
+
+
+def test_cuda_graph_validation_rejects_an_active_cpu_provider(tmp_path, monkeypatch):
+    input_path = tmp_path / "inputs.npz"
+    np.savez(input_path, input=np.ones((1, 2), dtype=np.float32))
+
+    class FakeSessionOptions:
+        def add_session_config_entry(self, key, value):
+            del key, value
+
+    class FakeSession:
+        def __init__(self, model_path, *, sess_options, providers):
+            del model_path, sess_options, providers
+
+        def get_providers(self):
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    fake_ort = type(
+        "FakeOrt",
+        (),
+        {
+            "SessionOptions": FakeSessionOptions,
+            "InferenceSession": FakeSession,
+            "get_available_providers": staticmethod(lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"]),
+        },
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+
+    with pytest.raises(RuntimeError, match="exclusively on CUDAExecutionProvider"):
+        _run_graph(tmp_path / "model.onnx", input_path, "cuda")
 
 
 def test_overall_gate_includes_compounded_prefix_decoder_error(tmp_path, monkeypatch):
