@@ -29,6 +29,10 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
 
+    def close(self) -> None:
+        """Close the synchronous WebSocket and its background receive thread."""
+        self._ws.close()
+
     def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
         logging.info(f"Waiting for server at {self._uri}...")
         while True:

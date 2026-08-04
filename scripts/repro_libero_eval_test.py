@@ -61,11 +61,15 @@ class _FakeEnv:
 class _FakeClient:
     def __init__(self):
         self.calls = 0
+        self.closed = False
 
     def infer(self, element):
         assert element["prompt"] == "put the red block in the bowl"
         self.calls += 1
         return {"actions": np.zeros((1, 7), dtype=np.float32)}
+
+    def close(self):
+        self.closed = True
 
 
 def _read_jsonl(path):
@@ -169,7 +173,7 @@ def test_eval_writes_exact_deterministic_pairs_without_simulator(tmp_path, monke
     assert [record["init_index"] for record in outputs["base"]] == [0, 1]
     assert all(record["success"] for records in outputs.values() for record in records)
     assert all(env.init_indices == [0, 1] and env.closed for env in environments)
-    assert all(client.calls == 2 for client in clients)
+    assert all(client.calls == 2 and client.closed for client in clients)
 
 
 def test_eval_rejects_short_init_state_set_before_creating_output(tmp_path, monkeypatch):

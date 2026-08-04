@@ -367,6 +367,7 @@ def eval_libero(args: Args) -> None:
 
     logging.info("Total success rate: %s", float(total_successes) / float(total_episodes))
     logging.info("Total episodes: %d", total_episodes)
+    client.close()
 
 
 def _get_libero_env(task, resolution, seed):
