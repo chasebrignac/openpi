@@ -48,7 +48,7 @@ NON_COMMITTED_STATES = frozenset({"cancelled", "superseded"})
 
 
 def _finite_number(value: Any, label: str, *, positive: bool = False) -> float:
-    if isinstance(value, bool) or not isinstance(value, int | float):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):  # noqa: UP038 -- Python 3.9 CLI support.
         raise BudgetError(f"{label} must be a finite number")
     try:
         result = float(value)
