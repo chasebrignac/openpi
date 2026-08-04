@@ -521,8 +521,16 @@ def make_plan(
     )
     if inputs.workload != resolved_workload:
         raise LaunchError(f"static inputs were selected for workload {inputs.workload}, not {resolved_workload}")
-    if retain_after_command and resolved_workload != "export_compile_quantize":
-        raise LaunchError("--retain-after-command is allowed only for the export_compile_quantize workload")
+    retained_corrective_shallow = (
+        category == "corrective_run"
+        and resolved_workload == "shallow_training"
+        and instance_type == "g7e.4xlarge"
+        and instance_count == 1
+    )
+    if retain_after_command and resolved_workload != "export_compile_quantize" and not retained_corrective_shallow:
+        raise LaunchError(
+            "--retain-after-command is allowed only for export/compile or the one-GPU corrective Shallow fallback"
+        )
 
     volume_gib = root_volume_gib if root_volume_gib is not None else (1024 if category == "workbench_setup" else 256)
     if not 100 <= volume_gib <= 2048:

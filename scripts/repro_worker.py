@@ -85,6 +85,12 @@ WORKER_OWNED_ENVIRONMENT = {"HOME", "PATH", "PYTHONDONTWRITEBYTECODE", "PYTHONPA
 TORCHRUN_LOOPBACK_ENVIRONMENT = {
     "NCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
+    # The pinned NCCL 2.26.2 runtime predates the 2.26.5 automatic fallback
+    # for Docker/NUMA-incompatible cuMem allocations. The G7e two-GPU pilot
+    # reached P2P/CUMEM communicator initialization and then faulted both ranks.
+    # Keep PCIe P2P enabled while selecting NCCL's legacy allocation path.
+    "NCCL_CUMEM_ENABLE": "0",
+    "NCCL_CUMEM_HOST_ENABLE": "0",
 }
 DROID_LAYOUT_CONTRACT = "molmoact2-v3-exact-media-references-v1"
 DROID_CAMERA_FILE_COUNTS = {

@@ -116,24 +116,38 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
-    if use_ddp and not torch.distributed.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
-
-        # Set up debugging environment variables for DDP issues
-        if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
-            os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
-
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
+    # Bind the process to its CUDA device before NCCL creates any communicator.
+    # Otherwise ProcessGroupNCCL has to guess the rank-to-device mapping during
+    # its first barrier and can initialize collectives on the wrong device.
     if torch.cuda.is_available():
         torch.cuda.set_device(device)
+
+    if use_ddp and not torch.distributed.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        # This must be set before process-group construction to affect NCCL's
+        # diagnostic setup rather than only later collectives.
+        if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
+            os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
+        kwargs = {"backend": backend, "init_method": "env://"}
+        if backend == "nccl":
+            kwargs["device_id"] = device
+        torch.distributed.init_process_group(**kwargs)
     return use_ddp, local_rank, device
+
+
+def ddp_barrier():
+    if torch.cuda.is_available():
+        torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        torch.distributed.barrier()
 
 
 def cleanup_ddp():
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        ddp_barrier()
         torch.distributed.destroy_process_group()
 
 
@@ -900,7 +914,7 @@ def prepare_checkpoint_directory(config: _config.TrainConfig, *, is_main: bool, 
     # Non-main ranks must not inspect or create a fresh directory until rank
     # zero has completed any requested removal and recreation.
     if use_ddp:
-        dist.barrier()
+        ddp_barrier()
 
     checkpoint_dir = _config.resolve_checkpoint_dir(config.checkpoint_base_dir, config.name, config.exp_name)
     if resuming:

@@ -60,6 +60,46 @@ def _config(checkpoint_base_dir, *, exp_name="immutable", resume=False, overwrit
     )
 
 
+def test_setup_ddp_binds_cuda_device_before_nccl_initialization(monkeypatch):
+    events = []
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.delenv("TORCH_DISTRIBUTED_DEBUG", raising=False)
+    monkeypatch.setattr(train_pytorch.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(train_pytorch.torch.cuda, "set_device", lambda device: events.append(("set_device", device)))
+    monkeypatch.setattr(train_pytorch.torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        train_pytorch.torch.distributed,
+        "init_process_group",
+        lambda **kwargs: events.append(("init_process_group", kwargs)),
+    )
+
+    use_ddp, local_rank, device = train_pytorch.setup_ddp()
+
+    assert use_ddp is True
+    assert local_rank == 1
+    assert device == torch.device("cuda:1")
+    assert events == [
+        ("set_device", torch.device("cuda:1")),
+        (
+            "init_process_group",
+            {"backend": "nccl", "init_method": "env://", "device_id": torch.device("cuda:1")},
+        ),
+    ]
+    assert train_pytorch.os.environ["TORCH_DISTRIBUTED_DEBUG"] == "INFO"
+
+
+def test_ddp_barrier_passes_current_cuda_device(monkeypatch):
+    calls = []
+    monkeypatch.setattr(train_pytorch.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(train_pytorch.torch.cuda, "current_device", lambda: 1)
+    monkeypatch.setattr(train_pytorch.torch.distributed, "barrier", lambda **kwargs: calls.append(kwargs))
+
+    train_pytorch.ddp_barrier()
+
+    assert calls == [{"device_ids": [1]}]
+
+
 def test_checkpoint_overwrite_is_owned_by_rank_zero_and_barriered(tmp_path, monkeypatch):
     checkpoint_base_dir = tmp_path / "runs"
     checkpoint_dir = checkpoint_base_dir / "debug" / "immutable"

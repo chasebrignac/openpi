@@ -1190,11 +1190,15 @@ def test_multi_process_torchrun_forces_loopback_transports_without_weakening_net
     spec = repro_worker.validate_worker_spec(make_resume_spec(tmp_path))
     command = repro_worker.build_docker_command(spec, tmp_path / "source", tmp_path / "scratch")
     seed_index = command.index("PI05_SEED=7")
-    assert command[seed_index + 1 : seed_index + 5] == [
+    assert command[seed_index + 1 : seed_index + 9] == [
         "--env",
         "NCCL_SOCKET_IFNAME=lo",
         "--env",
         "GLOO_SOCKET_IFNAME=lo",
+        "--env",
+        "NCCL_CUMEM_ENABLE=0",
+        "--env",
+        "NCCL_CUMEM_HOST_ENABLE=0",
     ]
     assert command[command.index("--network") + 1] == "none"
     assert not any(item.startswith("MASTER_ADDR=") for item in command)
@@ -1203,6 +1207,8 @@ def test_multi_process_torchrun_forces_loopback_transports_without_weakening_net
     single_command = repro_worker.build_docker_command(single_process, tmp_path / "source", tmp_path / "scratch")
     assert "NCCL_SOCKET_IFNAME=lo" not in single_command
     assert "GLOO_SOCKET_IFNAME=lo" not in single_command
+    assert "NCCL_CUMEM_ENABLE=0" not in single_command
+    assert "NCCL_CUMEM_HOST_ENABLE=0" not in single_command
 
 
 def test_multi_process_torchrun_loopback_contract_is_fail_closed(tmp_path):

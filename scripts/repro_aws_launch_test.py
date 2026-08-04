@@ -396,7 +396,7 @@ def test_plan_reserves_boot_margin_and_worker_must_have_command(tmp_path, config
         workload="shallow_training",
         instance_type="g7e.12xlarge",
     )
-    with pytest.raises(repro_aws_launch.LaunchError, match="allowed only for the export_compile_quantize workload"):
+    with pytest.raises(repro_aws_launch.LaunchError, match="allowed only for export/compile"):
         make_plan(
             tmp_path,
             shallow_inputs,
@@ -500,6 +500,52 @@ def test_export_session_can_retain_instance_until_absolute_termination_deadline(
     metadata_line = next(line for line in user_data.splitlines() if line.endswith("> /opt/pi05/launch-metadata.json"))
     metadata = json.loads(base64.b64decode(metadata_line.split("'")[3]))
     assert metadata["retain_after_command"] is True
+
+
+def test_corrective_single_gpu_shallow_can_retain_instance_for_same_node_repair(tmp_path, config, foundation):
+    inputs = make_inputs(
+        tmp_path,
+        config,
+        foundation,
+        category="corrective_run",
+        workload="shallow_training",
+        instance_type="g7e.4xlarge",
+    )
+    plan = make_plan(
+        tmp_path,
+        inputs,
+        category="corrective_run",
+        workload="shallow_training",
+        instance_type="g7e.4xlarge",
+        retain_after_command=True,
+    )
+    user_data = repro_aws_launch.build_user_data(plan, "retained-corrective-shallow-preview")
+
+    assert plan.retain_after_command is True
+    assert plan.shutdown_behavior == "terminate"
+    assert "ExecStopPost=" not in user_data
+    assert "OnCalendar=2026-08-03 22:00:00 UTC" in user_data
+
+
+def test_ordinary_or_two_gpu_shallow_cannot_retain_instance(tmp_path, config, foundation):
+    inputs = make_inputs(
+        tmp_path,
+        config,
+        foundation,
+        category="corrective_run",
+        workload="shallow_training",
+        instance_type="g7e.12xlarge",
+    )
+
+    with pytest.raises(repro_aws_launch.LaunchError, match="one-GPU corrective Shallow fallback"):
+        make_plan(
+            tmp_path,
+            inputs,
+            category="corrective_run",
+            workload="shallow_training",
+            instance_type="g7e.12xlarge",
+            retain_after_command=True,
+        )
 
 
 class LedgerAwsMixin:
