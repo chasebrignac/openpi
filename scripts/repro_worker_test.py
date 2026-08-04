@@ -139,22 +139,35 @@ def make_single_gpu_shallow_resume_spec(
     *,
     source_step: int = 2_000,
     target_step: int = 5_000,
+    track: str = "libero",
 ) -> dict:
+    if track not in {"libero", "droid"}:
+        raise ValueError(f"unsupported Shallow resume test track: {track}")
     spec = make_resume_spec(tmp_path)
-    experiment = "libero-shallow"
-    spec["run_id"] = f"libero-shallow-continue-{source_step}-to-{target_step}"
+    config = f"pi05_{track}_l09_distill"
+    experiment = f"{track}-shallow"
+    spec["run_id"] = f"{track}-shallow-continue-{source_step}-to-{target_step}"
     spec["output"]["s3_uri"] = f"s3://pi05-repro-752160877725-us-east-2/runs/{spec['run_id']}/"
+    if track == "droid":
+        spec["image"]["lerobot_runtime"] = "v3"
+        spec["image"]["lerobot_revision"] = repro_worker.LEROBOT_REVISIONS["v3"]
+        spec["artifacts"][0].update(
+            {
+                "name": "droid",
+                "destination": "molmoact2-droid",
+                "payload_s3_uri": "s3://pi05-repro-752160877725-us-east-2/datasets/droid/snapshot/",
+            }
+        )
     resume_artifact = spec["artifacts"][1]
-    resume_artifact["destination"] = f"pi05_libero_l09_distill/{experiment}/{source_step}"
+    resume_artifact["destination"] = f"{config}/{experiment}/{source_step}"
     resume_artifact["payload_s3_uri"] = (
-        "s3://pi05-repro-752160877725-us-east-2/runs/source/checkpoints/"
-        f"pi05_libero_l09_distill/{experiment}/{source_step}/"
+        f"s3://pi05-repro-752160877725-us-east-2/runs/source/checkpoints/{config}/{experiment}/{source_step}/"
     )
-    spec["resume_checkpoint"]["target"] = f"pi05_libero_l09_distill/{experiment}/{source_step}"
+    spec["resume_checkpoint"]["target"] = f"{config}/{experiment}/{source_step}"
     spec["container"]["command"] = [
         "python",
         "scripts/train_pytorch.py",
-        "pi05_libero_l09_distill",
+        config,
         "--exp-name",
         experiment,
         "--checkpoint-base-dir",
@@ -169,12 +182,14 @@ def make_single_gpu_shallow_resume_spec(
         "--log-interval",
         "10",
     ]
+    if track == "droid":
+        spec["container"]["command"].append("--no-wandb-enabled")
     spec["expected_outputs"] = [
         {
             "name": "continued_checkpoint",
             "kind": "checkpoint",
-            "path": f"checkpoints/pi05_libero_l09_distill/{experiment}/{target_step}",
-            "publish_destination": f"pi05_libero_l09_distill/{experiment}/{target_step}",
+            "path": f"checkpoints/{config}/{experiment}/{target_step}",
+            "publish_destination": f"{config}/{experiment}/{target_step}",
         }
     ]
     return spec
@@ -1358,8 +1373,26 @@ def test_single_gpu_shallow_resume_uses_exact_reviewed_ladder_and_argv(tmp_path)
         repro_worker.validate_worker_spec(reordered)
 
 
+def test_single_gpu_droid_shallow_resume_restores_reviewed_parallel_loader(tmp_path):
+    spec = make_single_gpu_shallow_resume_spec(tmp_path, track="droid")
+    validated = repro_worker.validate_worker_spec(spec)
+    command = validated["container"]["command"]
+    assert command[:3] == ["python", "scripts/train_pytorch.py", "pi05_droid_l09_distill"]
+    assert command.count("--no-wandb-enabled") == 1
+    assert "--num-workers" not in command
+
+    wandb_enabled = make_single_gpu_shallow_resume_spec(tmp_path, track="droid")
+    wandb_enabled["container"]["command"].remove("--no-wandb-enabled")
+    with pytest.raises(repro_worker.WorkerError, match="exact reviewed direct-Python argv"):
+        repro_worker.validate_worker_spec(wandb_enabled)
+
+    serialized_loader = make_single_gpu_shallow_resume_spec(tmp_path, track="droid")
+    serialized_loader["container"]["command"].extend(["--num-workers", "0"])
+    with pytest.raises(repro_worker.WorkerError, match="unreviewed options"):
+        repro_worker.validate_worker_spec(serialized_loader)
+
+
 def test_single_gpu_shallow_resume_requires_corrective_g7e_launch_metadata(tmp_path):
-    spec = repro_worker.validate_worker_spec(make_single_gpu_shallow_resume_spec(tmp_path))
     now = dt.datetime.now(dt.UTC)
     metadata = {
         **make_launch_metadata((now + dt.timedelta(hours=6)).isoformat()),
@@ -1367,16 +1400,18 @@ def test_single_gpu_shallow_resume_requires_corrective_g7e_launch_metadata(tmp_p
         "workload": "shallow_training",
         "instance_type": "g7e.4xlarge",
     }
-    repro_worker.validate_launch_metadata(spec, metadata, now=now)
+    for track in ("libero", "droid"):
+        spec = repro_worker.validate_worker_spec(make_single_gpu_shallow_resume_spec(tmp_path, track=track))
+        repro_worker.validate_launch_metadata(spec, metadata, now=now)
 
-    for field, value in (
-        ("category", "shallow_training"),
-        ("workload", "evaluation"),
-        ("instance_type", "g7e.12xlarge"),
-    ):
-        wrong = {**metadata, field: value}
-        with pytest.raises(repro_worker.WorkerError, match="corrective_run/shallow_training on g7e.4xlarge"):
-            repro_worker.validate_launch_metadata(spec, wrong, now=now)
+        for field, value in (
+            ("category", "shallow_training"),
+            ("workload", "evaluation"),
+            ("instance_type", "g7e.12xlarge"),
+        ):
+            wrong = {**metadata, field: value}
+            with pytest.raises(repro_worker.WorkerError, match="corrective_run/shallow_training on g7e.4xlarge"):
+                repro_worker.validate_launch_metadata(spec, wrong, now=now)
 
 
 def test_fresh_snapflow_contract_binds_accepted_source_recipe_and_output(tmp_path):

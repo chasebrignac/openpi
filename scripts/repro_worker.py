@@ -460,6 +460,7 @@ SHALLOW_RESUME_ALLOWED_OPTIONS = {
     "--checkpoint-base-dir",
     "--exp-name",
     "--log-interval",
+    "--no-wandb-enabled",
     "--num-train-steps",
     "--resume",
     "--save-interval",
@@ -532,10 +533,11 @@ def validate_shallow_resume_training_contract(
     """Keep every Shallow resume on the reviewed checkpoint ladder.
 
     The single-GPU corrective path is intentionally narrower than an ordinary
-    two-process Shallow worker: only LIBERO may use it, and its argv is matched
-    byte-for-byte after substituting the already validated experiment, seed,
-    and target step. This prevents CLI equals forms, negated flags, and future
-    config options from silently changing the resumed recipe.
+    two-process Shallow worker. Its argv is matched byte-for-byte after
+    substituting the already validated config, experiment, seed, and target
+    step. DROID keeps disabled W&B from its accepted 2k checkpoint but drops
+    the diagnostic ``--num-workers 0`` override so the reviewed config's four
+    deterministic loader workers can overlap real-video decoding.
     """
 
     context = "Shallow resume training command"
@@ -549,7 +551,10 @@ def validate_shallow_resume_training_contract(
     equals_options = [value for value in training_arguments if value.startswith("-") and "=" in value]
     if equals_options:
         raise WorkerError(f"{context} forbids equals-form options: {equals_options}")
-    negated_options = [value for value in training_arguments if value.startswith("--no-")]
+    allowed_negated_options = {"--no-wandb-enabled"} if training_config == "pi05_droid_l09_distill" else set()
+    negated_options = [
+        value for value in training_arguments if value.startswith("--no-") and value not in allowed_negated_options
+    ]
     if negated_options:
         raise WorkerError(f"{context} forbids negated recipe options: {negated_options}")
     unreviewed_options = [
@@ -573,8 +578,6 @@ def validate_shallow_resume_training_contract(
             raise WorkerError(f"{context} torchrun path requires exactly two local processes")
         return
 
-    if training_config != "pi05_libero_l09_distill":
-        raise WorkerError(f"{context} single-GPU direct-Python path is approved only for LIBERO")
     experiment = _single_command_option(command, "--exp-name", context)
     seed = _single_command_option(command, "--seed", context)
     expected = [
@@ -595,6 +598,8 @@ def validate_shallow_resume_training_contract(
         "--log-interval",
         "10",
     ]
+    if training_config == "pi05_droid_l09_distill":
+        expected.append("--no-wandb-enabled")
     if list(command) != expected:
         raise WorkerError(f"{context} single-GPU corrective path must use the exact reviewed direct-Python argv")
 
@@ -1333,7 +1338,8 @@ def validate_launch_metadata(
         spec.get("resume_checkpoint") is not None
         and isinstance(command, list)
         and len(command) >= 3
-        and command[:3] == ["python", "scripts/train_pytorch.py", "pi05_libero_l09_distill"]
+        and command[:2] == ["python", "scripts/train_pytorch.py"]
+        and command[2] in SHALLOW_RESUME_CONFIGS
     )
     if direct_single_gpu_shallow_resume:
         expected_launch = {
