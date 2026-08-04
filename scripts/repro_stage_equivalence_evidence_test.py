@@ -334,6 +334,31 @@ def test_rejects_symlink_and_path_contract_aliases(tmp_path):
         _validate(track, inputs)
 
 
+def test_accepts_report_paths_through_parent_symlink(tmp_path):
+    real_root = tmp_path / "real"
+    alias_root = tmp_path / "alias"
+    track, inputs, _, report, *_ = _fixture(real_root)
+    alias_root.symlink_to(real_root, target_is_directory=True)
+
+    report["provenance"]["golden_corpus"]["path"] = str(alias_root / inputs.golden_npz.name)
+    report["provenance"]["golden_corpus"]["sidecar_path"] = str(alias_root / inputs.golden_sidecar.name)
+    report["provenance"]["jax_checkpoint"]["manifest"]["path"] = str(alias_root / inputs.source_manifest.name)
+    report["provenance"]["pytorch_checkpoint"]["manifest"]["path"] = str(alias_root / inputs.converted_manifest.name)
+    report["velocities"]["path"] = str(alias_root / inputs.velocity_npz.name)
+    _write_json(inputs.equivalence_report, report)
+
+    assert _validate(track, inputs)["content"]["gate"]["pass"] is True
+
+
+def test_rejects_report_path_that_does_not_resolve_to_input(tmp_path):
+    track, inputs, _, report, *_ = _fixture(tmp_path)
+    report["provenance"]["golden_corpus"]["path"] = str(tmp_path / "missing.npz")
+    _write_json(inputs.equivalence_report, report)
+
+    with pytest.raises(repro_stage_data.StageError, match="exact golden NPZ"):
+        _validate(track, inputs)
+
+
 def _mock_s3_runner(*, existing=False, corrupt_head=False):
     calls = []
     stored = {}

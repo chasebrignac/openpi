@@ -85,12 +85,12 @@ are dry runs and do not contact Hugging Face or AWS.
 First print both transfer plans:
 
 ```bash
-python scripts/repro_stage_data.py plan \
+python3 scripts/repro_stage_data.py plan \
   --dataset libero \
   --local-root /mnt/openpi/datasets \
   --s3-root s3://pi05-repro-752160877725-us-east-2/datasets
 
-python scripts/repro_stage_data.py plan \
+python3 scripts/repro_stage_data.py plan \
   --dataset droid \
   --local-root /mnt/openpi/datasets \
   --s3-root s3://pi05-repro-752160877725-us-east-2/datasets
@@ -100,12 +100,12 @@ Download and validate each immutable snapshot. These are the only commands in
 this section that download dataset payloads:
 
 ```bash
-python scripts/repro_stage_data.py download \
+python3 scripts/repro_stage_data.py download \
   --dataset libero \
   --local-root /mnt/openpi/datasets \
   --execute
 
-python scripts/repro_stage_data.py download \
+python3 scripts/repro_stage_data.py download \
   --dataset droid \
   --local-root /mnt/openpi/datasets \
   --execute
@@ -130,11 +130,11 @@ If a download was resumed or copied from another volume, rerun the read-only
 validation and SHA-256 manifest generation explicitly:
 
 ```bash
-python scripts/repro_stage_data.py validate \
+python3 scripts/repro_stage_data.py validate \
   --dataset libero \
   --local-root /mnt/openpi/datasets
 
-python scripts/repro_stage_data.py validate \
+python3 scripts/repro_stage_data.py validate \
   --dataset droid \
   --local-root /mnt/openpi/datasets
 ```
@@ -153,13 +153,13 @@ the pinned source commit, uploads the SHA-256 manifest separately, and verifies
 the manifest object's source-revision metadata and S3 version ID.
 
 ```bash
-AWS_REGION=us-east-2 python scripts/repro_stage_data.py upload \
+AWS_REGION=us-east-2 python3 scripts/repro_stage_data.py upload \
   --dataset libero \
   --local-root /mnt/openpi/datasets \
   --s3-root s3://pi05-repro-752160877725-us-east-2/datasets \
   --execute
 
-AWS_REGION=us-east-2 python scripts/repro_stage_data.py upload \
+AWS_REGION=us-east-2 python3 scripts/repro_stage_data.py upload \
   --dataset droid \
   --local-root /mnt/openpi/datasets \
   --s3-root s3://pi05-repro-752160877725-us-east-2/datasets \
@@ -363,12 +363,12 @@ that inventory and uses it as the immutable S3 path component. As with dataset
 staging, the default is a network-free dry run:
 
 ```bash
-python scripts/repro_stage_checkpoints.py plan \
+python3 scripts/repro_stage_checkpoints.py plan \
   --checkpoint libero \
   --local-root /mnt/openpi/checkpoints \
   --s3-root s3://pi05-repro-752160877725-us-east-2/checkpoints
 
-python scripts/repro_stage_checkpoints.py plan \
+python3 scripts/repro_stage_checkpoints.py plan \
   --checkpoint droid_jointpos \
   --local-root /mnt/openpi/checkpoints \
   --s3-root s3://pi05-repro-752160877725-us-east-2/checkpoints
@@ -379,12 +379,12 @@ MD5s, refetch the inventory to detect a mid-transfer source change, then hash
 the local trees:
 
 ```bash
-python scripts/repro_stage_checkpoints.py download \
+python3 scripts/repro_stage_checkpoints.py download \
   --checkpoint libero \
   --local-root /mnt/openpi/checkpoints \
   --execute
 
-python scripts/repro_stage_checkpoints.py download \
+python3 scripts/repro_stage_checkpoints.py download \
   --checkpoint droid_jointpos \
   --local-root /mnt/openpi/checkpoints \
   --execute
@@ -395,13 +395,13 @@ same account, region, bucket-versioning and encryption preflight as dataset
 staging:
 
 ```bash
-AWS_REGION=us-east-2 python scripts/repro_stage_checkpoints.py upload \
+AWS_REGION=us-east-2 python3 scripts/repro_stage_checkpoints.py upload \
   --checkpoint libero \
   --local-root /mnt/openpi/checkpoints \
   --s3-root s3://pi05-repro-752160877725-us-east-2/checkpoints \
   --execute
 
-AWS_REGION=us-east-2 python scripts/repro_stage_checkpoints.py upload \
+AWS_REGION=us-east-2 python3 scripts/repro_stage_checkpoints.py upload \
   --checkpoint droid_jointpos \
   --local-root /mnt/openpi/checkpoints \
   --s3-root s3://pi05-repro-752160877725-us-east-2/checkpoints \
@@ -457,13 +457,13 @@ converted revision binds those bytes to the original GCS inventory, exact
 source commit, config, precision, and image digest:
 
 ```bash
-python scripts/repro_stage_converted_checkpoints.py validate \
+python3 scripts/repro_stage_converted_checkpoints.py validate \
   --checkpoint libero \
   --local-root /mnt/openpi/checkpoints \
   --source-commit "$SOURCE_COMMIT" \
   --image-digest "$LIBERO_IMAGE_DIGEST"
 
-python scripts/repro_stage_converted_checkpoints.py validate \
+python3 scripts/repro_stage_converted_checkpoints.py validate \
   --checkpoint droid_jointpos \
   --local-root /mnt/openpi/checkpoints \
   --source-commit "$SOURCE_COMMIT" \
@@ -582,7 +582,7 @@ SHA-256 checksum, and size for all four files plus the manifest written last.
 stage_equivalence_evidence() {
   local action="$1" track="$2" corpus="$3" teacher="$4" image_digest="$5"
   shift 5
-  python scripts/repro_stage_equivalence_evidence.py "$action" \
+  python3 scripts/repro_stage_equivalence_evidence.py "$action" \
     --track "$track" \
     --golden-npz "/mnt/openpi/evidence/${corpus}-heldout.npz" \
     --golden-sidecar "/mnt/openpi/evidence/${corpus}-heldout.json" \
@@ -631,7 +631,7 @@ manifest VersionIds from `s3.publication` along with the copy-ready
 `worker_artifact`.
 
 ```bash
-python scripts/repro_stage_converted_checkpoints.py upload \
+python3 scripts/repro_stage_converted_checkpoints.py upload \
   --checkpoint libero \
   --local-root /mnt/openpi/checkpoints \
   --source-commit "$SOURCE_COMMIT" \
@@ -639,7 +639,7 @@ python scripts/repro_stage_converted_checkpoints.py upload \
   --equivalence-report /mnt/openpi/evidence/pi05_libero.framework-equivalence.json \
   --s3-root s3://pi05-repro-752160877725-us-east-2/checkpoints
 
-AWS_REGION=us-east-2 python scripts/repro_stage_converted_checkpoints.py upload \
+AWS_REGION=us-east-2 python3 scripts/repro_stage_converted_checkpoints.py upload \
   --checkpoint libero \
   --local-root /mnt/openpi/checkpoints \
   --source-commit "$SOURCE_COMMIT" \
@@ -648,7 +648,7 @@ AWS_REGION=us-east-2 python scripts/repro_stage_converted_checkpoints.py upload 
   --s3-root s3://pi05-repro-752160877725-us-east-2/checkpoints \
   --execute
 
-python scripts/repro_stage_converted_checkpoints.py upload \
+python3 scripts/repro_stage_converted_checkpoints.py upload \
   --checkpoint droid_jointpos \
   --local-root /mnt/openpi/checkpoints \
   --source-commit "$SOURCE_COMMIT" \
@@ -656,7 +656,7 @@ python scripts/repro_stage_converted_checkpoints.py upload \
   --equivalence-report /mnt/openpi/evidence/pi05_droid_jointpos.framework-equivalence.json \
   --s3-root s3://pi05-repro-752160877725-us-east-2/checkpoints
 
-AWS_REGION=us-east-2 python scripts/repro_stage_converted_checkpoints.py upload \
+AWS_REGION=us-east-2 python3 scripts/repro_stage_converted_checkpoints.py upload \
   --checkpoint droid_jointpos \
   --local-root /mnt/openpi/checkpoints \
   --source-commit "$SOURCE_COMMIT" \

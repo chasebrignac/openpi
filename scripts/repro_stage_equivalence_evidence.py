@@ -117,6 +117,23 @@ def _require_regular_file(path: pathlib.Path, *, label: str) -> pathlib.Path:
     return path.resolve()
 
 
+def _report_path_references(path_value: Any, expected: pathlib.Path) -> bool:
+    """Accept lexical aliases only when they resolve to the validated file.
+
+    Framework comparison runs inside a container, so its absolute provenance
+    paths can traverse a bind mount such as ``/mnt/openpi``.  Host-side staging
+    may see that same tree through a compatibility symlink such as
+    ``/mnt/openpi -> /opt/pi05``.  Comparing the two path strings would reject
+    byte-identical evidence even though both names resolve to the same file.
+    """
+    if not isinstance(path_value, str) or not path_value or not pathlib.Path(path_value).is_absolute():
+        return False
+    try:
+        return pathlib.Path(path_value).expanduser().resolve(strict=True) == expected
+    except (OSError, RuntimeError):
+        return False
+
+
 def _stable_sha256(path: pathlib.Path) -> str:
     before = path.stat()
     digest = hashlib.sha256()
@@ -264,9 +281,7 @@ def _validate_golden(
     if not isinstance(report_golden, Mapping):
         raise repro_stage_data.StageError("equivalence report has no golden-corpus provenance")
     expected_report = {
-        "path": str(inputs.golden_npz),
         "sha256": golden_sha,
-        "sidecar_path": str(inputs.golden_sidecar),
         "sidecar_sha256": sidecar_sha,
         "run_id": sidecar["run_id"],
         "config_name": track.golden_config,
@@ -276,7 +291,14 @@ def _validate_golden(
         "data_split_seed": 42,
         "data_split": split,
     }
-    if dict(report_golden) != expected_report:
+    actual_report = dict(report_golden)
+    report_path = actual_report.pop("path", None)
+    report_sidecar_path = actual_report.pop("sidecar_path", None)
+    if (
+        not _report_path_references(report_path, inputs.golden_npz)
+        or not _report_path_references(report_sidecar_path, inputs.golden_sidecar)
+        or actual_report != expected_report
+    ):
         raise repro_stage_data.StageError("equivalence report is not bound to the exact golden NPZ and sidecar")
     return sidecar, golden_sha, sidecar_sha
 
@@ -339,17 +361,23 @@ def _validate_manifests(
     pytorch = report_provenance.get("pytorch_checkpoint")
     jax_manifest = jax.get("manifest") if isinstance(jax, Mapping) else None
     pytorch_manifest = pytorch.get("manifest") if isinstance(pytorch, Mapping) else None
-    expected_jax = {"path": str(inputs.source_manifest), "sha256": source_sha, "revision": source_revision}
+    expected_jax = {"sha256": source_sha, "revision": source_revision}
     expected_pytorch = {
-        "path": str(inputs.converted_manifest),
         "sha256": converted_sha,
         "revision": converted_revision,
         "source_commit": source_commit,
         "image_digest": image_digest,
     }
-    if jax_manifest != expected_jax:
+    actual_jax = dict(jax_manifest) if isinstance(jax_manifest, Mapping) else {}
+    actual_jax_path = actual_jax.pop("path", None)
+    actual_pytorch = dict(pytorch_manifest) if isinstance(pytorch_manifest, Mapping) else {}
+    actual_pytorch_path = actual_pytorch.pop("path", None)
+    if not _report_path_references(actual_jax_path, inputs.source_manifest) or actual_jax != expected_jax:
         raise repro_stage_data.StageError("equivalence report does not bind the exact source manifest")
-    if pytorch_manifest != expected_pytorch:
+    if (
+        not _report_path_references(actual_pytorch_path, inputs.converted_manifest)
+        or actual_pytorch != expected_pytorch
+    ):
         raise repro_stage_data.StageError("equivalence report does not bind the exact converted manifest")
     pytorch_config = pytorch.get("config") if isinstance(pytorch, Mapping) else None
     if not isinstance(pytorch_config, Mapping) or pytorch_config.get("config_name") != track.teacher_config:
@@ -368,7 +396,9 @@ def _validate_manifests(
 def _validate_velocities(path: pathlib.Path, report: Mapping[str, Any]) -> dict[str, float]:
     velocity_sha = _stable_sha256(path)
     velocities = report.get("velocities")
-    if not isinstance(velocities, Mapping) or velocities != {"path": str(path), "sha256": velocity_sha}:
+    actual_velocities = dict(velocities) if isinstance(velocities, Mapping) else {}
+    velocity_report_path = actual_velocities.pop("path", None)
+    if not _report_path_references(velocity_report_path, path) or actual_velocities != {"sha256": velocity_sha}:
         raise repro_stage_data.StageError("equivalence report is not bound to the exact velocity NPZ")
     try:
         with np.load(path, allow_pickle=False) as archive:
