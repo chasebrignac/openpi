@@ -180,6 +180,113 @@ def test_rejects_unassigned_instance_and_unpinned_subnet(tmp_path, config, found
         )
 
 
+def test_shallow_training_rejects_single_gpu_fallback(tmp_path, config, foundation):
+    config_path, foundation_path = write_inputs(tmp_path, config, foundation)
+
+    primary = repro_aws_launch.load_static_inputs(
+        config_path,
+        foundation_path,
+        subnet_id=None,
+        category="shallow_training",
+        instance_type="g7e.12xlarge",
+        instance_count=1,
+    )
+    assert primary.availability_zone == "us-east-2a"
+
+    with pytest.raises(repro_aws_launch.LaunchError, match="not approved for category shallow_training"):
+        repro_aws_launch.load_static_inputs(
+            config_path,
+            foundation_path,
+            subnet_id=None,
+            category="shallow_training",
+            instance_type="g7e.4xlarge",
+            instance_count=1,
+        )
+
+
+def test_corrective_budget_cannot_bypass_underlying_workload_hardware(tmp_path, config, foundation):
+    config_path, foundation_path = write_inputs(tmp_path, config, foundation)
+
+    with pytest.raises(repro_aws_launch.LaunchError, match="explicit underlying --workload"):
+        repro_aws_launch.load_static_inputs(
+            config_path,
+            foundation_path,
+            subnet_id=None,
+            category="corrective_run",
+            instance_type="g7e.4xlarge",
+            instance_count=1,
+        )
+
+    with pytest.raises(repro_aws_launch.LaunchError, match="not approved for workload shallow_training"):
+        repro_aws_launch.load_static_inputs(
+            config_path,
+            foundation_path,
+            subnet_id=None,
+            category="corrective_run",
+            workload="shallow_training",
+            instance_type="g7e.4xlarge",
+            instance_count=1,
+        )
+
+    shallow_retry = repro_aws_launch.load_static_inputs(
+        config_path,
+        foundation_path,
+        subnet_id=None,
+        category="corrective_run",
+        workload="shallow_training",
+        instance_type="g7e.12xlarge",
+        instance_count=1,
+    )
+    assert shallow_retry.workload == "shallow_training"
+
+    export_retry = repro_aws_launch.load_static_inputs(
+        config_path,
+        foundation_path,
+        subnet_id=None,
+        category="corrective_run",
+        workload="export_compile_quantize",
+        instance_type="g7e.4xlarge",
+        instance_count=1,
+    )
+    assert export_retry.workload == "export_compile_quantize"
+    retry_plan = make_plan(
+        tmp_path,
+        export_retry,
+        category="corrective_run",
+        workload="export_compile_quantize",
+        retain_after_command=True,
+    )
+    assert (retry_plan.category, retry_plan.workload) == ("corrective_run", "export_compile_quantize")
+    assert retry_plan.retain_after_command is True
+
+
+def test_corrective_evaluation_uses_workload_pinned_ami(tmp_path, config, foundation):
+    inputs = make_inputs(
+        tmp_path,
+        config,
+        foundation,
+        category="corrective_run",
+        workload="evaluation",
+        instance_type="g6e.4xlarge",
+    )
+    assert inputs.workload == "evaluation"
+    assert inputs.ami_id == EVALUATION_AMI["id"]
+
+
+def test_noncorrective_category_cannot_impersonate_another_workload(tmp_path, config, foundation):
+    config_path, foundation_path = write_inputs(tmp_path, config, foundation)
+    with pytest.raises(repro_aws_launch.LaunchError, match="cannot declare workload"):
+        repro_aws_launch.load_static_inputs(
+            config_path,
+            foundation_path,
+            subnet_id=None,
+            category="export_compile_quantize",
+            workload="shallow_training",
+            instance_type="g7e.4xlarge",
+            instance_count=1,
+        )
+
+
 def test_category_deterministically_selects_pinned_evaluation_ami(tmp_path, config, foundation):
     base_inputs = make_inputs(tmp_path, config, foundation)
     assert base_inputs.ami_id == BASE_AMI["id"]
@@ -228,6 +335,8 @@ def test_cli_has_no_arbitrary_ami_override():
             [
                 "--category",
                 "evaluation",
+                "--workload",
+                "evaluation",
                 "--instance-type",
                 "g6e.4xlarge",
                 "--hours",
@@ -252,15 +361,25 @@ def test_plan_reserves_boot_margin_and_worker_must_have_command(tmp_path, config
     assert repro_aws_launch.public_plan(plan)["authoritative_cost_ledger"] == (
         "s3://pi05-repro-752160877725-us-east-2/control/cost-ledger.json"
     )
+    assert repro_aws_launch.public_plan(plan)["workload"] == "export_compile_quantize"
 
     with pytest.raises(repro_aws_launch.LaunchError, match="require a command"):
         make_plan(tmp_path, inputs, command="")
 
-    with pytest.raises(repro_aws_launch.LaunchError, match="allowed only for export_compile_quantize"):
+    shallow_inputs = make_inputs(
+        tmp_path,
+        config,
+        foundation,
+        category="shallow_training",
+        workload="shallow_training",
+        instance_type="g7e.12xlarge",
+    )
+    with pytest.raises(repro_aws_launch.LaunchError, match="allowed only for the export_compile_quantize workload"):
         make_plan(
             tmp_path,
-            inputs,
+            shallow_inputs,
             category="shallow_training",
+            workload="shallow_training",
             instance_type="g7e.12xlarge",
             retain_after_command=True,
         )
@@ -305,6 +424,7 @@ def test_run_request_is_on_demand_hardened_and_tagged(tmp_path, config, foundati
     for specification in tag_specs:
         tags = {tag["Key"]: tag["Value"] for tag in specification["Tags"]}
         assert tags["Project"] == "pi05-aws-repro"
+        assert tags["Workload"] == "export_compile_quantize"
         assert tags["CommandSha256"] == plan.command_sha256
     user_data = arguments[arguments.index("--user-data") + 1]
     assert "pi05-hard-deadline.timer" in user_data
@@ -316,6 +436,7 @@ def test_run_request_is_on_demand_hardened_and_tagged(tmp_path, config, foundati
     metadata_line = next(line for line in user_data.splitlines() if line.endswith("> /opt/pi05/launch-metadata.json"))
     metadata = json.loads(base64.b64decode(metadata_line.split("'")[3]))
     assert metadata["reservation_id"] == "reservation-1"
+    assert metadata["workload"] == "export_compile_quantize"
     assert metadata["purchase_option"] == "On-Demand"
     assert metadata["projected_compute_usd"] == plan.projected_usd
     assert metadata["reserved_hours"] == plan.reserved_hours
@@ -478,6 +599,7 @@ def test_execute_reserves_before_launch_and_records_instance(tmp_path, config, f
     assert json.loads(target["Input"]) == {"InstanceIds": ["i-123"]}
     entry = json.loads(ledger_path.read_text())["entries"][0]
     assert entry["state"] == "launched"
+    assert entry["workload"] == "export_compile_quantize"
     assert entry["schedule_arn"] == result["schedule_arn"]
     assert entry["usd"] == pytest.approx(plan.projected_usd)
     ledger_puts = [call for call in aws.calls if call[:2] == ["s3api", "put-object"]]

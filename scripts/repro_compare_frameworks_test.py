@@ -1,4 +1,5 @@
 import json
+import pathlib
 
 import numpy as np
 import pytest
@@ -48,6 +49,39 @@ def test_velocity_gate_uses_worst_sample_not_mean():
     assert report["cosine_mean"] == 0.5
     assert report["cosine_min"] == 0.0
     assert report["gate_pass"] is False
+
+
+@pytest.mark.parametrize("existing_name", ["framework-equivalence.json", "framework-equivalence.npz"])
+def test_main_refuses_existing_output_before_expensive_comparison(tmp_path, monkeypatch, existing_name):
+    output = tmp_path / "framework-equivalence.json"
+    (tmp_path / existing_name).write_bytes(b"preserve me")
+
+    def unexpected_compare(**_kwargs):
+        raise AssertionError("expensive comparison ran before the output collision check")
+
+    monkeypatch.setattr(repro_compare_frameworks, "compare", unexpected_compare)
+    monkeypatch.setattr(
+        repro_compare_frameworks,
+        "parse_args",
+        lambda: type(
+            "Args",
+            (),
+            {
+                "config_name": "pi05_libero",
+                "jax_checkpoint": pathlib.Path("jax"),
+                "pytorch_checkpoint": pathlib.Path("pytorch"),
+                "source_manifest": pathlib.Path("source.json"),
+                "converted_manifest": pathlib.Path("converted.json"),
+                "corpus": pathlib.Path("golden.npz"),
+                "device": "cuda:0",
+                "output": output,
+            },
+        )(),
+    )
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        repro_compare_frameworks.main()
+    assert (tmp_path / existing_name).read_bytes() == b"preserve me"
 
 
 def _golden_fixture(tmp_path):

@@ -555,6 +555,7 @@ def save_checkpoint(
     initialization_lineage,
     *,
     overfit_diagnostic: dict | None = None,
+    training_metrics: dict | None = None,
 ):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
@@ -620,6 +621,25 @@ def save_checkpoint(
             "state_files": ["metadata.pt", "model.safetensors", "optimizer.pt", "wandb_id.txt"],
         }
         (tmp_ckpt_dir / "resume-state.json").write_text(json.dumps(resume_state, indent=2, sort_keys=True) + "\n")
+
+        if training_metrics is not None:
+            metrics = _canonical_json_value(training_metrics)
+            if not isinstance(metrics, dict) or not metrics:
+                raise ValueError("training checkpoint metrics must be a non-empty object")
+            # ``allow_nan=False`` makes the durable sidecar fail closed even if
+            # a newly added diagnostic bypasses the tensor-level finite gate.
+            metrics_payload = {
+                "schema_version": 1,
+                "config_name": config.name,
+                "exp_name": config.exp_name,
+                "global_step": global_step,
+                "metrics": metrics,
+            }
+            try:
+                serialized_metrics = json.dumps(metrics_payload, allow_nan=False, indent=2, sort_keys=True) + "\n"
+            except (TypeError, ValueError) as exc:
+                raise ValueError("training checkpoint metrics must contain only finite JSON values") from exc
+            (tmp_ckpt_dir / "training-metrics.json").write_text(serialized_metrics)
 
         if overfit_diagnostic is not None:
             (tmp_ckpt_dir / "overfit-diagnostic.json").write_text(
@@ -1190,6 +1210,7 @@ def train_loop(config: _config.TrainConfig):
         if is_main
         else None
     )
+    latest_optimizer_metrics = None
 
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
@@ -1333,6 +1354,28 @@ def train_loop(config: _config.TrainConfig):
 
             if is_main:
                 infos[-1]["grad_norm"] = float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm
+                accumulation_window = infos[-config.gradient_accumulation_steps :]
+                latest_optimizer_metrics = {
+                    "measurement_scope": "rank-zero local microbatches for final optimizer step",
+                    "loss": math.fsum(float(info["loss"]) for info in accumulation_window) / len(accumulation_window),
+                    "learning_rate": math.fsum(float(info["learning_rate"]) for info in accumulation_window)
+                    / len(accumulation_window),
+                    "grad_norm": float(infos[-1]["grad_norm"]),
+                }
+                for metric_name in (
+                    "fm_mse",
+                    "kd_mse",
+                    "kd_cosine",
+                    "per_joint_nrmse_mean",
+                    "per_joint_nrmse_max",
+                    "snapflow_total",
+                    "snapflow_fm_mse",
+                    "snapflow_shortcut_mse",
+                ):
+                    if all(metric_name in info for info in accumulation_window):
+                        latest_optimizer_metrics[metric_name] = math.fsum(
+                            float(info[metric_name]) for info in accumulation_window
+                        ) / len(accumulation_window)
             if config.one_batch_overfit:
                 if len(accumulation_losses) != config.gradient_accumulation_steps:
                     raise RuntimeError("one-batch diagnostic lost an accumulated microbatch loss")
@@ -1426,6 +1469,12 @@ def train_loop(config: _config.TrainConfig):
                     )
             # Save checkpoint using the new mechanism
             if checkpoint_due(config, global_step):
+                checkpoint_metrics = latest_optimizer_metrics
+                if checkpoint_metrics is not None and overfit_diagnostic is not None:
+                    checkpoint_metrics = {
+                        **checkpoint_metrics,
+                        "one_batch_overfit": overfit_diagnostic,
+                    }
                 coordinated_save_checkpoint(
                     model,
                     optim,
@@ -1437,6 +1486,7 @@ def train_loop(config: _config.TrainConfig):
                     resume_contract,
                     initialization_lineage,
                     overfit_diagnostic=overfit_diagnostic,
+                    training_metrics=checkpoint_metrics,
                     device=device,
                 )
 

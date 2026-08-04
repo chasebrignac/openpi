@@ -22,7 +22,7 @@
     "approved_instances": {
       "g6e.4xlarge": {"hourly_usd": 3.00424, "purpose": "workbench/evaluation"},
       "g7e.2xlarge": {"hourly_usd": 3.36312, "purpose": "SnapFlow"},
-      "g7e.4xlarge": {"hourly_usd": 3.99816, "purpose": "export/compile/latency or fallback training"},
+      "g7e.4xlarge": {"hourly_usd": 3.99816, "purpose": "export/compile/latency"},
       "g7e.12xlarge": {"hourly_usd": 8.28608, "purpose": "two-GPU Shallow training"}
     },
     "base_ami": {

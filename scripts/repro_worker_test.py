@@ -4,6 +4,7 @@ import hashlib
 import json
 import pathlib
 import re
+import shlex
 
 import pytest
 
@@ -757,6 +758,74 @@ def test_manifest_revision_paths_totals_and_local_hashes_are_verified(tmp_path):
         repro_worker.validate_artifact_manifest(manifest, artifact)
 
 
+def test_explicit_payload_versions_are_validated_and_staged_without_unversioned_sync(tmp_path):
+    raw = make_spec(tmp_path)
+    content = b"exact-versioned-payload"
+    digest = hashlib.sha256(content).hexdigest()
+    manifest = {
+        "schema_version": 1,
+        "source": {
+            "provider": "huggingface",
+            "repo_id": "physical-intelligence/libero",
+            "revision": raw["artifacts"][0]["revision"],
+        },
+        "dataset": {"key": "libero", "codebase_version": "v2.0", "local_dirname": "libero"},
+        "files": [{"path": "data.bin", "bytes": len(content), "sha256": digest}],
+        "totals": {"files": 1, "bytes": len(content)},
+    }
+    manifest_bytes = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+    artifact = raw["artifacts"][0]
+    artifact["manifest"]["sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+    artifact["payload_objects"] = [{"path": "data.bin", "version_id": "payload-v7", "sha256": digest}]
+    spec = repro_worker.validate_worker_spec(raw)
+    artifact = spec["artifacts"][0]
+    manifest_location = repro_worker.parse_s3_uri(artifact["manifest"]["s3_uri"])
+    payload_location = repro_worker.parse_s3_uri(artifact["payload_s3_uri"], prefix=True)
+    objects = {
+        (manifest_location.key, artifact["manifest"]["version_id"]): manifest_bytes,
+        (f"{payload_location.key}/data.bin", "payload-v7"): content,
+    }
+    calls = []
+
+    def runner(argv):
+        argv = list(argv)
+        calls.append(argv)
+        assert argv[:3] == ["aws", "s3api", "get-object"]
+        key = argv[argv.index("--key") + 1]
+        version = argv[argv.index("--version-id") + 1]
+        pathlib.Path(argv[-1]).write_bytes(objects[(key, version)])
+        return json.dumps({"VersionId": version})
+
+    staged = repro_worker.stage_artifact(artifact, spec, tmp_path / "scratch", runner)
+
+    assert staged["files"] == 1
+    assert pathlib.Path(staged["destination"], "data.bin").read_bytes() == content
+    assert len(calls) == 2
+    assert all(call[:3] == ["aws", "s3api", "get-object"] for call in calls)
+
+    incomplete = {**artifact, "payload_objects": []}
+    with pytest.raises(repro_worker.WorkerError, match="non-empty list"):
+        repro_worker.validate_worker_spec({**raw, "artifacts": [incomplete]})
+
+
+def test_converted_teacher_cannot_fall_back_to_unversioned_payload_sync():
+    artifact = {
+        "name": "libero_teacher_pytorch",
+        "kind": "checkpoint",
+        "revision": "9" * 64,
+        "manifest": {"s3_uri": "s3://bucket/manifest", "version_id": "v1", "sha256": "a" * 64},
+        "payload_s3_uri": "s3://bucket/checkpoint/",
+        "destination": "pi05_libero_pytorch",
+    }
+    manifest = {
+        "source": {"provider": "openpi-jax-to-pytorch", "revision": artifact["revision"]},
+        "files": [{"path": "model.safetensors", "bytes": 5, "sha256": "b" * 64}],
+    }
+
+    with pytest.raises(repro_worker.WorkerError, match="requires explicit versioned payload_objects"):
+        repro_worker.exact_artifact_payload_pins(manifest, artifact)
+
+
 def test_complete_staged_input_tree_is_readable_and_nonwritable_for_container_uid(tmp_path):
     root = tmp_path / "inputs"
     payload = root / "checkpoints" / "model" / "model.safetensors"
@@ -1294,6 +1363,318 @@ def test_expected_checkpoint_publishes_worker_compatible_input_manifest(tmp_path
     changed_payload = {**artifact, "payload_s3_uri": artifact["payload_s3_uri"].replace("/2000/", "/5000/")}
     with pytest.raises(repro_worker.WorkerError, match="publication path"):
         repro_worker.validate_artifact_manifest(manifest, changed_payload)
+
+
+def _training_metrics_output(tmp_path, metrics_document=None):
+    raw = make_spec(tmp_path)
+    relative = "checkpoints/pi05_libero_l09_distill/libero-shallow/2000"
+    raw["expected_outputs"] = [{"name": "pilot_checkpoint", "kind": "checkpoint", "path": relative}]
+    spec = repro_worker.validate_worker_spec(raw)
+    root = tmp_path / "output"
+    for directory in (".ready", ".receipts", ".spool", relative):
+        (root / directory).mkdir(parents=True)
+    checkpoint = root / relative
+    (checkpoint / "model.safetensors").write_bytes(b"weights")
+    if metrics_document is not None:
+        (checkpoint / repro_worker.TRAINING_METRICS_FILENAME).write_text(json.dumps(metrics_document))
+    manager = repro_worker.OutputManager(spec, root, OutputRunner())
+    markers = manager.commit_expected_outputs()
+    return spec, root, checkpoint, markers
+
+
+def _metrics_runtime_context(instance_type="g6e.4xlarge"):
+    launch = make_launch_metadata("2026-08-04T12:00:00+00:00")
+    launch["instance_type"] = instance_type
+    identity = {
+        "accountId": repro_worker.EXPECTED_ACCOUNT,
+        "region": repro_worker.EXPECTED_REGION,
+        "instanceId": "i-0123456789abcdef0",
+        "instanceType": instance_type,
+    }
+    return launch, identity
+
+
+def _write_expected_json(tmp_path, spec, relative, document):
+    root = tmp_path / "output"
+    for directory in (".ready", ".receipts", ".spool", pathlib.PurePosixPath(relative).parent.as_posix()):
+        (root / directory).mkdir(parents=True, exist_ok=True)
+    source = root / relative
+    source.write_text(json.dumps(document))
+    manager = repro_worker.OutputManager(spec, root, OutputRunner())
+    return root, source, manager.commit_expected_outputs()
+
+
+def test_run_metrics_are_finite_hash_covered_and_old_checkpoint_absence_is_compatible(tmp_path):
+    document = {
+        "schema_version": 1,
+        "config_name": "pi05_libero_l09_distill",
+        "exp_name": "libero-shallow",
+        "global_step": 2000,
+        "metrics": {"loss": 0.25, "kd_cosine": 0.999},
+    }
+    spec, root, _checkpoint, markers = _training_metrics_output(tmp_path / "current", document)
+    metrics, provenance = repro_worker.collect_run_metrics(spec, root, markers)
+    path = "checkpoints/pi05_libero_l09_distill/libero-shallow/2000/training-metrics.json"
+    assert metrics == {path: document["metrics"]}
+    assert provenance == [
+        {
+            "expected_output": "pilot_checkpoint",
+            "path": path,
+            "sha256": repro_worker.sha256_file(root / path),
+        }
+    ]
+
+    old_spec, old_root, _old_checkpoint, old_markers = _training_metrics_output(tmp_path / "old")
+    assert repro_worker.collect_run_metrics(old_spec, old_root, old_markers) == ({}, [])
+
+
+def test_run_metrics_ingest_declared_evaluation_manifest(tmp_path):
+    raw = make_libero_evaluator_spec(tmp_path)
+    raw["container"]["command"].extend(["--stage", "final", "--seed", "7"])
+    relative = "manifests/libero-final.json"
+    raw["expected_outputs"] = [{"name": "evaluation_manifest", "kind": "manifest", "path": relative}]
+    spec = repro_worker.validate_worker_spec(raw)
+    command = spec["container"]["command"][1:]
+    launch, identity = _metrics_runtime_context()
+    document = {
+        "schema_version": 1,
+        "project": repro_worker.EXPECTED_PROJECT,
+        "kind": "libero-evaluation",
+        "run_id": spec["run_id"],
+        "started_at": "2026-08-04T10:00:00+00:00",
+        "finished_at": "2026-08-04T10:01:00+00:00",
+        "source": {"commit": spec["source"]["commit"]},
+        "image": {"digest": spec["image"]["digest"]},
+        "dataset": {"name": "LIBERO fixed benchmark assets", "revision": spec["artifacts"][0]["revision"]},
+        "simulator": {},
+        "dependencies": {},
+        "policy": {},
+        "evaluation": {
+            "stage": "final",
+            "seed": spec["seed"],
+            "suites": ["libero_spatial"],
+            "trials_per_task": 50,
+            "metrics": {"success": 0.97},
+        },
+        "command": command,
+        "child_commands": [],
+        "instance": {
+            "type": identity["instanceType"],
+            "id": identity["instanceId"],
+            "identity_recorded_by": "worker run manifest",
+        },
+        "cost": {"projected_usd": 18.0, "actual_recorded_by": "worker run manifest"},
+        "artifacts": [],
+    }
+    root, source, markers = _write_expected_json(tmp_path, spec, relative, document)
+
+    metrics, provenance = repro_worker.collect_run_metrics(
+        spec, root, markers, launch_metadata=launch, instance_identity=identity
+    )
+
+    assert metrics == {relative: {"success": 0.97}}
+    assert provenance[0]["sha256"] == repro_worker.sha256_file(source)
+
+
+def test_run_metrics_reject_unrecognized_or_mismatched_evaluation_manifest(tmp_path):
+    launch, identity = _metrics_runtime_context()
+    for suffix, document in (
+        ("unknown", {"schema_version": 1, "evaluation": {"metrics": {"success": 0.97}}}),
+        (
+            "wrong-schema",
+            {
+                "schema_version": 999,
+                "kind": "libero-evaluation",
+                "evaluation": {"metrics": {"success": 0.97}},
+            },
+        ),
+    ):
+        raw = make_spec(tmp_path / suffix)
+        relative = f"manifests/{suffix}.json"
+        raw["expected_outputs"] = [{"name": "evaluation_manifest", "kind": "manifest", "path": relative}]
+        spec = repro_worker.validate_worker_spec(raw)
+        root, _source, markers = _write_expected_json(tmp_path / suffix, spec, relative, document)
+        with pytest.raises(repro_worker.WorkerError, match=r"recognized schema|wrong schema"):
+            repro_worker.collect_run_metrics(spec, root, markers, launch_metadata=launch, instance_identity=identity)
+
+
+def _latency_metrics_output(tmp_path, *, schema_version=1, image_digest=None):
+    raw = make_tensorrt_policy_spec(tmp_path)
+    instance_id = "i-0123456789abcdef0"
+    raw["placement"] = {"mode": "exact-existing-instance", "instance_id": instance_id}
+    relative = "artifacts/latency.json"
+    raw["expected_outputs"] = [{"name": "latency", "kind": "artifact", "path": relative}]
+    raw["container"]["command"] = [
+        "python",
+        "scripts/benchmark_pi05_latency.py",
+        "--backend",
+        "tensorrt",
+        "--stage",
+        "tensorrt_fp8",
+        "--artifact-dir",
+        "/mnt/openpi/artifacts",
+        "--track",
+        "libero",
+        "--dataset",
+        "physical-intelligence/libero",
+        "--dataset-revision",
+        raw["artifacts"][0]["revision"],
+        "--image-digest",
+        raw["image"]["digest"],
+        "--instance-id",
+        instance_id,
+        "--cost-reservation",
+        "12345678-1234-4123-8123-123456789abc",
+        "--output",
+        "/output/artifacts/latency.json",
+    ]
+    spec = repro_worker.validate_worker_spec(raw)
+    launch, identity = _metrics_runtime_context("g7e.4xlarge")
+    document = {
+        "schema_version": schema_version,
+        "stage": "tensorrt_fp8",
+        "track": "libero",
+        "official_protocol": True,
+        "batch_size": 1,
+        "warmups": 500,
+        "iterations": 10_000,
+        "latency": {"total": {"cuda_event_ms": {"mean": 12.5}}},
+        "runner": {"backend": "tensorrt", "num_denoise_steps": 1},
+        "numerical_smoke": {"cosine_similarity": 0.999},
+        "gpu_inventory": [],
+        "dataset": {"name": "physical-intelligence/libero", "revision": spec["artifacts"][0]["revision"]},
+        "benchmark_inputs": {},
+        "source_artifacts": [],
+        "runtime": {
+            "instance_type": identity["instanceType"],
+            "instance_id": identity["instanceId"],
+            "image_digest": image_digest or spec["image"]["digest"],
+            "instance_identity_source": "IMDSv2",
+        },
+    }
+    root, source, markers = _write_expected_json(tmp_path, spec, relative, document)
+    return spec, root, source, markers, launch, identity
+
+
+def test_run_metrics_ingest_command_bound_latency_report(tmp_path):
+    spec, root, source, markers, launch, identity = _latency_metrics_output(tmp_path)
+    metrics, provenance = repro_worker.collect_run_metrics(
+        spec, root, markers, launch_metadata=launch, instance_identity=identity
+    )
+    relative = "artifacts/latency.json"
+    assert metrics == {
+        relative: {
+            "latency": {"total": {"cuda_event_ms": {"mean": 12.5}}},
+            "numerical_smoke": {"cosine_similarity": 0.999},
+        }
+    }
+    assert provenance[0]["sha256"] == repro_worker.sha256_file(source)
+
+
+def test_run_metrics_ignores_unrelated_manifests_in_composite_artifact(tmp_path):
+    raw = make_spec(tmp_path)
+    relative = "artifacts/composite"
+    raw["expected_outputs"] = [{"name": "composite", "kind": "artifact", "path": relative}]
+    dataset = raw["artifacts"][0]
+    raw["container"]["command"] = [
+        "python",
+        "scripts/export_pi05_onnx.py",
+        "--stage",
+        "current",
+        "--track",
+        "libero",
+        "--dataset",
+        "physical-intelligence/libero",
+        "--dataset-revision",
+        dataset["revision"],
+    ]
+    spec = raw
+    launch, identity = _metrics_runtime_context()
+    command = spec["container"]["command"][1:]
+
+    def stage_manifest(stage, argv, value):
+        return {
+            "schema_version": 1,
+            "created_at": "2026-08-04T10:00:00+00:00",
+            "stage": stage,
+            "track": "libero",
+            "source": {"sha": spec["source"]["commit"], "dirty": False},
+            "runtime": {
+                "image_digest": spec["image"]["digest"],
+                "instance_type": identity["instanceType"],
+                "instance_id": identity["instanceId"],
+            },
+            "dataset": {"name": "physical-intelligence/libero", "revision": dataset["revision"]},
+            "experiment": {"seed": None, "steps": None},
+            "cost": {"reservation_id": launch["reservation_id"]},
+            "command": {"argv": argv, "shell": shlex.join(argv)},
+            "metrics": {"value": value},
+            "artifacts": [],
+            "details": {},
+        }
+
+    root = tmp_path / "output"
+    target = root / relative
+    for directory in (root / ".ready", root / ".receipts", root / ".spool", target):
+        directory.mkdir(parents=True, exist_ok=True)
+    (target / "current-manifest.json").write_text(json.dumps(stage_manifest("current", command, 1.0)))
+    old_command = [*command]
+    old_command[old_command.index("current")] = "old"
+    (target / "old-manifest.json").write_text(json.dumps(stage_manifest("old", old_command, 99.0)))
+    markers = repro_worker.OutputManager(spec, root, OutputRunner()).commit_expected_outputs()
+
+    metrics, provenance = repro_worker.collect_run_metrics(
+        spec, root, markers, launch_metadata=launch, instance_identity=identity
+    )
+
+    assert metrics == {f"{relative}/current-manifest.json": {"value": 1.0}}
+    assert [item["path"] for item in provenance] == [f"{relative}/current-manifest.json"]
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "image_digest", "message"),
+    [(999, None, "wrong schema"), (1, "sha256:" + "9" * 64, "identity differs")],
+)
+def test_run_metrics_reject_latency_schema_or_identity(tmp_path, schema_version, image_digest, message):
+    spec, root, _source, markers, launch, identity = _latency_metrics_output(
+        tmp_path, schema_version=schema_version, image_digest=image_digest
+    )
+    with pytest.raises(repro_worker.WorkerError, match=message):
+        repro_worker.collect_run_metrics(spec, root, markers, launch_metadata=launch, instance_identity=identity)
+
+
+def test_run_metrics_reject_identity_nonfinite_and_post_commit_tampering(tmp_path):
+    base = {
+        "schema_version": 1,
+        "config_name": "pi05_libero_l09_distill",
+        "exp_name": "libero-shallow",
+        "global_step": 2000,
+        "metrics": {"loss": 0.25},
+    }
+    wrong_step = {**base, "global_step": 5000}
+    spec, root, _checkpoint, markers = _training_metrics_output(tmp_path / "identity", wrong_step)
+    with pytest.raises(repro_worker.WorkerError, match="config/experiment/step"):
+        repro_worker.collect_run_metrics(spec, root, markers)
+
+    nonfinite = {**base, "metrics": {"loss": float("nan")}}
+    spec, root, _checkpoint, markers = _training_metrics_output(tmp_path / "nonfinite", nonfinite)
+    with pytest.raises(repro_worker.WorkerError, match="non-finite"):
+        repro_worker.collect_run_metrics(spec, root, markers)
+
+    spec, root, checkpoint, markers = _training_metrics_output(tmp_path / "tampered", base)
+    (checkpoint / repro_worker.TRAINING_METRICS_FILENAME).write_text(json.dumps({**base, "metrics": {"loss": 9}}))
+    with pytest.raises(repro_worker.WorkerError, match="changed after expected-output commit"):
+        repro_worker.collect_run_metrics(spec, root, markers)
+
+
+def test_worker_cost_exposes_projection_but_never_infers_actual():
+    metadata = make_launch_metadata("2026-08-04T12:00:00+00:00")
+    assert repro_worker.worker_cost_record(metadata) == {
+        "reservation_id": metadata["reservation_id"],
+        "projected_usd": 18.0,
+        "actual_usd": None,
+        "actual_recorded_by": "versioned cost ledger after AWS billing reconciliation",
+    }
 
 
 def test_resume_checkpoint_is_hash_verified_restored_and_not_reuploaded(tmp_path):

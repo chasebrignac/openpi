@@ -45,16 +45,26 @@ BOOT_AND_SHUTDOWN_RESERVE_HOURS = 0.25
 UTC = getattr(dt, "UTC", dt.timezone.utc)  # noqa: UP017 -- direct-script compatibility with macOS Python 3.9.
 SCHEDULER_ROLE_RE = re.compile(r"^arn:aws:iam::752160877725:role/[A-Za-z0-9+=,.@_/-]{1,512}$")
 DEFAULT_AMI_KEY = "base"
-CATEGORY_AMI_KEYS = {"evaluation": "evaluation"}
+WORKLOAD_AMI_KEYS = {"evaluation": "evaluation"}
 
-# A category may only launch the machines assigned to that stage in the plan.
-# The value is the largest count allowed in one idempotent RunInstances call.
-LAUNCH_MATRIX: dict[str, dict[str, int]] = {
+# A workload may only launch the machines assigned to that stage in the plan.
+# Spend categories are separate: ``corrective_run`` can fund a bounded retry,
+# but it cannot change the retried workload's hardware contract.
+WORKLOAD_MATRIX: dict[str, dict[str, int]] = {
     "workbench_setup": {"g6e.4xlarge": 1},
-    "shallow_training": {"g7e.12xlarge": 1, "g7e.4xlarge": 2},
+    # Every documented Shallow command is one-node, two-process DDP.  Keep the
+    # launch guard aligned with that contract: g7e.4xlarge has only one GPU and
+    # this launcher does not implement a multi-node rendezvous.
+    "shallow_training": {"g7e.12xlarge": 1},
     "snapflow_bc": {"g7e.2xlarge": 2},
     "export_compile_quantize": {"g7e.4xlarge": 1},
     "evaluation": {"g6e.4xlarge": 4},
+}
+
+# The category selects a spend cap. Normal runs use the same-named workload;
+# corrective runs must declare one underlying workload and pass both matrices.
+LAUNCH_MATRIX: dict[str, dict[str, int]] = {
+    **WORKLOAD_MATRIX,
     "corrective_run": {
         "g6e.4xlarge": 2,
         "g7e.2xlarge": 2,
@@ -146,6 +156,7 @@ class AwsCli:
 class StaticInputs:
     config: dict[str, Any]
     foundation: dict[str, Any]
+    workload: str
     subnet_id: str
     availability_zone: str
     security_group_id: str
@@ -165,6 +176,7 @@ class StaticInputs:
 @dataclasses.dataclass(frozen=True)
 class LaunchPlan:
     category: str
+    workload: str
     instance_type: str
     instance_count: int
     max_runtime_hours: float
@@ -200,7 +212,26 @@ def _read_required_json(path: pathlib.Path) -> dict[str, Any]:
     return value
 
 
-def validate_launch_policy(category: str, instance_type: str, instance_count: int) -> None:
+def resolve_workload(category: str, workload: str | None) -> str:
+    if category == "corrective_run":
+        if workload is None:
+            raise LaunchError("corrective_run requires an explicit underlying --workload")
+    elif workload is None:
+        workload = category
+    elif workload != category:
+        raise LaunchError(f"budget category {category} cannot declare workload {workload}")
+    if workload not in WORKLOAD_MATRIX:
+        raise LaunchError(f"unsupported workload: {workload}")
+    return workload
+
+
+def validate_launch_policy(
+    category: str,
+    instance_type: str,
+    instance_count: int,
+    *,
+    workload: str | None = None,
+) -> str:
     allowed = LAUNCH_MATRIX.get(category)
     if allowed is None:
         raise LaunchError(f"budget category cannot launch compute: {category}")
@@ -209,16 +240,20 @@ def validate_launch_policy(category: str, instance_type: str, instance_count: in
         raise LaunchError(f"{instance_type} is not approved for category {category}")
     if instance_count != 1:
         raise LaunchError(f"instance count must be exactly 1 per guarded launch, got {instance_count}")
+    resolved_workload = resolve_workload(category, workload)
+    if instance_type not in WORKLOAD_MATRIX[resolved_workload]:
+        raise LaunchError(f"{instance_type} is not approved for workload {resolved_workload}")
+    return resolved_workload
 
 
 def _select_pinned_ami(
     config_aws: Mapping[str, Any],
     foundation: Mapping[str, Any],
-    category: str,
+    workload: str,
 ) -> Mapping[str, Any]:
-    """Select the one foundation-pinned AMI assigned to this launch category."""
+    """Select the one foundation-pinned AMI assigned to this workload."""
 
-    ami_key = CATEGORY_AMI_KEYS.get(category, DEFAULT_AMI_KEY)
+    ami_key = WORKLOAD_AMI_KEYS.get(workload, DEFAULT_AMI_KEY)
     launch_amis = foundation.get("launch_amis", {})
     if not isinstance(launch_amis, Mapping):
         raise LaunchError("foundation launch_amis must be an object")
@@ -272,6 +307,7 @@ def load_static_inputs(
     category: str,
     instance_type: str,
     instance_count: int,
+    workload: str | None = None,
 ) -> StaticInputs:
     config = _read_required_json(config_path)
     foundation = _read_required_json(foundation_path)
@@ -290,7 +326,12 @@ def load_static_inputs(
         if actual != expected:
             raise LaunchError(f"{field} mismatch: expected {expected!r}, got {actual!r}")
 
-    validate_launch_policy(category, instance_type, instance_count)
+    resolved_workload = validate_launch_policy(
+        category,
+        instance_type,
+        instance_count,
+        workload=workload,
+    )
     if instance_type not in aws.get("approved_instances", {}):
         raise LaunchError(f"instance type missing from approved_instances: {instance_type}")
 
@@ -313,13 +354,14 @@ def load_static_inputs(
     if artifact_bucket != EXPECTED_ARTIFACT_BUCKET:
         raise LaunchError(f"foundation artifact bucket mismatch: {artifact_bucket!r}")
     security_group = network.get("security_group", {})
-    ami = _select_pinned_ami(aws, foundation, category)
+    ami = _select_pinned_ami(aws, foundation, resolved_workload)
     if security_group.get("ingress_rule_count") != 0:
         raise LaunchError("foundation does not assert a zero-ingress security group")
 
     return StaticInputs(
         config=config,
         foundation=foundation,
+        workload=resolved_workload,
         subnet_id=selected_id,
         availability_zone=availability_zone,
         security_group_id=str(security_group.get("id", "")),
@@ -438,6 +480,7 @@ def make_plan(
     command: str,
     root_device_name: str,
     root_volume_gib: int | None,
+    workload: str | None = None,
     retain_after_command: bool = False,
     scheduler_role_arn: str | None = None,
     now: dt.datetime | None = None,
@@ -448,10 +491,18 @@ def make_plan(
         raise LaunchError("label must not be empty")
     if category != "workbench_setup" and not command.strip():
         raise LaunchError("non-workbench launches require a command so paid GPUs do not start idle")
-    if retain_after_command and category != "export_compile_quantize":
-        raise LaunchError("--retain-after-command is allowed only for export_compile_quantize")
     if scheduler_role_arn is not None and SCHEDULER_ROLE_RE.fullmatch(scheduler_role_arn) is None:
         raise LaunchError("scheduler role ARN is not a valid role in the pinned AWS account")
+    resolved_workload = validate_launch_policy(
+        category,
+        instance_type,
+        instance_count,
+        workload=workload,
+    )
+    if inputs.workload != resolved_workload:
+        raise LaunchError(f"static inputs were selected for workload {inputs.workload}, not {resolved_workload}")
+    if retain_after_command and resolved_workload != "export_compile_quantize":
+        raise LaunchError("--retain-after-command is allowed only for the export_compile_quantize workload")
 
     volume_gib = root_volume_gib if root_volume_gib is not None else (1024 if category == "workbench_setup" else 256)
     if not 100 <= volume_gib <= 2048:
@@ -474,6 +525,7 @@ def make_plan(
 
     return LaunchPlan(
         category=category,
+        workload=resolved_workload,
         instance_type=instance_type,
         instance_count=instance_count,
         max_runtime_hours=max_runtime_hours,
@@ -502,6 +554,7 @@ def build_user_data(plan: LaunchPlan, reservation_id: str) -> str:
     command_b64 = base64.b64encode(plan.command.encode()).decode()
     metadata = {
         "category": plan.category,
+        "workload": plan.workload,
         "command_sha256": plan.command_sha256,
         "deadline_utc": plan.deadline_utc,
         "instance_type": plan.instance_type,
@@ -585,6 +638,7 @@ def _tag_specifications(plan: LaunchPlan, reservation_id: str) -> list[dict[str,
         {"Key": "Reproduction", "Value": "pi05-repro"},
         {"Key": "ManagedBy", "Value": "repro-aws-launch"},
         {"Key": "Category", "Value": plan.category},
+        {"Key": "Workload", "Value": plan.workload},
         {"Key": "RunId", "Value": reservation_id},
         {"Key": "CommandSha256", "Value": plan.command_sha256},
         {"Key": "Name", "Value": safe_label},
@@ -952,6 +1006,7 @@ class S3CostLedger:
                     "command": plan.command,
                     "command_sha256": plan.command_sha256,
                     "category": projection.category,
+                    "workload": plan.workload,
                     "instance_type": projection.instance_type,
                     "instance_count": projection.instance_count,
                     "hours": projection.hours,
@@ -1251,6 +1306,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--foundation", type=pathlib.Path, default=DEFAULT_FOUNDATION)
     parser.add_argument("--ledger", type=pathlib.Path, default=DEFAULT_LEDGER)
     parser.add_argument("--category", required=True)
+    parser.add_argument(
+        "--workload",
+        required=True,
+        choices=tuple(WORKLOAD_MATRIX),
+        help="underlying stage identity; corrective_run changes the spend cap, never this hardware contract",
+    )
     parser.add_argument("--instance-type", required=True)
     parser.add_argument("--instance-count", type=int, default=1)
     parser.add_argument("--hours", type=float, required=True, help="hard maximum runtime before stop/terminate")
@@ -1291,6 +1352,7 @@ def main(argv: list[str] | None = None) -> int:
             category=args.category,
             instance_type=args.instance_type,
             instance_count=args.instance_count,
+            workload=args.workload,
         )
         aws = AwsCli(EXPECTED_REGION)
         root_device_name = verify_live_environment(aws, inputs, args.instance_type)
@@ -1306,6 +1368,7 @@ def main(argv: list[str] | None = None) -> int:
             command=command,
             root_device_name=root_device_name,
             root_volume_gib=args.root_volume_gib,
+            workload=args.workload,
             retain_after_command=args.retain_after_command,
             scheduler_role_arn=args.scheduler_role_arn,
         )

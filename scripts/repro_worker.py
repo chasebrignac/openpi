@@ -171,6 +171,60 @@ RESUME_CONTRACT_KEYS = {
     "one_batch_overfit",
     "one_batch_overfit_min_relative_decline",
 }
+TRAINING_METRICS_FILENAME = "training-metrics.json"
+TRAINING_METRICS_KEYS = {"schema_version", "config_name", "exp_name", "global_step", "metrics"}
+STAGE_METRICS_MANIFEST_KEYS = {
+    "schema_version",
+    "created_at",
+    "stage",
+    "track",
+    "source",
+    "runtime",
+    "dataset",
+    "experiment",
+    "cost",
+    "command",
+    "metrics",
+    "artifacts",
+    "details",
+}
+LIBERO_METRICS_MANIFEST_KEYS = {
+    "schema_version",
+    "project",
+    "kind",
+    "run_id",
+    "started_at",
+    "finished_at",
+    "source",
+    "image",
+    "dataset",
+    "simulator",
+    "dependencies",
+    "policy",
+    "evaluation",
+    "command",
+    "child_commands",
+    "instance",
+    "cost",
+    "artifacts",
+}
+LATENCY_REPORT_KEYS = {
+    "schema_version",
+    "stage",
+    "track",
+    "official_protocol",
+    "batch_size",
+    "warmups",
+    "iterations",
+    "latency",
+    "runner",
+    "numerical_smoke",
+    "gpu_inventory",
+    "dataset",
+    "benchmark_inputs",
+    "source_artifacts",
+    "runtime",
+}
 DATASET_CONTRACT_KEYS = {
     "factory",
     "factory_config_sha256",
@@ -563,7 +617,7 @@ def validate_worker_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
             raise WorkerError(f"{context} must be an object")
         _only_keys(
             artifact,
-            {"name", "kind", "revision", "manifest", "payload_s3_uri", "destination"},
+            {"name", "kind", "revision", "manifest", "payload_s3_uri", "payload_objects", "destination"},
             context,
         )
         name = _required_string(artifact, "name", context)
@@ -600,6 +654,29 @@ def validate_worker_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
         payload = parse_s3_uri(_required_string(artifact, "payload_s3_uri", context), prefix=True)
         if payload.bucket != bucket:
             raise WorkerError(f"{context} payload must be in the pinned artifact bucket")
+        payload_objects = artifact.get("payload_objects")
+        if payload_objects is not None:
+            if not isinstance(payload_objects, list) or not payload_objects:
+                raise WorkerError(f"{context}.payload_objects must be a non-empty list when present")
+            normalized_payload_objects: list[dict[str, str]] = []
+            payload_paths: set[str] = set()
+            for object_index, payload_object in enumerate(payload_objects):
+                object_context = f"{context}.payload_objects[{object_index}]"
+                if not isinstance(payload_object, dict):
+                    raise WorkerError(f"{object_context} must be an object")
+                _only_keys(payload_object, {"path", "version_id", "sha256"}, object_context)
+                object_path = _safe_relative_path(
+                    _required_string(payload_object, "path", object_context), f"{object_context}.path"
+                ).as_posix()
+                if object_path in payload_paths:
+                    raise WorkerError(f"{context}.payload_objects contains a duplicate path: {object_path}")
+                payload_paths.add(object_path)
+                version_id = _required_string(payload_object, "version_id", object_context)
+                digest = _required_string(payload_object, "sha256", object_context)
+                if SHA256_RE.fullmatch(digest) is None:
+                    raise WorkerError(f"{object_context}.sha256 must be a lowercase SHA-256")
+                normalized_payload_objects.append({"path": object_path, "version_id": version_id, "sha256": digest})
+            artifact["payload_objects"] = sorted(normalized_payload_objects, key=lambda item: item["path"])
 
     image_runtime = image.get("lerobot_runtime")
     for artifact in artifacts:
@@ -1460,6 +1537,63 @@ def versioned_worker_output_pins(
     return sorted(pins, key=lambda item: item["path"])
 
 
+def exact_artifact_payload_pins(
+    manifest: Mapping[str, Any], artifact: Mapping[str, Any]
+) -> list[dict[str, str]] | None:
+    """Resolve an artifact's explicit object versions, with legacy worker-output fallback."""
+
+    explicit = artifact.get("payload_objects")
+    if explicit is None:
+        source = manifest.get("source", {})
+        if isinstance(source, Mapping) and source.get("provider") == "openpi-jax-to-pytorch":
+            raise WorkerError(
+                f"{artifact['name']} converted teacher requires explicit versioned payload_objects from its uploader"
+            )
+        return versioned_worker_output_pins(manifest, artifact)
+    if not isinstance(explicit, list) or not explicit:
+        raise WorkerError(f"{artifact['name']} explicit payload object pins are missing")
+
+    manifest_files = manifest.get("files")
+    if not isinstance(manifest_files, list):
+        raise WorkerError(f"{artifact['name']} manifest has no file inventory for its explicit payload pins")
+    file_hashes = {str(item.get("path")): item.get("sha256") for item in manifest_files if isinstance(item, Mapping)}
+    payload = parse_s3_uri(str(artifact["payload_s3_uri"]), prefix=True)
+    pins: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(explicit):
+        if not isinstance(item, Mapping):
+            raise WorkerError(f"{artifact['name']} explicit payload pin {index} is invalid")
+        path = _safe_relative_path(str(item.get("path", "")), f"{artifact['name']} explicit payload path")
+        relative = path.as_posix()
+        version_id = item.get("version_id")
+        digest = item.get("sha256")
+        if (
+            relative in seen
+            or not isinstance(version_id, str)
+            or not version_id
+            or not isinstance(digest, str)
+            or SHA256_RE.fullmatch(digest) is None
+            or file_hashes.get(relative) != digest
+        ):
+            raise WorkerError(f"{artifact['name']} explicit payload pins differ from its versioned manifest")
+        seen.add(relative)
+        pins.append(
+            {
+                "path": relative,
+                "s3_uri": f"s3://{payload.bucket}/{payload.key}/{relative}",
+                "version_id": version_id,
+                "sha256": digest,
+            }
+        )
+    if seen != set(file_hashes):
+        raise WorkerError(f"{artifact['name']} explicit payload pins do not cover every manifest file")
+
+    worker_pins = versioned_worker_output_pins(manifest, artifact)
+    if worker_pins is not None and sorted(pins, key=lambda item: item["path"]) != worker_pins:
+        raise WorkerError(f"{artifact['name']} explicit payload pins conflict with its worker-output manifest")
+    return sorted(pins, key=lambda item: item["path"])
+
+
 def stage_artifact(
     artifact: Mapping[str, Any], spec: Mapping[str, Any], root: pathlib.Path, runner: CommandRunner
 ) -> dict[str, Any]:
@@ -1470,7 +1604,7 @@ def stage_artifact(
     manifest = _read_json(manifest_path)
     files = validate_artifact_manifest(manifest, artifact)
     validate_artifact_track_contract(manifest, artifact, spec)
-    versioned_pins = versioned_worker_output_pins(manifest, artifact)
+    versioned_pins = exact_artifact_payload_pins(manifest, artifact)
     if versioned_pins is None:
         runner(
             [
@@ -2335,6 +2469,452 @@ class OutputManager:
         return completed
 
 
+def _require_finite_json_numbers(value: Any, *, context: str) -> None:
+    """Reject JSON-compatible evidence containing NaN or infinity."""
+
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return
+    if isinstance(value, int):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise WorkerError(f"{context} contains a non-finite numeric value")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _require_finite_json_numbers(item, context=context)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise WorkerError(f"{context} contains a non-string object key")
+            _require_finite_json_numbers(item, context=context)
+        return
+    raise WorkerError(f"{context} contains a non-JSON value")
+
+
+def _metric_command_argv(spec: Mapping[str, Any]) -> list[str]:
+    command = list(spec["container"]["command"])
+    if len(command) < 2 or command[0] not in {"python", "python3", "/opt/modelopt/bin/python"}:
+        raise WorkerError("metrics manifest requires a direct Python worker command")
+    return command[1:]
+
+
+def _optional_command_option(command: Sequence[str], option: str) -> str | None:
+    positions = [index for index, value in enumerate(command) if value == option]
+    if not positions:
+        return None
+    if len(positions) != 1 or positions[0] + 1 >= len(command):
+        raise WorkerError(f"metrics-producing command has an invalid {option} option")
+    return command[positions[0] + 1]
+
+
+def _is_declared_latency_report(spec: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    """Recognize only the benchmark report selected by its direct worker argv."""
+
+    command = list(spec["container"]["command"])
+    if (
+        expected["kind"] != "artifact"
+        or len(command) < 2
+        or command[0] not in {"python", "python3", "/opt/modelopt/bin/python"}
+        or command[1] != "scripts/benchmark_pi05_latency.py"
+    ):
+        return False
+    output = _optional_command_option(command, "--output")
+    prefix = "/output/"
+    return isinstance(output, str) and output.startswith(prefix) and output.removeprefix(prefix) == expected["path"]
+
+
+def _metric_candidates(
+    spec: Mapping[str, Any], expected: Mapping[str, Any], target: pathlib.Path
+) -> list[pathlib.Path]:
+    """Select only deterministic, schema-bearing metrics sources."""
+
+    kind = str(expected["kind"])
+    if kind == "checkpoint":
+        candidate = target / TRAINING_METRICS_FILENAME
+        return [candidate] if candidate.is_file() else []
+    if target.is_file():
+        return (
+            [target]
+            if kind == "manifest" or "manifest" in target.name or _is_declared_latency_report(spec, expected)
+            else []
+        )
+    if not target.is_dir() or kind not in {"artifact", "manifest"}:
+        return []
+    return sorted(
+        path for path in target.rglob("*.json") if path.is_file() and not path.is_symlink() and "manifest" in path.name
+    )
+
+
+def _metric_runtime_identity(
+    launch_metadata: Mapping[str, Any] | None, instance_identity: Mapping[str, Any] | None
+) -> tuple[str, str, str]:
+    if launch_metadata is None or instance_identity is None:
+        raise WorkerError("stage metrics require launch and live instance identity")
+    reservation_id = launch_metadata.get("reservation_id")
+    instance_id = instance_identity.get("instanceId")
+    instance_type = instance_identity.get("instanceType")
+    if (
+        not isinstance(reservation_id, str)
+        or UUID_RE.fullmatch(reservation_id) is None
+        or not isinstance(instance_id, str)
+        or INSTANCE_ID_RE.fullmatch(instance_id) is None
+        or not isinstance(instance_type, str)
+        or INSTANCE_TYPE_RE.fullmatch(instance_type) is None
+        or launch_metadata.get("instance_type") != instance_type
+    ):
+        raise WorkerError("stage metrics launch or instance identity is invalid")
+    return reservation_id, instance_id, instance_type
+
+
+def _require_exact_keys(value: Any, keys: set[str], *, context: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != keys:
+        actual = set(value) if isinstance(value, Mapping) else set()
+        raise WorkerError(f"{context} has the wrong schema keys: {sorted(actual ^ keys)}")
+    return value
+
+
+def _command_dataset_identity(spec: Mapping[str, Any], command: Sequence[str]) -> tuple[str | None, str]:
+    dataset_name = _optional_command_option(command, "--dataset")
+    dataset_revision = _optional_command_option(command, "--dataset-revision")
+    if dataset_revision is None:
+        revisions = {str(artifact["revision"]) for artifact in spec["artifacts"] if artifact.get("kind") == "dataset"}
+        if len(revisions) != 1:
+            raise WorkerError("metrics manifest cannot resolve one dataset revision from the worker contract")
+        dataset_revision = revisions.pop()
+    return dataset_name, dataset_revision
+
+
+def _validate_stage_metrics_manifest(
+    document: Mapping[str, Any],
+    *,
+    spec: Mapping[str, Any],
+    candidate: pathlib.Path,
+    launch_metadata: Mapping[str, Any] | None,
+    instance_identity: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if set(document) != STAGE_METRICS_MANIFEST_KEYS or document.get("schema_version") != 1:
+        raise WorkerError(f"stage metrics manifest has the wrong schema: {candidate}")
+    source = _require_exact_keys(document.get("source"), {"sha", "dirty"}, context="stage metrics source")
+    runtime = _require_exact_keys(
+        document.get("runtime"), {"image_digest", "instance_type", "instance_id"}, context="stage metrics runtime"
+    )
+    dataset = _require_exact_keys(document.get("dataset"), {"name", "revision"}, context="stage metrics dataset")
+    experiment = _require_exact_keys(document.get("experiment"), {"seed", "steps"}, context="stage metrics experiment")
+    cost = _require_exact_keys(document.get("cost"), {"reservation_id"}, context="stage metrics cost")
+    manifest_command = _require_exact_keys(document.get("command"), {"argv", "shell"}, context="stage metrics command")
+    reservation_id, instance_id, instance_type = _metric_runtime_identity(launch_metadata, instance_identity)
+    expected_argv = _metric_command_argv(spec)
+    dataset_name, dataset_revision = _command_dataset_identity(spec, expected_argv)
+    if (
+        source != {"sha": spec["source"]["commit"], "dirty": False}
+        or runtime
+        != {"image_digest": spec["image"]["digest"], "instance_type": instance_type, "instance_id": instance_id}
+        or dataset.get("revision") != dataset_revision
+        or (dataset_name is not None and dataset.get("name") != dataset_name)
+        or cost.get("reservation_id") != reservation_id
+        or manifest_command.get("argv") != expected_argv
+        or manifest_command.get("shell") != shlex.join(expected_argv)
+    ):
+        raise WorkerError(f"stage metrics manifest identity differs from its worker run: {candidate}")
+    for field in ("stage", "track"):
+        command_value = _optional_command_option(expected_argv, f"--{field}")
+        if command_value is not None and document.get(field) != command_value:
+            raise WorkerError(f"stage metrics manifest {field} differs from its worker command")
+    command_seed = _optional_command_option(expected_argv, "--seed")
+    if experiment.get("seed") is not None and (
+        experiment.get("seed") != spec["seed"] or (command_seed is not None and str(experiment["seed"]) != command_seed)
+    ):
+        raise WorkerError("stage metrics manifest seed differs from its worker command")
+    command_steps = _optional_command_option(expected_argv, "--steps")
+    if command_steps is None:
+        if experiment.get("steps") is not None:
+            raise WorkerError("stage metrics manifest reports steps not bound by its worker command")
+    else:
+        try:
+            expected_steps = int(command_steps)
+        except ValueError as exc:
+            raise WorkerError("metrics-producing command has non-integer --steps") from exc
+        if experiment.get("steps") != expected_steps:
+            raise WorkerError("stage metrics manifest steps differ from its worker command")
+    metrics = document.get("metrics")
+    if not isinstance(metrics, dict):
+        raise WorkerError(f"metrics source must contain an object: {candidate}")
+    _require_finite_json_numbers(metrics, context=f"metrics source {candidate}")
+    return json.loads(json.dumps(metrics, allow_nan=False, sort_keys=True))
+
+
+def _validate_libero_metrics_manifest(
+    document: Mapping[str, Any],
+    *,
+    spec: Mapping[str, Any],
+    candidate: pathlib.Path,
+    launch_metadata: Mapping[str, Any] | None,
+    instance_identity: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if set(document) != LIBERO_METRICS_MANIFEST_KEYS or document.get("schema_version") != 1:
+        raise WorkerError(f"LIBERO metrics manifest has the wrong schema: {candidate}")
+    _reservation_id, instance_id, instance_type = _metric_runtime_identity(launch_metadata, instance_identity)
+    command = _metric_command_argv(spec)
+    evaluation = _require_exact_keys(
+        document.get("evaluation"),
+        {"stage", "seed", "suites", "trials_per_task", "metrics"},
+        context="LIBERO evaluation",
+    )
+    source = _require_exact_keys(document.get("source"), {"commit"}, context="LIBERO metrics source")
+    image = _require_exact_keys(document.get("image"), {"digest"}, context="LIBERO metrics image")
+    dataset = _require_exact_keys(document.get("dataset"), {"name", "revision"}, context="LIBERO metrics dataset")
+    runtime = _require_exact_keys(
+        document.get("instance"), {"type", "id", "identity_recorded_by"}, context="LIBERO metrics instance"
+    )
+    _dataset_name, dataset_revision = _command_dataset_identity(spec, command)
+    if (
+        document.get("project") != EXPECTED_PROJECT
+        or document.get("kind") != "libero-evaluation"
+        or document.get("run_id") != spec["run_id"]
+        or source.get("commit") != spec["source"]["commit"]
+        or image.get("digest") != spec["image"]["digest"]
+        or dataset.get("revision") != dataset_revision
+        or runtime.get("type") != instance_type
+        or runtime.get("id") != instance_id
+        or document.get("command") != command
+        or evaluation.get("seed") != spec["seed"]
+        or evaluation.get("stage") != _optional_command_option(command, "--stage")
+    ):
+        raise WorkerError(f"LIBERO metrics manifest identity differs from its worker run: {candidate}")
+    metrics = evaluation.get("metrics")
+    if not isinstance(metrics, dict):
+        raise WorkerError(f"metrics source must contain an object: {candidate}")
+    _require_finite_json_numbers(metrics, context=f"metrics source {candidate}")
+    return json.loads(json.dumps(metrics, allow_nan=False, sort_keys=True))
+
+
+def _validate_latency_report(
+    document: Mapping[str, Any],
+    *,
+    spec: Mapping[str, Any],
+    candidate: pathlib.Path,
+    expected: Mapping[str, Any],
+    launch_metadata: Mapping[str, Any] | None,
+    instance_identity: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not _is_declared_latency_report(spec, expected):
+        raise WorkerError(f"latency report is not the command-declared expected output: {candidate}")
+    if set(document) != LATENCY_REPORT_KEYS or document.get("schema_version") != 1:
+        raise WorkerError(f"latency metrics report has the wrong schema: {candidate}")
+    _reservation_id, instance_id, instance_type = _metric_runtime_identity(launch_metadata, instance_identity)
+    command = _metric_command_argv(spec)
+    dataset = _require_exact_keys(document.get("dataset"), {"name", "revision"}, context="latency dataset")
+    runtime = _require_exact_keys(
+        document.get("runtime"),
+        {"instance_type", "instance_id", "image_digest", "instance_identity_source"},
+        context="latency runtime",
+    )
+    dataset_name, dataset_revision = _command_dataset_identity(spec, command)
+    try:
+        expected_warmups = int(_optional_command_option(command, "--warmups") or 500)
+        expected_iterations = int(_optional_command_option(command, "--iterations") or 10_000)
+    except ValueError as exc:
+        raise WorkerError("latency command has non-integer timing counts") from exc
+    stage = _optional_command_option(command, "--stage")
+    expected_denoise_steps = 10 if stage in {"base", "shallow"} else 1
+    runner = document.get("runner")
+    expected_backend = "tensorrt" if _optional_command_option(command, "--backend") == "tensorrt" else "torch-eager"
+    if (
+        document.get("stage") != stage
+        or document.get("track") != _optional_command_option(command, "--track")
+        or dataset.get("revision") != dataset_revision
+        or (dataset_name is not None and dataset.get("name") != dataset_name)
+        or runtime.get("image_digest") != spec["image"]["digest"]
+        or runtime.get("instance_type") != instance_type
+        or runtime.get("instance_id") != instance_id
+        or document.get("batch_size") != 1
+        or document.get("warmups") != expected_warmups
+        or document.get("iterations") != expected_iterations
+        or not isinstance(runner, Mapping)
+        or runner.get("backend") != expected_backend
+        or runner.get("num_denoise_steps") != expected_denoise_steps
+        or document.get("official_protocol") is not (expected_warmups == 500 and expected_iterations == 10_000)
+    ):
+        raise WorkerError(f"latency metrics report identity differs from its worker run: {candidate}")
+    latency = document.get("latency")
+    numerical_smoke = document.get("numerical_smoke")
+    if (
+        not isinstance(latency, dict)
+        or not latency
+        or not (numerical_smoke is None or isinstance(numerical_smoke, dict))
+    ):
+        raise WorkerError(f"latency metrics report has invalid metrics: {candidate}")
+    metrics = {"latency": latency, "numerical_smoke": numerical_smoke}
+    _require_finite_json_numbers(metrics, context=f"metrics source {candidate}")
+    return json.loads(json.dumps(metrics, allow_nan=False, sort_keys=True))
+
+
+def _extract_metrics_document(
+    document: Mapping[str, Any],
+    *,
+    spec: Mapping[str, Any],
+    candidate: pathlib.Path,
+    expected: Mapping[str, Any],
+    launch_metadata: Mapping[str, Any] | None,
+    instance_identity: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    expected_path = pathlib.PurePosixPath(str(expected["path"]))
+    strict_metric_source = expected["kind"] == "manifest" or expected_path.suffix == ".json"
+    expected_command = _metric_command_argv(spec)
+    if candidate.name == TRAINING_METRICS_FILENAME:
+        if set(document) != TRAINING_METRICS_KEYS or document.get("schema_version") != 1:
+            raise WorkerError("training metrics sidecar has the wrong schema")
+        target = pathlib.PurePosixPath(str(expected["path"]))
+        try:
+            expected_step = int(target.parts[-1])
+            expected_config, expected_experiment = target.parts[-3:-1]
+        except (ValueError, IndexError) as exc:
+            raise WorkerError("training metrics checkpoint path has no config/experiment/step identity") from exc
+        if (
+            document.get("config_name") != expected_config
+            or document.get("exp_name") != expected_experiment
+            or document.get("global_step") != expected_step
+        ):
+            raise WorkerError("training metrics sidecar differs from its checkpoint config/experiment/step")
+        metrics = document.get("metrics")
+    elif (
+        _is_declared_latency_report(spec, expected)
+        and candidate.name == pathlib.PurePosixPath(str(expected["path"])).name
+    ):
+        return _validate_latency_report(
+            document,
+            spec=spec,
+            candidate=candidate,
+            expected=expected,
+            launch_metadata=launch_metadata,
+            instance_identity=instance_identity,
+        )
+    elif document.get("kind") == "libero-evaluation":
+        if document.get("command") != expected_command and not strict_metric_source:
+            return None
+        return _validate_libero_metrics_manifest(
+            document,
+            spec=spec,
+            candidate=candidate,
+            launch_metadata=launch_metadata,
+            instance_identity=instance_identity,
+        )
+    elif "metrics" in document:
+        manifest_command = document.get("command")
+        manifest_argv = manifest_command.get("argv") if isinstance(manifest_command, Mapping) else None
+        if manifest_argv != expected_command and not strict_metric_source:
+            return None
+        return _validate_stage_metrics_manifest(
+            document,
+            spec=spec,
+            candidate=candidate,
+            launch_metadata=launch_metadata,
+            instance_identity=instance_identity,
+        )
+    elif isinstance(document.get("evaluation"), Mapping) and "metrics" in document["evaluation"]:
+        if strict_metric_source:
+            raise WorkerError(f"metrics manifest is not a recognized schema: {candidate}")
+        return None
+    else:
+        return None
+    if metrics is None:
+        return None
+    if not isinstance(metrics, dict):
+        raise WorkerError(f"metrics source must contain an object: {candidate}")
+    _require_finite_json_numbers(metrics, context=f"metrics source {candidate}")
+    return json.loads(json.dumps(metrics, allow_nan=False, sort_keys=True))
+
+
+def collect_run_metrics(
+    spec: Mapping[str, Any],
+    root: pathlib.Path,
+    committed_markers: Sequence[pathlib.Path],
+    *,
+    launch_metadata: Mapping[str, Any] | None = None,
+    instance_identity: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Copy metrics only from files covered by immutable expected-output markers.
+
+    Older checkpoints have no training sidecar and therefore yield an empty
+    metrics object. Once a sidecar or stage manifest is present, its live hash
+    must still equal the marker created after the container exited.
+    """
+
+    marker_by_name = {path.name: path for path in committed_markers}
+    collected: dict[str, Any] = {}
+    provenance: list[dict[str, Any]] = []
+    resolved_root = root.resolve()
+    for expected in sorted(spec.get("expected_outputs", []), key=lambda item: str(item["name"])):
+        marker_name = f"expected-{expected['name']}.ready.json"
+        marker_path = marker_by_name.get(marker_name)
+        if marker_path is None:
+            raise WorkerError(f"metrics collection is missing committed marker for {expected['name']}")
+        marker = _read_json(marker_path)
+        marker_records = marker.get("artifacts")
+        if marker.get("schema_version") != 1 or not isinstance(marker_records, list):
+            raise WorkerError(f"expected-output marker is malformed: {marker_path}")
+        covered = {
+            str(record.get("path")): record
+            for record in marker_records
+            if isinstance(record, dict) and isinstance(record.get("path"), str)
+        }
+        relative_target = _safe_relative_path(str(expected["path"]), "metrics expected output")
+        target = root.joinpath(*relative_target.parts)
+        training_relative = (relative_target / TRAINING_METRICS_FILENAME).as_posix()
+        if (
+            expected["kind"] == "checkpoint"
+            and training_relative in covered
+            and not (target / TRAINING_METRICS_FILENAME).is_file()
+        ):
+            raise WorkerError("hash-covered training metrics sidecar disappeared after output commit")
+        for candidate in _metric_candidates(spec, expected, target):
+            try:
+                relative = candidate.resolve().relative_to(resolved_root).as_posix()
+            except ValueError as exc:
+                raise WorkerError(f"metrics source escapes the output root: {candidate}") from exc
+            record = covered.get(relative)
+            if record is None:
+                raise WorkerError(f"metrics source is not covered by its expected-output marker: {relative}")
+            digest = record.get("sha256")
+            if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None or sha256_file(candidate) != digest:
+                raise WorkerError(f"metrics source changed after expected-output commit: {relative}")
+            document = _read_json(candidate)
+            metrics = _extract_metrics_document(
+                document,
+                spec=spec,
+                candidate=candidate,
+                expected=expected,
+                launch_metadata=launch_metadata,
+                instance_identity=instance_identity,
+            )
+            if metrics is None:
+                continue
+            if relative in collected:
+                raise WorkerError(f"duplicate metrics source path: {relative}")
+            collected[relative] = metrics
+            provenance.append(
+                {
+                    "expected_output": expected["name"],
+                    "path": relative,
+                    "sha256": digest,
+                }
+            )
+    return collected, provenance
+
+
+def worker_cost_record(launch_metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose the authoritative reservation projection without guessing billing."""
+
+    return {
+        "reservation_id": launch_metadata["reservation_id"],
+        "projected_usd": launch_metadata["projected_compute_usd"],
+        "actual_usd": None,
+        "actual_recorded_by": "versioned cost ledger after AWS billing reconciliation",
+    }
+
+
 class SegmentLog:
     def __init__(self, manager: OutputManager):
         self.manager = manager
@@ -2620,6 +3200,8 @@ def execute_worker(
     receipts: list[dict[str, Any]] = []
     published_inputs: list[dict[str, Any]] = []
     expected_output_markers: list[pathlib.Path] = []
+    run_metrics: dict[str, Any] = {}
+    metrics_provenance: list[dict[str, Any]] = []
     try:
         exit_code, termination = run_container_until_deadline(docker_command, manager, soft_deadline, spec, runner)
     except Exception as exc:
@@ -2627,6 +3209,13 @@ def execute_worker(
     if exit_code == 0 and termination is None and failure is None:
         try:
             expected_output_markers = manager.commit_expected_outputs()
+            run_metrics, metrics_provenance = collect_run_metrics(
+                spec,
+                manager.root,
+                expected_output_markers,
+                launch_metadata=launch_metadata,
+                instance_identity=identity,
+            )
         except Exception as exc:
             failure = f"expected output validation failed: {type(exc).__name__}: {exc}"
     try:
@@ -2665,6 +3254,9 @@ def execute_worker(
             "command_sha256": command_sha,
             "seed": spec["seed"],
         },
+        "cost": worker_cost_record(launch_metadata),
+        "metrics": run_metrics,
+        "metrics_provenance": metrics_provenance,
         "expected_outputs": list(spec.get("expected_outputs", [])),
         "committed_expected_output_markers": [path.name for path in expected_output_markers],
         "published_inputs": published_inputs,

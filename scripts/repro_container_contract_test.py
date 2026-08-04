@@ -204,6 +204,50 @@ def test_source_bundle_seed_and_single_corpus_contracts_are_documented() -> None
     assert '"MUJOCO_EGL_DEVICE_ID": "0"' in worker_runbook
 
 
+def test_launch_and_latency_runbooks_match_runnable_hardware_and_artifact_order() -> None:
+    reproduction = json.loads((ROOT / "repro/reproduction.json").read_text())
+    main_runbook = (ROOT / "RUNBOOK.md").read_text()
+    aws_runbook = (ROOT / "RUNBOOK_AWS.md").read_text()
+    export_runbook = (ROOT / "repro/EXPORT_RUNBOOK.md").read_text()
+
+    assert reproduction["aws"]["approved_instances"]["g7e.4xlarge"]["purpose"] == "export/compile/latency"
+    assert "fallback training" not in json.dumps(reproduction)
+    assert "Shallow training is intentionally launch-guarded to `g7e.12xlarge`" in aws_runbook
+    assert "Do not substitute a\n`g7e.4xlarge`" in aws_runbook
+    assert "--category corrective_run" in aws_runbook
+    assert "--workload shallow_training" in aws_runbook
+    assert "the launcher applies both hardware matrices" in aws_runbook
+
+    assert "baseline quality\n   smoke" in main_runbook
+    assert "baseline smoke and eager" not in main_runbook
+    assert "Official eager-base latency is deliberately deferred until step 6" in main_runbook
+    assert export_runbook.index("## 1. Export BF16 graphs") < export_runbook.index("## 6. Stagewise G7e latency")
+    assert "do not\nattempt an official eager-base benchmark before export" in export_runbook
+    expected_stage_commands = {
+        "--backend torch --stage base",
+        "--backend torch --stage shallow",
+        "--backend torch --stage snapflow",
+        "--backend tensorrt --stage tensorrt_bf16",
+        "--backend tensorrt --stage tensorrt_fp8",
+    }
+    for command in expected_stage_commands:
+        assert export_runbook.count(command) == 2
+    for config_name in (
+        "pi05_libero",
+        "pi05_libero_l09_distill",
+        "pi05_libero_l09_snapflow",
+        "pi05_droid_jointpos",
+        "pi05_droid_l09_distill",
+        "pi05_droid_l09_snapflow",
+    ):
+        assert f"--config {config_name}" in export_runbook
+    assert export_runbook.count("python scripts/summarize_pi05_latency.py") == 2
+    assert "--output /output/artifacts/latency/libero/summary.json" in export_runbook
+    assert "--output /output/artifacts/latency/droid/summary.json" in export_runbook
+    for stage in ("base", "shallow", "snapflow", "tensorrt_bf16", "tensorrt_fp8"):
+        assert f"latency.{stage}.json" in export_runbook
+
+
 def test_compiled_droid_examples_use_the_digest_bound_retained_session_wrapper() -> None:
     runbook = (ROOT / "repro/EXPORT_RUNBOOK.md").read_text()
 

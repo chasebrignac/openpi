@@ -294,11 +294,16 @@ Accepted state on 2026-08-03:
 
 Use `scripts/repro_aws_launch.py` for every GPU launch. Omitting `--execute` is the default read-only mode: it verifies the STS account, pinned region, AMI, subnet, zero-ingress security group, SSM profile, and instance-type offering, then prints the exact cost and deadline plan. It does not reserve money or call `RunInstances`.
 
-AMI selection is category-scoped and has no command-line override. Category
+Every launch declares both a spend `--category` and an underlying
+`--workload`. They are identical for normal runs. A bounded corrective retry
+uses `--category corrective_run` but must retain the actual workload, such as
+`--workload shallow_training`; the launcher applies both hardware matrices, so
+the corrective budget cannot turn a two-GPU Shallow job into a one-GPU job.
+AMI selection is workload-scoped and has no command-line override. Workload
 `evaluation` deterministically selects Amazon AMI
 `ami-06517bc7fad3c6a48`, exact name
 `Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) 20260403`; every
-other category selects the pinned base AMI. Preflight queries the selected ID
+other workload selects the pinned base AMI. Preflight queries the selected ID
 with owner `amazon` and requires owner ID `898082745236` (plus owner alias when
 returned), exact name, `available` state, `x86_64`, `Linux/UNIX`, HVM, and root
 device `/dev/sda1`. The selected ID remains in the printed plan and launch
@@ -307,6 +312,7 @@ request.
 ```bash
 python3 scripts/repro_aws_launch.py \
   --category workbench_setup \
+  --workload workbench_setup \
   --instance-type g6e.4xlarge \
   --hours 8 \
   --label pi05-workbench
@@ -319,11 +325,22 @@ Worker launches require a command, preferably kept in a reviewed file so shell q
 # bootstrap/spec VersionIds exactly as shown in repro/WORKER_RUNBOOK.md.
 python3 scripts/repro_aws_launch.py \
   --category shallow_training \
+  --workload shallow_training \
   --instance-type g7e.12xlarge \
   --hours 12 \
   --label shallow-libero-pilot \
   --command-file /tmp/libero-shallow-2k-01.command.sh
 ```
+
+Shallow training is intentionally launch-guarded to `g7e.12xlarge`: its two
+local GPUs match the documented `torchrun --nproc-per-node=2` contract.  If the
+first AZ reports insufficient capacity, rerender the same launch with
+`--subnet-id subnet-0b49463b4ceee4d0f`, the other foundation-pinned subnet in
+which preflight found G7e. Do not substitute a
+`g7e.4xlarge`; it has one GPU, and neither the worker nor launcher implements a
+two-node rendezvous.  If both pinned AZs are unavailable, record an AWS
+capacity outage and retry later rather than launching a command that cannot
+run.
 
 The manual TensorRT replay is intentionally different from an ephemeral
 training worker. It needs one bounded G7e session to survive a failed or
@@ -334,6 +351,7 @@ with the explicit retention flag:
 ```bash
 python3 scripts/repro_aws_launch.py \
   --category export_compile_quantize \
+  --workload export_compile_quantize \
   --instance-type g7e.4xlarge \
   --hours 8 \
   --label pi05-trt-manual-01 \
@@ -357,6 +375,7 @@ evaluator image through the reviewed worker command. Run this without
 ```bash
 python3 scripts/repro_aws_launch.py \
   --category evaluation \
+  --workload evaluation \
   --instance-type g6e.4xlarge \
   --hours 1 \
   --label robolab-r580-camera-smoke \
@@ -457,7 +476,7 @@ camera-enabled evaluator smoke, not a policy-quality evaluation.
 22. Numeric training checkpoints were durably uploaded but originally had no manifest in the schema enforced for later worker inputs. Declared checkpoint/artifact outputs can now set `publish_destination`; only after their S3 receipts exist does the worker upload a worker-input manifest and record a complete copy-ready descriptor in `run-manifest.json.published_inputs`. This is the required Shallow-to-SnapFlow and model-to-evaluation handoff.
 23. Container review found that the editable project install resolved normal dependencies independently of `uv.lock`, and that generated `data`, `checkpoints`, `runs`, calibration, and engine directories could enter a later Docker context. The training Dockerfile now exports from the frozen lock before installing the local packages without dependency resolution, and `.dockerignore` excludes those generated trees. Replays require a clean checkout before assigning the OCI source-revision label.
 24. Early manual downloads used `/opt/pi05`, while the reviewed container and worker interface consistently uses `/mnt/openpi`. After verifying `/mnt/openpi` did not exist and `/opt/pi05` was on the persistent 1 TiB root volume, the workbench added the single compatibility symlink `/mnt/openpi -> /opt/pi05`. Container bind sources and manual commands now use `/mnt/openpi`; ephemeral workers create that path directly and do not need the symlink.
-25. The base AMI `ami-01901bc01d5d9bb55` exposes NVIDIA driver `595.71.05`. An untouched Isaac Lab 2.2.0 base reproduced the NVIDIA-known Isaac Sim RTX startup crash with `enable_cameras=True`, while otherwise identical non-camera startup succeeded. This isolates the failure to the camera/RTX driver path rather than the RoboLab or policy changes. Evaluation launches are therefore category-pinned to Amazon AMI `ami-06517bc7fad3c6a48`, whose AWS release notes specify Ubuntu 22.04, NVIDIA driver `580.126.09`, and G6e/G7e support.
+25. The base AMI `ami-01901bc01d5d9bb55` exposes NVIDIA driver `595.71.05`. An untouched Isaac Lab 2.2.0 base reproduced the NVIDIA-known Isaac Sim RTX startup crash with `enable_cameras=True`, while otherwise identical non-camera startup succeeded. This isolates the failure to the camera/RTX driver path rather than the RoboLab or policy changes. Evaluation launches are therefore workload-pinned to Amazon AMI `ami-06517bc7fad3c6a48`, whose AWS release notes specify Ubuntu 22.04, NVIDIA driver `580.126.09`, and G6e/G7e support.
 26. RoboLab's editable install upgraded `typing-extensions` to 4.16.0 and selected `typeguard` 4.6.0. Isaac Lab's bundled Torch 2.7.0 could no longer import `torch._dynamo`, while downgrading only `typing-extensions` made the typeguard pytest plugin fail. The same source checkout and base layers were retained; `typeguard==4.4.2` and `typing_extensions==4.12.2` were installed together without dependency resolution, and the Docker build now proves both import paths. The corrected immutable image digest is `sha256:2d17c15e62887c9fc8b4c41b7ee3d39c4c187348eb55b4273fd24e785a3325e7`.
 27. After publishing that image, a host-side `ecr:DescribeImages` verification failed because the scoped instance role supported push/pull but omitted this read-only inventory action. `ecr:DescribeImages` was added only for the project repository, the live inline policy was reapplied, IAM simulation returned `allowed`, and the same workbench verified the immutable digest. No instance or image rebuild was needed.
 28. The first paid R580 evaluator used reservation `96c5e984-1279-42c5-b795-ba7699683422` and instance `i-011eb2c219aea0e3e`. It observed driver `580.126.09`, pulled the exact evaluator digest, passed all 128 tests across the four camera/task smoke suites, uploaded its AES-256 encrypted versioned log with `smoke_exit_code=0`, and entered termination immediately. The external deadline remained independent protection but did not have to fire. The log VersionId and hash are in the evaluation-smoke section above.
@@ -479,5 +498,9 @@ camera-enabled evaluator smoke, not a policy-quality evaluation.
 44. The corrected policy-image build passed the frozen dependency, tokenizer, source-install, config-import, and version gates, then exposed an AWS DLC ABI mismatch at the former TorchCodec smoke. The pinned DLC's CPython 3.12.10 is a static build (`Py_ENABLE_SHARED=0`) with only `libpython3.12.a`; lock-pinned TorchCodec 0.4.0 attempts to load `libpython3.12.so.1.0` when using the available FFmpeg 4 libraries. Both exact LeRobot revisions support an explicit PyAV backend. Training now passes `video_backend="pyav"` rather than allowing package presence to select a broken default, the image retains its otherwise exact locked graph, and build plus digest smokes generate and decode a real local video through the LeRobot PyAV path. The OCI decoder label and worker identity gate bind that choice; later pilot throughput will measure whether it is an actual input bottleneck before any broader runtime change.
 45. A pre-compiler runbook audit found that the combined TensorRT policy section required post-push GPU/import smokes but specified them only in prose and resolved only the DROID digest in its executable block. Before compiler execution, the runbook was completed with digest resolution for both tracks, exact architecture/RepoDigest/provenance/toolchain/runtime label gates, and network-disabled digest smokes for Torch CUDA, no-fallback ONNX Runtime CUDA, TensorRT builder creation, tokenizer/config loading, and the policy/WebSocket protocol stack. The LIBERO combined image remains only an intermediate parent; final LIBERO export and evaluation still require the later evaluator digest.
 46. The first live v2 GPU smoke passed Torch CUDA, JAX CUDA, the generated PyAV decode, and runtime imports, then correctly failed the no-CPU-fallback ONNX Runtime gate before ECR publication. PyPI's ONNX Runtime GPU 1.28 wheel requires CUDA 13 (`libcublasLt.so.13`), while the training DLC is pinned to CUDA 12.8. The official ONNX Runtime CUDA matrix states that PyPI 1.27 and newer default to CUDA 13, while 1.26.x through 1.21.x use CUDA 12.8. The same built image was retained and a temporary container replaced only ORT with 1.26.0; the complete PyAV/Torch/JAX/no-fallback ORT CUDA smoke then passed on the L40S. The policy Dockerfile now pins 1.26.0 and binds it in OCI and worker identity; the TensorRT compiler's separate CUDA 13.3/ORT 1.24.2 environment is unchanged. Reference: https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements
+47. Source commit `9eaede81032b8cbeb2c2a8844c2386e4798fc352` produced both policy images without launching another instance. The DROID v3 build completed under SSM command `47a95ddc-641f-41b8-840a-c0123e3629b7` in 3m02s and passed the real PyAV decode plus exact LeRobot 0.4.3 dependency gate. Before publication, LIBERO v2 and DROID v3 each passed OCI-label checks and a network-disabled L40S smoke covering Torch CUDA 12.8, JAX CUDA, PyAV, the runtime-specific LeRobot import, and an ONNX CUDA Add with CPU fallback disabled. ECR returned `ImageNotFound` for both commit-qualified tags immediately before the one permitted push. The immutable LIBERO digest is `sha256:ed15a0c3bdb75180a8cc2a92f9b5f7231c7e868b299e8b244ed4c8d8b2899228` (13,130,271,069 compressed bytes); the DROID digest is `sha256:39b408afa5b489b11196754ef135caf38e5d0e73b0d63cee50e7e4f3f844668e` (13,228,434,802 bytes). SSM command `d40405f8-dd14-44d4-bf7c-0aaa4a7fd9b4` explicitly pulled both registry digests, verified their RepoDigests and complete provenance labels, and repeated both network-disabled GPU smokes successfully. These artifacts remain evidence for commit `9eaede8`; if a later source-contract fix changes the OCI revision, publish new commit-qualified tags rather than relabeling or overwriting them.
+48. A read-only state audit found that the local conservative cost ledger included the four-hour workbench extension while the versioned S3 ledger still contained only the first two reservations. The two remote entries were byte-for-byte identical to the first two local entries, so the complete three-entry local document was published with `If-Match` against ETag `7aeef0a6f60687ac3bee45c2ec3dbb5c`. The accepted AES256/SHA256 object is VersionId `yH285_YCNG4Ia78TW3q1tOFE.57p97lR`, SHA-256 `b8bb0171b1d473cd47c74379e0a7084d7e86c4ea7fa42a1e25263e0807065d8c`, and contains three reservations totaling `$34.54876`; a current-object round trip reproduced the hash and version history contained no delete marker. Both independent workbench deadline layers stop rather than terminate the instance. After all required state is durable in S3, explicitly terminate `i-038112fe75c610517`; otherwise its stopped 1 TiB gp3 volume at 500 MB/s continues to accrue roughly `$3.19/day`.
+49. The pre-conversion launch audit found that the documented `g7e.4xlarge` Shallow fallback could not run the two-process DDP command and that the generic corrective budget category could bypass a category-only hardware guard. The launcher now separates required workload identity from spend category, applies both hardware matrices, scopes AMI selection and lifecycle to the workload, and rejects Shallow on a one-GPU G7e even when corrective funds are used. The supported capacity fallback is the same `g7e.12xlarge` in the alternate pinned AZ. The audit also found that eager-base latency depended on fixed inputs emitted only by export; official base latency is now deferred to the retained G7e session, where exact commands run all five stages for both tracks and both summarizers on one instance.
+50. Before teacher conversion, adversarial output/publication review found overwriteable framework reports, a non-create-once converted-checkpoint sync, nondeterministic converted manifests, unversioned converted payload retrieval, a source-mutation window during multipart upload, indiscriminate composite-manifest metrics ingestion, and missing top-level worker metrics/cost. The corrected comparison exclusively creates both evidence files before promotion. The converted publisher now uses a deterministic manifest, claim-first/manifest-last create-once protocol, per-part and streamed whole-file SHA-256 checks, stable file-identity checks, conditional completion, exact partial recovery, version-specific round trips, durable receipts, and mandatory per-payload VersionIds in worker artifacts. Workers stage those versions individually, reject converted artifacts without pins, ingest only command-bound schema-v1 metrics, publish hash-covered training diagnostics, and record projected cost without inventing actual billing. Corrective retained sessions are authorized by the resolved export workload rather than the spend category. No checkpoint conversion or training ran while these contracts were changing. The final integrated checks passed 361 script tests, 18 data-loader tests, Ruff lint/format, Python compilation, JSON parsing, shell syntax, and `git diff --check`.
 
 Record any future console action or command here before incorporating it into CloudFormation.

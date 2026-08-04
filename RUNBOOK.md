@@ -12,8 +12,9 @@ is written only after two clean smoke replays need no undocumented correction.
   or broad hyperparameter sweep.
 - Local NVMe is scratch. Checkpoints, logs, manifests, graphs, engines, dataset
   revisions, and evaluation results must be copied to versioned encrypted S3.
-- Every paid launch goes through `scripts/repro_aws_launch.py --execute`, which
-  reserves with the cost guard before its idempotent On-Demand API call.
+- Every paid launch goes through `scripts/repro_aws_launch.py --execute` with
+  explicit spend-category and workload identities; it reserves with the cost
+  guard before its idempotent On-Demand API call.
 - Every run writes a manifest with `scripts/repro_manifest.py` and is not promoted
   until its artifact hashes exist in S3.
 - AWS results validate the method and relative G7e speedups. They do not validate
@@ -53,15 +54,25 @@ The exact foundation and launch commands are recorded in `RUNBOOK_AWS.md`.
 
 ## Promotion order
 
-1. Foundation, checkpoint conversion, golden vectors, baseline smoke and eager
-   benchmark.
+1. Foundation, checkpoint conversion, golden vectors, and baseline quality
+   smoke.
 2. Shallow-pi: 300-step overfit, 2k pilot, then 5k/10k/20k/30k empirical gates.
 3. Bounded RoboLab BC recovery only when the Stack3RubiksCube trigger fires;
    follow `repro/ROBOLAB_BC_RECOVERY_RUNBOOK.md`.
 4. SnapFlow: 5k pilot, then 10k/20k/30k only while gates require it.
-5. BF16 ONNX validation, BF16 TensorRT, selective-MLP FP8 calibration.
-6. Intermediate then paired final quality evaluation and fixed-shape latency.
+5. BF16 ONNX validation, BF16 TensorRT, selective-MLP FP8 calibration, and the
+   fixed batch-one benchmark inputs emitted by export.
+6. On the same retained `g7e.4xlarge`, run eager base, Shallow, SnapFlow,
+   TensorRT BF16, and TensorRT FP8 latency; then run intermediate and paired
+   final quality evaluation.
 7. Two clean abbreviated manual replays, then CloudFormation and Change Set.
+
+The foundation baseline smoke is a quality/startup gate, not official latency
+evidence.  Official eager-base latency is deliberately deferred until step 6:
+the accepted SnapFlow export has then emitted `encode-inputs.npz` and
+`decode-inputs.npz`, and all five stages can be timed on one retained instance.
+Do not keep an early G7e instance alive across training or compare an early
+baseline measurement with engines built on a replacement instance.
 
 ## Dataset and released-teacher staging
 
@@ -475,7 +486,12 @@ dataset revision, resolved config fingerprint, teacher link, tensor contract,
 source manifest, converted manifest, conversion config, or converted model hash
 does not match. It requires every sample—not only the mean—to have velocity
 cosine similarity at least `0.999` and writes both frameworks' velocities with
-their hash into the report.
+their hash into the report. Each comparison refuses to start the expensive
+full-depth forward passes if either its report path or adjacent velocity NPZ
+already exists (including a symlink), and both final writes use exclusive
+creation. If a run is interrupted after creating only one file, retain that
+partial evidence for diagnosis; do not delete it and blindly reuse the same
+canonical output name.
 
 ```bash
 export LIBERO_DATASET_REVISION="$(jq -er '.source.libero_revision' repro/reproduction.json)"
@@ -600,7 +616,19 @@ manifest VersionIds, and manifest hashes in the manual ledger. Later workers
 must retrieve these exact versions; an unversioned S3 key is not evidence.
 
 Review each manifest and the network-free upload plan, then execute. Original
-and converted teachers deliberately use separate immutable S3 prefixes.
+and converted teachers deliberately use separate immutable S3 prefixes. The
+converted publisher is create-once rather than an `aws s3 sync`: it
+conditionally creates a content/provenance claim, conditionally publishes each
+small object or completes each multipart object with `If-None-Match: *`, and
+performs a version-specific SHA-256 round trip for every object. It then writes
+a durable receipt and publishes the converted manifest last. A retry after an
+interruption resumes only when the existing claim and every partial object are
+byte-for-byte exact and have one version with no delete marker; unknown keys,
+changed bytes, or ambiguous version history stop the run. Therefore retry the
+same command after a transport interruption—never clear or overwrite the
+content-addressed prefix. Record the emitted claim, payload, receipt, and final
+manifest VersionIds from `s3.publication` along with the copy-ready
+`worker_artifact`.
 
 ```bash
 python scripts/repro_stage_converted_checkpoints.py upload \

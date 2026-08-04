@@ -466,8 +466,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def require_new_output_paths(output: pathlib.Path) -> pathlib.Path:
+    """Refuse to replace either half of the report/velocity evidence pair."""
+    velocity_path = output.with_suffix(".npz")
+    collisions = [path for path in (output, velocity_path) if path.exists() or path.is_symlink()]
+    if collisions:
+        rendered = ", ".join(str(path) for path in collisions)
+        raise FileExistsError(f"framework-equivalence output already exists: {rendered}")
+    return velocity_path
+
+
 def main() -> int:
     args = parse_args()
+    # Check before loading either full-depth model. This makes a retry preserve
+    # the original diagnostic evidence instead of spending GPU time and then
+    # silently replacing it.
+    velocity_path = require_new_output_paths(args.output)
     report, velocities = compare(
         config_name=args.config_name,
         jax_checkpoint=args.jax_checkpoint,
@@ -478,10 +492,14 @@ def main() -> int:
         device=args.device,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    velocity_path = args.output.with_suffix(".npz")
-    np.savez_compressed(velocity_path, **velocities)
+    # Exclusive creation also closes the race between the early guard and the
+    # final writes. If publication is interrupted after the velocity archive,
+    # that file remains as explicit partial evidence and blocks a blind retry.
+    with velocity_path.open("xb") as stream:
+        np.savez_compressed(stream, **velocities)
     report["velocities"] = {"path": str(velocity_path.resolve()), "sha256": sha256_file(velocity_path)}
-    args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    with args.output.open("x") as stream:
+        stream.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["gate_pass"] else 2
 

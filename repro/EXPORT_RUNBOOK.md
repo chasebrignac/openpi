@@ -759,19 +759,114 @@ the same `g7e.4xlarge` and final evaluator image digest.
 
 ## 6. Stagewise G7e latency
 
-Run `scripts/benchmark_pi05_latency.py` five times on the same
-`g7e.4xlarge`: eager base (`--backend torch --stage base`), eager nine-layer
-student (`shallow`), eager one-step model (`snapflow`), then TensorRT BF16 and
-FP8 (`--backend tensorrt`). Torch stages also require their `--config`,
-`--checkpoint`, and expected denoising count. For example:
+Run `scripts/benchmark_pi05_latency.py` five times **per track** on the same
+`g7e.4xlarge`: eager base, eager nine-layer Shallow, eager one-step SnapFlow,
+TensorRT BF16, and TensorRT FP8. This is the first official latency point in
+the promotion order. The eager runs deliberately consume the fixed
+`encode-inputs.npz` and `decode-inputs.npz` created in section 1; do not
+attempt an official eager-base benchmark before export or on a different
+instance.
+
+Run all three eager LIBERO stages from the self-contained FP8 tree after that
+tree has been produced:
 
 ```bash
+run_libero_phase python scripts/benchmark_pi05_latency.py \
+  --backend torch --stage base \
+  --artifact-dir /output/artifacts/tensorrt/libero/fp8 \
+  --config pi05_libero \
+  --checkpoint /mnt/openpi/checkpoints/pi05_libero_pytorch \
+  --num-denoise-steps 10 \
+  --track libero --dataset physical-intelligence/libero \
+  --dataset-revision "$LIBERO_REVISION" \
+  --image-digest "$IMAGE_DIGEST" --instance-id "$INSTANCE_ID" \
+  --cost-reservation "$COST_RESERVATION"
+
+run_libero_phase python scripts/benchmark_pi05_latency.py \
+  --backend torch --stage shallow \
+  --artifact-dir /output/artifacts/tensorrt/libero/fp8 \
+  --config pi05_libero_l09_distill \
+  --checkpoint /mnt/openpi/checkpoints/pi05_libero_l09_distill \
+  --num-denoise-steps 10 \
+  --track libero --dataset physical-intelligence/libero \
+  --dataset-revision "$LIBERO_REVISION" \
+  --image-digest "$IMAGE_DIGEST" --instance-id "$INSTANCE_ID" \
+  --cost-reservation "$COST_RESERVATION"
+
+run_libero_phase python scripts/benchmark_pi05_latency.py \
+  --backend torch --stage snapflow \
+  --artifact-dir /output/artifacts/tensorrt/libero/fp8 \
+  --config pi05_libero_l09_snapflow \
+  --checkpoint /mnt/openpi/checkpoints/pi05_libero_l09_snapflow \
+  --num-denoise-steps 1 \
+  --track libero --dataset physical-intelligence/libero \
+  --dataset-revision "$LIBERO_REVISION" \
+  --image-digest "$IMAGE_DIGEST" --instance-id "$INSTANCE_ID" \
+  --cost-reservation "$COST_RESERVATION"
+```
+
+Run both compiled LIBERO stages from their matching immutable build trees:
+
+```bash
+run_libero_phase python scripts/benchmark_pi05_latency.py \
+  --backend tensorrt --stage tensorrt_bf16 \
+  --artifact-dir /output/artifacts/tensorrt/libero/bf16 \
+  --track libero --dataset physical-intelligence/libero \
+  --dataset-revision "$LIBERO_REVISION" \
+  --image-digest "$IMAGE_DIGEST" --instance-id "$INSTANCE_ID" \
+  --cost-reservation "$COST_RESERVATION"
+
 run_libero_phase python scripts/benchmark_pi05_latency.py \
   --backend tensorrt --stage tensorrt_fp8 \
   --artifact-dir /output/artifacts/tensorrt/libero/fp8 \
   --track libero --dataset physical-intelligence/libero \
   --dataset-revision "$LIBERO_REVISION" \
   --image-digest "$IMAGE_DIGEST" --instance-id "$INSTANCE_ID" \
+  --cost-reservation "$COST_RESERVATION"
+```
+
+Run the exact five DROID counterparts through the v3 wrapper:
+
+```bash
+run_droid_phase python scripts/benchmark_pi05_latency.py \
+  --backend torch --stage base \
+  --artifact-dir /output/artifacts/tensorrt/droid/fp8 \
+  --config pi05_droid_jointpos \
+  --checkpoint /mnt/openpi/checkpoints/pi05_droid_jointpos_pytorch \
+  --num-denoise-steps 10 \
+  --track droid --dataset allenai/MolmoAct2-DROID-Dataset \
+  --dataset-revision "$DROID_REVISION" \
+  --image-digest "$DROID_IMAGE_DIGEST" --instance-id "$INSTANCE_ID" \
+  --cost-reservation "$COST_RESERVATION"
+
+run_droid_phase python scripts/benchmark_pi05_latency.py \
+  --backend torch --stage shallow \
+  --artifact-dir /output/artifacts/tensorrt/droid/fp8 \
+  --config pi05_droid_l09_distill \
+  --checkpoint /mnt/openpi/checkpoints/pi05_droid_l09_distill \
+  --num-denoise-steps 10 \
+  --track droid --dataset allenai/MolmoAct2-DROID-Dataset \
+  --dataset-revision "$DROID_REVISION" \
+  --image-digest "$DROID_IMAGE_DIGEST" --instance-id "$INSTANCE_ID" \
+  --cost-reservation "$COST_RESERVATION"
+
+run_droid_phase python scripts/benchmark_pi05_latency.py \
+  --backend torch --stage snapflow \
+  --artifact-dir /output/artifacts/tensorrt/droid/fp8 \
+  --config pi05_droid_l09_snapflow \
+  --checkpoint /mnt/openpi/checkpoints/pi05_droid_l09_snapflow \
+  --num-denoise-steps 1 \
+  --track droid --dataset allenai/MolmoAct2-DROID-Dataset \
+  --dataset-revision "$DROID_REVISION" \
+  --image-digest "$DROID_IMAGE_DIGEST" --instance-id "$INSTANCE_ID" \
+  --cost-reservation "$COST_RESERVATION"
+
+run_droid_phase python scripts/benchmark_pi05_latency.py \
+  --backend tensorrt --stage tensorrt_bf16 \
+  --artifact-dir /output/artifacts/tensorrt/droid/bf16 \
+  --track droid --dataset allenai/MolmoAct2-DROID-Dataset \
+  --dataset-revision "$DROID_REVISION" \
+  --image-digest "$DROID_IMAGE_DIGEST" --instance-id "$INSTANCE_ID" \
   --cost-reservation "$COST_RESERVATION"
 
 run_droid_phase python scripts/benchmark_pi05_latency.py \
@@ -789,10 +884,33 @@ paired CUDA-event and synchronized wall time; reports include mean, p50, p95,
 and p99. Nonstandard counts require the explicit
 `--allow-nonstandard-counts` smoke flag and cannot enter the aggregate report.
 
-Combine the five reports with `scripts/summarize_pi05_latency.py`. It applies
-all stagewise gates from `repro/reproduction.json` and labels the cumulative
-result as an AWS G7e relative speedup, never as Thor latency or an 11x Thor
-claim.
+Combine each track's five reports with these exact invocations. The summarizer
+requires byte-identical fixed inputs, the same live instance and GPU inventory,
+and the official timing counts before applying every gate in
+`repro/reproduction.json`:
+
+```bash
+run_libero_phase python scripts/summarize_pi05_latency.py \
+  --base /output/artifacts/tensorrt/libero/fp8/latency.base.json \
+  --shallow /output/artifacts/tensorrt/libero/fp8/latency.shallow.json \
+  --snapflow /output/artifacts/tensorrt/libero/fp8/latency.snapflow.json \
+  --tensorrt-bf16 /output/artifacts/tensorrt/libero/bf16/latency.tensorrt_bf16.json \
+  --tensorrt-fp8 /output/artifacts/tensorrt/libero/fp8/latency.tensorrt_fp8.json \
+  --reproduction-config repro/reproduction.json \
+  --output /output/artifacts/latency/libero/summary.json
+
+run_droid_phase python scripts/summarize_pi05_latency.py \
+  --base /output/artifacts/tensorrt/droid/fp8/latency.base.json \
+  --shallow /output/artifacts/tensorrt/droid/fp8/latency.shallow.json \
+  --snapflow /output/artifacts/tensorrt/droid/fp8/latency.snapflow.json \
+  --tensorrt-bf16 /output/artifacts/tensorrt/droid/bf16/latency.tensorrt_bf16.json \
+  --tensorrt-fp8 /output/artifacts/tensorrt/droid/fp8/latency.tensorrt_fp8.json \
+  --reproduction-config repro/reproduction.json \
+  --output /output/artifacts/latency/droid/summary.json
+```
+
+Each summary labels the cumulative result as an AWS G7e relative speedup,
+never as Thor latency or an 11x Thor claim.
 
 ## 7. Compiled LIBERO quality on the build instance
 

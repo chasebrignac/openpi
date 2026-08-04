@@ -395,6 +395,7 @@ def test_checkpoint_publication_is_immutable_and_contains_resume_contract(tmp_pa
         data_split_metadata=None,
         resume_contract=contract,
         initialization_lineage=lineage,
+        training_metrics={"loss": 0.25, "kd_cosine": 0.999},
     )
     checkpoint = tmp_path / "1"
     assert checkpoint.is_dir()
@@ -402,6 +403,14 @@ def test_checkpoint_publication_is_immutable_and_contains_resume_contract(tmp_pa
     state = json.loads((checkpoint / "resume-state.json").read_text())
     assert state["resume_contract"] == contract
     assert state["resume_fingerprint_sha256"] == train_pytorch.resume_identity_sha256(contract, lineage)
+    metrics = json.loads((checkpoint / "training-metrics.json").read_text())
+    assert metrics == {
+        "schema_version": 1,
+        "config_name": config.name,
+        "exp_name": config.exp_name,
+        "global_step": 1,
+        "metrics": {"kd_cosine": 0.999, "loss": 0.25},
+    }
 
     with pytest.raises(FileExistsError, match="immutable"):
         train_pytorch.save_checkpoint(
@@ -415,6 +424,28 @@ def test_checkpoint_publication_is_immutable_and_contains_resume_contract(tmp_pa
             resume_contract=contract,
             initialization_lineage=lineage,
         )
+
+
+def test_checkpoint_refuses_non_finite_training_metrics(tmp_path):
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters())
+    config = SaveConfig(checkpoint_dir=tmp_path)
+    data_config = types.SimpleNamespace(recovery_provenance=None, norm_stats=None, asset_id=None)
+
+    with pytest.raises(ValueError, match="finite JSON values"):
+        train_pytorch.save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            global_step=1,
+            config=config,
+            is_main=True,
+            data_config=data_config,
+            data_split_metadata=None,
+            resume_contract={"schema_version": 1},
+            initialization_lineage={"kind": "random_initialization"},
+            training_metrics={"loss": float("nan")},
+        )
+    assert not (tmp_path / "1").exists()
 
 
 def test_training_split_metadata_binds_seed_and_complete_validation_episodes():

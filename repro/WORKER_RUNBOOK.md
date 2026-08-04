@@ -156,6 +156,11 @@ checks complete before Docker starts.
         "sha256": "CONVERTED_MANIFEST_SHA256"
       },
       "payload_s3_uri": "s3://pi05-repro-752160877725-us-east-2/checkpoints/pi05_libero_pytorch/CONVERTED_64_CHARACTER_REVISION/checkpoint/",
+      "payload_objects": [
+        {"path": "model.safetensors", "version_id": "MODEL_VERSION_ID", "sha256": "MODEL_SHA256"},
+        {"path": "config.json", "version_id": "CONFIG_VERSION_ID", "sha256": "CONFIG_SHA256"},
+        {"path": "assets/physical-intelligence/libero/norm_stats.json", "version_id": "NORM_STATS_VERSION_ID", "sha256": "NORM_STATS_SHA256"}
+      ],
       "destination": "pi05_libero_pytorch"
     }
   ],
@@ -393,7 +398,14 @@ After reviewing both plans, render again with `render-bootstrap --execute`, then
 PyTorch checkpoints are saved as `tmp_STEP`, flushed, and atomically renamed to
 previously nonexistent numeric `STEP` directories. Numeric steps are immutable;
 the trainer refuses replacement. Before publication it checks every model and
-optimizer tensor for finite values. The worker recognizes only numeric
+optimizer tensor for finite values. Each newly written checkpoint also contains
+`training-metrics.json`: a schema-v1 sidecar bound to config, experiment, and
+global step, with the rank-zero final optimizer-step loss and whichever Shallow
+or SnapFlow diagnostics were produced. The sidecar labels that measurement
+scope explicitly; promotion still uses held-out metrics. The one-batch
+checkpoint includes its full overfit gate under the same metrics object. JSON
+serialization rejects NaN and infinity. Older checkpoints without this additive
+sidecar remain valid resume inputs. The worker recognizes only numeric
 checkpoint directories as complete and snapshots/uploads them on each sync
 interval.
 
@@ -490,8 +502,19 @@ Use the same shape for Shallow 5k-to-10k/20k/30k and SnapFlow
 5k-to-10k/20k/30k continuations.
 
 At the soft deadline (hard launcher deadline minus the upload buffer), the wrapper stops the container, performs final sync, uploads `manifests/run-manifest.json`, and finally uploads `manifests/final-sync-evidence.json`. The launcher's independent hard shutdown timer remains the last-resort cutoff.
-The run manifest's `launch` object includes the authoritative cost-ledger
-reservation ID, On-Demand purchase option, reserved hours, and projected
-maximum compute cost. The worker also hashes `/opt/pi05/run-command.sh` against
-that launch metadata before staging; actual post-run cost reconciliation stays
-in the versioned S3 ledger rather than being guessed by the worker.
+The run manifest has top-level `metrics`, `metrics_provenance`, and `cost`
+objects. Metrics are keyed by their output-relative source path and are copied
+only from a deterministic training sidecar or stage/evaluation manifest whose
+current SHA-256 still equals its committed expected-output marker. A missing
+training sidecar yields `{}` for compatibility; a present sidecar with a bad
+schema, non-finite value, mismatched checkpoint identity, or changed hash fails
+the run before a checkpoint can be published as a downstream worker input.
+
+`cost.reservation_id` and `cost.projected_usd` come directly from the validated
+launch metadata. `cost.actual_usd` is `null` at worker completion: the worker
+does not turn elapsed time or the reservation ceiling into fictitious billing.
+The immutable run manifest points operators to the versioned cost ledger for a
+later AWS billing reconciliation. The nested `launch` object retains the full
+authoritative reservation, On-Demand purchase option, reserved hours, and
+projection for compatibility. The worker also hashes `/opt/pi05/run-command.sh`
+against that launch metadata before staging.

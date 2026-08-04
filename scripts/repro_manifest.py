@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import pathlib
 import shlex
@@ -30,8 +31,31 @@ def artifact_record(path: pathlib.Path) -> dict[str, Any]:
     return {"path": str(path), "bytes": path.stat().st_size, "sha256": sha256_file(path)}
 
 
+def optional_cost(value: float | None, *, label: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"{label} must be a finite non-negative number")
+    return float(value)
+
+
+def parse_metrics(raw: str) -> dict[str, Any]:
+    try:
+        metrics = json.loads(raw)
+        # Round-trip with strict JSON so NaN/Infinity can never enter durable
+        # run evidence through Python's permissive decoder.
+        json.dumps(metrics, allow_nan=False)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError("metrics JSON must be a finite JSON object") from exc
+    if not isinstance(metrics, dict):
+        raise ValueError("metrics JSON must be a finite JSON object")
+    return metrics
+
+
 def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
     artifacts = [artifact_record(path) for path in args.artifact]
+    projected_cost = optional_cost(getattr(args, "projected_cost_usd", None), label="projected cost")
+    actual_cost = optional_cost(args.actual_cost_usd, label="actual cost")
     return {
         "schema_version": 1,
         "run_id": args.run_id,
@@ -55,8 +79,12 @@ def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "command_argv": shlex.split(args.command),
             "command": args.command,
         },
-        "cost": {"reservation_id": args.cost_reservation, "actual_usd": args.actual_cost_usd},
-        "metrics": json.loads(args.metrics_json),
+        "cost": {
+            "reservation_id": args.cost_reservation,
+            "projected_usd": projected_cost,
+            "actual_usd": actual_cost,
+        },
+        "metrics": parse_metrics(args.metrics_json),
         "artifacts": artifacts,
         "environment": {"aws_execution_env": os.environ.get("AWS_EXECUTION_ENV")},
     }
@@ -78,6 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, required=True)
     parser.add_argument("--command", required=True)
     parser.add_argument("--cost-reservation", required=True)
+    parser.add_argument("--projected-cost-usd", type=float)
     parser.add_argument("--actual-cost-usd", type=float)
     parser.add_argument("--metrics-json", default="{}")
     parser.add_argument("--artifact", type=pathlib.Path, action="append", default=[])

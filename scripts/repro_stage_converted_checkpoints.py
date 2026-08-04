@@ -11,16 +11,19 @@ manifest shape consumed by ``repro_worker.py``.  S3 writes are dry-run unless
 from __future__ import annotations
 
 import argparse
+import base64
 from collections.abc import Callable, Iterable, Mapping, Sequence
 import concurrent.futures
+import contextlib
 import dataclasses
-import datetime as dt
 import hashlib
 import json
 import math
+import os
 import pathlib
 import re
 import sys
+import tempfile
 from typing import Any
 import urllib.parse
 
@@ -37,6 +40,8 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 EQUIVALENCE_COSINE_MINIMUM = 0.999
+SINGLE_PUT_LIMIT_BYTES = 4 * 1024**3
+MULTIPART_PART_BYTES = 256 * 1024**2
 GOLDEN_CONTRACTS = {
     "libero": {"config_name": "pi05_libero_l09_distill", "seed": 7001},
     "droid_jointpos": {"config_name": "pi05_droid_l09_distill", "seed": 7002},
@@ -212,7 +217,6 @@ def build_converted_manifest(
     ]
     manifest: dict[str, Any] = {
         "schema_version": 1,
-        "created_at": dt.datetime.now(dt.UTC).isoformat(),
         "source": {
             "provider": "openpi-jax-to-pytorch",
             "revision_kind": "converted-checkpoint-content-and-provenance-sha256",
@@ -252,6 +256,10 @@ def validate_saved_manifest(saved: Mapping[str, Any], rebuilt: Mapping[str, Any]
     expected_revision = conversion_revision(manifest_identity(saved))
     if saved.get("source", {}).get("revision") != expected_revision:
         raise repro_stage_data.StageError("converted checkpoint revision is inconsistent with its manifest")
+    if saved != rebuilt:
+        raise repro_stage_data.StageError(
+            "converted checkpoint manifest is not the exact canonical manifest for these bytes"
+        )
 
 
 def validate_equivalence_report(
@@ -361,6 +369,496 @@ def converted_s3_target(s3_root: str, spec: ConvertedCheckpointSpec, revision: s
     )
 
 
+def _json_command(runner: CommandRunner, argv: Sequence[str]) -> Mapping[str, Any]:
+    output = runner(argv)
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise repro_stage_data.StageError(f"command did not return JSON ({' '.join(argv)}): {output!r}") from exc
+    if not isinstance(value, Mapping):
+        raise repro_stage_data.StageError(f"command returned a non-object ({' '.join(argv)})")
+    return value
+
+
+def _list_prefix_history(
+    target: repro_stage_data.S3Target,
+    *,
+    account: str,
+    region: str,
+    runner: CommandRunner,
+) -> Mapping[str, Any]:
+    history = _json_command(
+        runner,
+        [
+            "aws",
+            "s3api",
+            "list-object-versions",
+            "--bucket",
+            target.bucket,
+            "--prefix",
+            f"{target.prefix}/",
+            "--expected-bucket-owner",
+            account,
+            "--region",
+            region,
+            "--output",
+            "json",
+        ],
+    )
+    if history.get("IsTruncated") is True:
+        raise repro_stage_data.StageError("converted-checkpoint version history is truncated; refusing publication")
+    return history
+
+
+def _key_versions(history: Mapping[str, Any], key: str) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
+    versions = [item for item in history.get("Versions", []) if isinstance(item, Mapping) and item.get("Key") == key]
+    markers = [
+        item for item in history.get("DeleteMarkers", []) if isinstance(item, Mapping) and item.get("Key") == key
+    ]
+    return versions, markers
+
+
+def _assert_known_create_once_history(history: Mapping[str, Any], allowed_keys: set[str]) -> None:
+    versions = [item for item in history.get("Versions", []) if isinstance(item, Mapping)]
+    markers = [item for item in history.get("DeleteMarkers", []) if isinstance(item, Mapping)]
+    observed = {str(item.get("Key")) for item in [*versions, *markers]}
+    unknown = observed - allowed_keys
+    if unknown:
+        raise repro_stage_data.StageError(
+            f"converted-checkpoint prefix contains unknown object history: {sorted(unknown)}"
+        )
+    if markers:
+        raise repro_stage_data.StageError("converted-checkpoint prefix contains a delete marker; refusing publication")
+    counts: dict[str, int] = {}
+    for item in versions:
+        key = str(item.get("Key"))
+        counts[key] = counts.get(key, 0) + 1
+        if item.get("IsLatest") is not True:
+            raise repro_stage_data.StageError(f"converted-checkpoint object is not the sole latest version: {key}")
+    repeated = sorted(key for key, count in counts.items() if count != 1)
+    if repeated:
+        raise repro_stage_data.StageError(f"converted-checkpoint object has multiple versions: {repeated}")
+
+
+def _verified_object_receipt(
+    *,
+    path: pathlib.Path,
+    sha256: str,
+    metadata: Mapping[str, str],
+    target: repro_stage_data.S3Target,
+    key: str,
+    account: str,
+    region: str,
+    verification_dir: pathlib.Path,
+    runner: CommandRunner,
+    expected_version_id: str | None = None,
+) -> dict[str, Any]:
+    history = _list_prefix_history(target, account=account, region=region, runner=runner)
+    versions, markers = _key_versions(history, key)
+    if markers or len(versions) != 1:
+        raise repro_stage_data.StageError(
+            f"create-once object history is not exactly one version for {key}: "
+            f"versions={len(versions)}, delete_markers={len(markers)}"
+        )
+    version_id = versions[0].get("VersionId")
+    if not isinstance(version_id, str) or not version_id:
+        raise repro_stage_data.StageError(f"published object has no version ID: {key}")
+    if expected_version_id is not None and version_id != expected_version_id:
+        raise repro_stage_data.StageError(f"published object version receipt changed for {key}")
+    head = _json_command(
+        runner,
+        [
+            "aws",
+            "s3api",
+            "head-object",
+            "--bucket",
+            target.bucket,
+            "--key",
+            key,
+            "--version-id",
+            version_id,
+            "--checksum-mode",
+            "ENABLED",
+            "--expected-bucket-owner",
+            account,
+            "--region",
+            region,
+            "--output",
+            "json",
+        ],
+    )
+    remote_metadata = head.get("Metadata")
+    if (
+        head.get("VersionId") != version_id
+        or head.get("ContentLength") != path.stat().st_size
+        or head.get("ServerSideEncryption") != "AES256"
+        or not isinstance(remote_metadata, Mapping)
+        or any(remote_metadata.get(name) != value for name, value in metadata.items())
+    ):
+        raise repro_stage_data.StageError(f"published object failed size/metadata/encryption verification: {key}")
+
+    # A version-specific round trip is the content proof for both single PUTs
+    # and multipart uploads (whose ETag is not a whole-file digest).
+    roundtrip = verification_dir / hashlib.sha256(key.encode()).hexdigest()
+    get_result = _json_command(
+        runner,
+        [
+            "aws",
+            "s3api",
+            "get-object",
+            "--bucket",
+            target.bucket,
+            "--key",
+            key,
+            "--version-id",
+            version_id,
+            "--checksum-mode",
+            "ENABLED",
+            "--expected-bucket-owner",
+            account,
+            "--region",
+            region,
+            "--output",
+            "json",
+            str(roundtrip),
+        ],
+    )
+    if get_result.get("VersionId") != version_id or repro_stage_data.sha256_file(roundtrip) != sha256:
+        raise repro_stage_data.StageError(f"version-specific round trip failed SHA-256 verification: {key}")
+    roundtrip.unlink()
+    return {
+        "key": key,
+        "s3_uri": f"s3://{target.bucket}/{key}",
+        "version_id": version_id,
+        "sha256": sha256,
+        "bytes": path.stat().st_size,
+        "etag": head.get("ETag"),
+        "checksum_sha256": head.get("ChecksumSHA256"),
+        "server_side_encryption": "AES256",
+    }
+
+
+def _abort_multipart(
+    *,
+    target: repro_stage_data.S3Target,
+    key: str,
+    upload_id: str,
+    account: str,
+    region: str,
+    runner: CommandRunner,
+) -> None:
+    # The bucket lifecycle also aborts incomplete multipart uploads. Never
+    # replace the original publication failure with cleanup noise.
+    with contextlib.suppress(repro_stage_data.StageError):
+        runner(
+            [
+                "aws",
+                "s3api",
+                "abort-multipart-upload",
+                "--bucket",
+                target.bucket,
+                "--key",
+                key,
+                "--upload-id",
+                upload_id,
+                "--expected-bucket-owner",
+                account,
+                "--region",
+                region,
+            ]
+        )
+
+
+def _conditional_multipart_put(
+    *,
+    path: pathlib.Path,
+    sha256: str,
+    metadata: Mapping[str, str],
+    target: repro_stage_data.S3Target,
+    key: str,
+    account: str,
+    region: str,
+    temporary: pathlib.Path,
+    runner: CommandRunner,
+) -> str:
+    def file_identity(stat_result: os.stat_result) -> tuple[int, ...]:
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_mode,
+            stat_result.st_nlink,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+        )
+
+    source_identity = file_identity(path.stat())
+    created = _json_command(
+        runner,
+        [
+            "aws",
+            "s3api",
+            "create-multipart-upload",
+            "--bucket",
+            target.bucket,
+            "--key",
+            key,
+            "--expected-bucket-owner",
+            account,
+            "--region",
+            region,
+            "--server-side-encryption",
+            "AES256",
+            "--checksum-algorithm",
+            "SHA256",
+            "--checksum-type",
+            "COMPOSITE",
+            "--metadata",
+            json.dumps(dict(metadata), separators=(",", ":"), sort_keys=True),
+            "--output",
+            "json",
+        ],
+    )
+    upload_id = created.get("UploadId")
+    if not isinstance(upload_id, str) or not upload_id:
+        raise repro_stage_data.StageError(f"multipart upload returned no upload ID: {key}")
+    parts: list[dict[str, Any]] = []
+    part_path = temporary / "multipart-part"
+    try:
+        with path.open("rb") as stream:
+            if file_identity(os.fstat(stream.fileno())) != source_identity:
+                raise repro_stage_data.StageError(f"multipart source changed before it was opened: {path}")
+            streamed_sha256 = hashlib.sha256()
+            streamed_bytes = 0
+            part_number = 1
+            while chunk := stream.read(MULTIPART_PART_BYTES):
+                streamed_sha256.update(chunk)
+                streamed_bytes += len(chunk)
+                part_checksum = base64.b64encode(hashlib.sha256(chunk).digest()).decode()
+                part_path.write_bytes(chunk)
+                uploaded = _json_command(
+                    runner,
+                    [
+                        "aws",
+                        "s3api",
+                        "upload-part",
+                        "--bucket",
+                        target.bucket,
+                        "--key",
+                        key,
+                        "--upload-id",
+                        upload_id,
+                        "--part-number",
+                        str(part_number),
+                        "--body",
+                        str(part_path),
+                        "--content-length",
+                        str(len(chunk)),
+                        "--checksum-algorithm",
+                        "SHA256",
+                        "--checksum-sha256",
+                        part_checksum,
+                        "--expected-bucket-owner",
+                        account,
+                        "--region",
+                        region,
+                        "--output",
+                        "json",
+                    ],
+                )
+                etag = uploaded.get("ETag")
+                if not isinstance(etag, str) or not etag:
+                    raise repro_stage_data.StageError(f"multipart part has no ETag: {key} part {part_number}")
+                if uploaded.get("ChecksumSHA256") != part_checksum:
+                    raise repro_stage_data.StageError(
+                        f"multipart part failed its SHA-256 response check: {key} part {part_number}"
+                    )
+                parts.append({"ETag": etag, "PartNumber": part_number, "ChecksumSHA256": part_checksum})
+                part_number += 1
+            stream_identity = file_identity(os.fstat(stream.fileno()))
+        final_identity = file_identity(path.stat())
+        if (
+            source_identity != stream_identity
+            or source_identity != final_identity
+            or streamed_bytes != source_identity[4]
+            or streamed_sha256.hexdigest() != sha256
+        ):
+            raise repro_stage_data.StageError(f"multipart source changed or differs from its manifest: {path}")
+        part_path.unlink(missing_ok=True)
+        description = temporary / "multipart.json"
+        description.write_text(json.dumps({"Parts": parts}, separators=(",", ":"), sort_keys=True))
+        completed = _json_command(
+            runner,
+            [
+                "aws",
+                "s3api",
+                "complete-multipart-upload",
+                "--bucket",
+                target.bucket,
+                "--key",
+                key,
+                "--upload-id",
+                upload_id,
+                "--multipart-upload",
+                f"file://{description}",
+                "--if-none-match",
+                "*",
+                "--checksum-type",
+                "COMPOSITE",
+                "--expected-bucket-owner",
+                account,
+                "--region",
+                region,
+                "--output",
+                "json",
+            ],
+        )
+    except (OSError, repro_stage_data.StageError):
+        _abort_multipart(
+            target=target,
+            key=key,
+            upload_id=upload_id,
+            account=account,
+            region=region,
+            runner=runner,
+        )
+        raise
+    version_id = completed.get("VersionId")
+    if not isinstance(version_id, str) or not version_id:
+        raise repro_stage_data.StageError(f"completed multipart upload has no version ID: {key}")
+    return version_id
+
+
+def _publish_exact_object(
+    *,
+    path: pathlib.Path,
+    sha256: str,
+    metadata: Mapping[str, str],
+    target: repro_stage_data.S3Target,
+    key: str,
+    account: str,
+    region: str,
+    temporary: pathlib.Path,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    if SHA256_RE.fullmatch(sha256) is None:
+        raise repro_stage_data.StageError(f"published object has an invalid SHA-256: {key}")
+    history = _list_prefix_history(target, account=account, region=region, runner=runner)
+    versions, markers = _key_versions(history, key)
+    if markers or len(versions) > 1:
+        raise repro_stage_data.StageError(f"create-once object already has unsafe version history: {key}")
+    if versions:
+        return _verified_object_receipt(
+            path=path,
+            sha256=sha256,
+            metadata=metadata,
+            target=target,
+            key=key,
+            account=account,
+            region=region,
+            verification_dir=temporary,
+            runner=runner,
+        )
+
+    expected_version: str | None = None
+    if path.stat().st_size <= SINGLE_PUT_LIMIT_BYTES:
+        checksum = base64.b64encode(bytes.fromhex(sha256)).decode()
+        try:
+            response = _json_command(
+                runner,
+                [
+                    "aws",
+                    "s3api",
+                    "put-object",
+                    "--bucket",
+                    target.bucket,
+                    "--key",
+                    key,
+                    "--body",
+                    str(path),
+                    "--content-length",
+                    str(path.stat().st_size),
+                    "--if-none-match",
+                    "*",
+                    "--expected-bucket-owner",
+                    account,
+                    "--region",
+                    region,
+                    "--server-side-encryption",
+                    "AES256",
+                    "--checksum-algorithm",
+                    "SHA256",
+                    "--checksum-sha256",
+                    checksum,
+                    "--metadata",
+                    json.dumps(dict(metadata), separators=(",", ":"), sort_keys=True),
+                    "--output",
+                    "json",
+                ],
+            )
+            candidate = response.get("VersionId")
+            expected_version = candidate if isinstance(candidate, str) and candidate else None
+            if expected_version is None:
+                raise repro_stage_data.StageError(f"conditional PUT returned no version ID: {key}")
+        except repro_stage_data.StageError as original:
+            # A concurrent exact publisher may have won the If-None-Match race.
+            # Reuse only after full version-specific verification.
+            try:
+                return _verified_object_receipt(
+                    path=path,
+                    sha256=sha256,
+                    metadata=metadata,
+                    target=target,
+                    key=key,
+                    account=account,
+                    region=region,
+                    verification_dir=temporary,
+                    runner=runner,
+                )
+            except repro_stage_data.StageError as verification_error:
+                raise original from verification_error
+    else:
+        try:
+            expected_version = _conditional_multipart_put(
+                path=path,
+                sha256=sha256,
+                metadata=metadata,
+                target=target,
+                key=key,
+                account=account,
+                region=region,
+                temporary=temporary,
+                runner=runner,
+            )
+        except repro_stage_data.StageError as original:
+            try:
+                return _verified_object_receipt(
+                    path=path,
+                    sha256=sha256,
+                    metadata=metadata,
+                    target=target,
+                    key=key,
+                    account=account,
+                    region=region,
+                    verification_dir=temporary,
+                    runner=runner,
+                )
+            except repro_stage_data.StageError as verification_error:
+                raise original from verification_error
+    return _verified_object_receipt(
+        path=path,
+        sha256=sha256,
+        metadata=metadata,
+        target=target,
+        key=key,
+        account=account,
+        region=region,
+        verification_dir=temporary,
+        runner=runner,
+        expected_version_id=expected_version,
+    )
+
+
 def upload_converted_checkpoint(
     config: Mapping[str, Any],
     spec: ConvertedCheckpointSpec,
@@ -379,84 +877,140 @@ def upload_converted_checkpoint(
     target = converted_s3_target(s3_root, spec, revision)
     account, region = repro_stage_data.verify_aws_destination(config, target, runner=runner, environ=environ)
     upstream = str(manifest["source"]["upstream"]["revision"])
-    metadata = (
-        f"source-provider=openpi-conversion,source-revision={revision},"
-        f"upstream-revision={upstream},source-commit={manifest['conversion']['source_commit']},"
-        f"image-digest={manifest['conversion']['image_digest']},"
-        f"equivalence-report-sha256={equivalence_report_sha256}"
-    )
-    sync = [
-        "aws",
-        "s3",
-        "sync",
-        str(converted_root),
-        target.snapshot_uri,
-        "--region",
-        region,
-        "--no-follow-symlinks",
-        "--only-show-errors",
-        "--no-progress",
-        "--sse",
-        "AES256",
-        "--metadata",
-        metadata,
+    manifest_sha256 = repro_stage_data.sha256_file(manifest_path)
+    payload_inventory = [
+        {"path": item["path"], "bytes": item["bytes"], "sha256": item["sha256"]} for item in manifest["files"]
     ]
-    runner(sync)
-    runner(
-        [
-            "aws",
-            "s3api",
-            "put-object",
-            "--bucket",
-            target.bucket,
-            "--key",
-            target.manifest_key,
-            "--body",
-            str(manifest_path),
-            "--expected-bucket-owner",
-            account,
-            "--region",
-            region,
-            "--server-side-encryption",
-            "AES256",
-            "--metadata",
-            metadata,
-        ]
-    )
-    verification_sync = [argument for argument in sync if argument != "--only-show-errors"]
-    if runner([*verification_sync, "--dryrun"]).strip():
-        raise repro_stage_data.StageError("S3 converted-checkpoint sync verification reports pending changes")
-    head = json.loads(
-        runner(
-            [
-                "aws",
-                "s3api",
-                "head-object",
-                "--bucket",
-                target.bucket,
-                "--key",
-                target.manifest_key,
-                "--expected-bucket-owner",
-                account,
-                "--region",
-                region,
-                "--output",
-                "json",
-            ]
+    claim = {
+        "schema_version": 1,
+        "kind": "pi05-converted-checkpoint-publication-claim",
+        "checkpoint": spec.key,
+        "source_revision": revision,
+        "upstream_revision": upstream,
+        "source_commit": manifest["conversion"]["source_commit"],
+        "image_digest": manifest["conversion"]["image_digest"],
+        "equivalence_report_sha256": equivalence_report_sha256,
+        "manifest_sha256": manifest_sha256,
+        "payload": payload_inventory,
+    }
+    claim_bytes = (json.dumps(claim, indent=2, sort_keys=True) + "\n").encode()
+    claim_sha256 = hashlib.sha256(claim_bytes).hexdigest()
+    claim_key = f"{target.prefix}/publication-claim.json"
+    receipt_key = f"{target.prefix}/publication-receipt.json"
+    payload_keys = {f"{target.prefix}/checkpoint/{item['path']}" for item in payload_inventory}
+    allowed_keys = {claim_key, receipt_key, target.manifest_key, *payload_keys}
+    common_metadata = {
+        "source-provider": "openpi-conversion",
+        "source-revision": revision,
+        "source-commit": str(manifest["conversion"]["source_commit"]),
+    }
+
+    with tempfile.TemporaryDirectory(prefix="pi05-converted-publication-") as temporary_name:
+        temporary = pathlib.Path(temporary_name)
+        claim_path = temporary / "publication-claim.json"
+        claim_path.write_bytes(claim_bytes)
+        initial_history = _list_prefix_history(target, account=account, region=region, runner=runner)
+        initial_versions, initial_markers = _key_versions(initial_history, claim_key)
+        if (
+            not initial_versions
+            and not initial_markers
+            and (initial_history.get("Versions") or initial_history.get("DeleteMarkers"))
+        ):
+            raise repro_stage_data.StageError(
+                "converted-checkpoint prefix has history without the exact publication claim; refusing recovery"
+            )
+        _assert_known_create_once_history(initial_history, allowed_keys)
+        claim_receipt = _publish_exact_object(
+            path=claim_path,
+            sha256=claim_sha256,
+            metadata=common_metadata | {"role": "publication-claim", "sha256": claim_sha256},
+            target=target,
+            key=claim_key,
+            account=account,
+            region=region,
+            temporary=temporary,
+            runner=runner,
         )
-    )
-    if int(head.get("ContentLength", -1)) != manifest_path.stat().st_size:
-        raise repro_stage_data.StageError("uploaded converted manifest has an unexpected content length")
-    if head.get("Metadata", {}).get("source-revision") != revision:
-        raise repro_stage_data.StageError("uploaded converted manifest has the wrong source revision")
-    version_id = head.get("VersionId")
-    if not version_id:
-        raise repro_stage_data.StageError("uploaded converted manifest has no S3 version ID")
+
+        payload_receipts: list[dict[str, Any]] = []
+        for item in payload_inventory:
+            relative = pathlib.PurePosixPath(str(item["path"]))
+            source = converted_root.joinpath(*relative.parts)
+            payload_receipts.append(
+                _publish_exact_object(
+                    path=source,
+                    sha256=str(item["sha256"]),
+                    metadata=common_metadata | {"role": "converted-payload", "sha256": str(item["sha256"])},
+                    target=target,
+                    key=f"{target.prefix}/checkpoint/{relative.as_posix()}",
+                    account=account,
+                    region=region,
+                    temporary=temporary,
+                    runner=runner,
+                )
+            )
+
+        publication_receipt = {
+            "schema_version": 1,
+            "kind": "pi05-converted-checkpoint-publication-receipt",
+            "source_revision": revision,
+            "manifest_sha256": manifest_sha256,
+            "claim": claim_receipt,
+            "payload": payload_receipts,
+        }
+        receipt_path = temporary / "publication-receipt.json"
+        receipt_path.write_text(json.dumps(publication_receipt, indent=2, sort_keys=True) + "\n")
+        receipt_sha256 = repro_stage_data.sha256_file(receipt_path)
+        publication_receipt_object = _publish_exact_object(
+            path=receipt_path,
+            sha256=receipt_sha256,
+            metadata=common_metadata | {"role": "publication-receipt", "sha256": receipt_sha256},
+            target=target,
+            key=receipt_key,
+            account=account,
+            region=region,
+            temporary=temporary,
+            runner=runner,
+        )
+        # The manifest is the final object. Its existence means the claim,
+        # every payload object, and the durable receipt have already passed a
+        # version-specific SHA-256 round trip.
+        manifest_receipt = _publish_exact_object(
+            path=manifest_path,
+            sha256=manifest_sha256,
+            metadata=common_metadata
+            | {
+                "role": "manifest",
+                "sha256": manifest_sha256,
+                "upstream-revision": upstream,
+                "image-digest": str(manifest["conversion"]["image_digest"]),
+                "equivalence-report-sha256": equivalence_report_sha256,
+            },
+            target=target,
+            key=target.manifest_key,
+            account=account,
+            region=region,
+            temporary=temporary,
+            runner=runner,
+        )
+        final_history = _list_prefix_history(target, account=account, region=region, runner=runner)
+        _assert_known_create_once_history(final_history, allowed_keys)
+        final_keys = {str(item.get("Key")) for item in final_history.get("Versions", [])}
+        if final_keys != allowed_keys:
+            raise repro_stage_data.StageError("converted-checkpoint publication is missing an expected final object")
+
+    version_id = manifest_receipt["version_id"]
     return {
         "source_revision": revision,
         "checkpoint_uri": target.snapshot_uri,
         "manifest_uri": target.manifest_uri,
         "manifest_version_id": version_id,
+        "publication": {
+            "claim": claim_receipt,
+            "payload": payload_receipts,
+            "receipt": publication_receipt_object,
+            "manifest": manifest_receipt,
+        },
         "worker_artifact": {
             "name": f"{spec.key}_teacher_pytorch",
             "kind": "checkpoint",
@@ -464,9 +1018,17 @@ def upload_converted_checkpoint(
             "manifest": {
                 "s3_uri": target.manifest_uri,
                 "version_id": version_id,
-                "sha256": repro_stage_data.sha256_file(manifest_path),
+                "sha256": manifest_sha256,
             },
             "payload_s3_uri": target.snapshot_uri,
+            "payload_objects": [
+                {
+                    "path": item["path"],
+                    "version_id": receipt["version_id"],
+                    "sha256": item["sha256"],
+                }
+                for item, receipt in zip(payload_inventory, payload_receipts, strict=True)
+            ],
             "destination": spec.local_dirname,
         },
     }

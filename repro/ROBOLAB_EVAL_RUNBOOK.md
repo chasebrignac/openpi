@@ -9,11 +9,11 @@ provenance-complete input for `scripts/repro_promotion_report.py`.
 Do not run camera-enabled validation on the persistent workbench's base AMI:
 its NVIDIA `595.71.05` driver reproduced the known Isaac Sim RTX startup crash
 in the untouched Isaac Lab base, while non-camera startup succeeded. Launch
-category `evaluation` through `scripts/repro_aws_launch.py`; it has no arbitrary
-AMI override and selects the pinned R580 evaluation AMI below. Record every
-command or dependency correction in the main run log. Do not add the procedure
-to CloudFormation until it has completed two clean abbreviated replays with no
-undocumented edit.
+category and workload `evaluation` through `scripts/repro_aws_launch.py`; it
+has no arbitrary AMI override and selects the pinned R580 evaluation AMI below.
+Record every command or dependency correction in the main run log. Do not add
+the procedure to CloudFormation until it has completed two clean abbreviated
+replays with no undocumented edit.
 
 ## Immutable inputs and fixed evaluation contract
 
@@ -57,6 +57,7 @@ hash, then add `--execute` to the identical invocation only when authorized:
 ```bash
 python3 scripts/repro_aws_launch.py \
   --category evaluation \
+  --workload evaluation \
   --instance-type g6e.4xlarge \
   --hours 1 \
   --label robolab-r580-camera-smoke \
