@@ -642,6 +642,17 @@ def render_worker_spec(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint = worker_artifact(args.checkpoint_artifact)
     checkpoint_path = safe_artifact_destination(checkpoint, root="/mnt/openpi/checkpoints", label="checkpoint")
     artifacts = [checkpoint]
+    provenance_artifact_path = getattr(args, "checkpoint_provenance_artifact", None)
+    if provenance_artifact_path is not None:
+        provenance = worker_artifact(provenance_artifact_path, label="checkpoint provenance")
+        provenance_path = safe_artifact_destination(
+            provenance,
+            root="/mnt/openpi/checkpoints",
+            label="checkpoint provenance",
+        )
+        if provenance_path == checkpoint_path:
+            raise ValueError("checkpoint and checkpoint-provenance destinations overlap")
+        artifacts.insert(0, provenance)
     compiled: dict[str, Any] | None = None
     build_contract: dict[str, Any] | None = None
     if backend == "tensorrt":
@@ -893,6 +904,11 @@ def add_render_parser(subparsers: Any) -> None:
     parser.add_argument("--parent-policy-image", required=True)
     parser.add_argument("--backend", choices=BACKENDS, default="eager")
     parser.add_argument("--checkpoint-artifact", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--checkpoint-provenance-artifact",
+        type=pathlib.Path,
+        help="optional upstream checkpoint descriptor required by converted-teacher staging contracts",
+    )
     parser.add_argument("--policy-config", required=True)
     parser.add_argument("--stage", required=True)
     parser.add_argument("--trials-per-task", type=positive_int, choices=(1, 10, 50), required=True)

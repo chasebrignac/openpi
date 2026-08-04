@@ -65,6 +65,24 @@ def _checkpoint_artifact(tmp_path: pathlib.Path) -> pathlib.Path:
     return path
 
 
+def _checkpoint_provenance_artifact(tmp_path: pathlib.Path) -> pathlib.Path:
+    artifact = {
+        "name": "libero_jax_checkpoint",
+        "kind": "checkpoint",
+        "revision": "1" * 64,
+        "manifest": {
+            "s3_uri": f"s3://{repro_libero_eval.BUCKET}/checkpoints/libero-jax/manifest.sha256.json",
+            "version_id": "version-jax-1",
+            "sha256": "2" * 64,
+        },
+        "payload_s3_uri": f"s3://{repro_libero_eval.BUCKET}/checkpoints/libero-jax/checkpoint/",
+        "destination": "pi05_libero",
+    }
+    path = tmp_path / "provenance-artifact.json"
+    path.write_text(json.dumps({"worker_artifact": artifact}))
+    return path
+
+
 def _render_args(tmp_path: pathlib.Path) -> argparse.Namespace:
     return argparse.Namespace(
         run_id="libero-base-smoke-01",
@@ -188,6 +206,29 @@ def test_rendered_worker_spec_uses_one_network_none_policy_container(tmp_path):
     )
     assert docker_command[docker_command.index("--network") + 1] == "none"
     assert docker_command.count(spec["image"]["uri"]) == 1
+
+
+def test_rendered_worker_spec_can_stage_distinct_checkpoint_provenance(tmp_path):
+    args = _render_args(tmp_path)
+    checkpoint_payload = json.loads(args.checkpoint_artifact.read_text())
+    checkpoint_payload["worker_artifact"]["destination"] = "pi05_libero_pytorch"
+    args.checkpoint_artifact.write_text(json.dumps(checkpoint_payload))
+    args.checkpoint_provenance_artifact = _checkpoint_provenance_artifact(tmp_path)
+    spec = repro_libero_eval.render_worker_spec(args)
+    assert [artifact["destination"] for artifact in spec["artifacts"]] == [
+        "pi05_libero",
+        "pi05_libero_pytorch",
+    ]
+    assert spec["container"]["command"][spec["container"]["command"].index("--checkpoint") + 1] == (
+        "/mnt/openpi/checkpoints/pi05_libero_pytorch"
+    )
+
+    overlapping = _checkpoint_provenance_artifact(tmp_path)
+    payload = json.loads(overlapping.read_text())
+    payload["worker_artifact"]["destination"] = "pi05_libero_pytorch"
+    overlapping.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="checkpoint and checkpoint-provenance destinations overlap"):
+        repro_libero_eval.render_worker_spec(args)
 
 
 def test_run_identity_cannot_override_worker_environment(tmp_path, monkeypatch):
