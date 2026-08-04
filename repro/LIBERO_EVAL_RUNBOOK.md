@@ -33,19 +33,23 @@ Commit the reviewed source first. Set the exact parent policy digest that alread
 tests; do not use a tag.
 
 ```bash
-export PI05_SOURCE_COMMIT="$(git rev-parse HEAD)"
-export PI05_POLICY_BASE_IMAGE='752160877725.dkr.ecr.us-east-2.amazonaws.com/pi05-repro@sha256:PARENT_DIGEST'
+export PI05_EVALUATOR_SOURCE_COMMIT=e30480a6de404c74a996863c4fde89367350cf70
+export PI05_PARENT_POLICY_SOURCE_COMMIT=229c08ea2a13a70cbbf1a9c8a1f31cb1ca674dee
+export PI05_SOURCE_COMMIT="$PI05_EVALUATOR_SOURCE_COMMIT"
+export PI05_SOURCE_CHECKOUT="/absolute/path/to/verified/openpi-$PI05_EVALUATOR_SOURCE_COMMIT"
+export PI05_POLICY_BASE_IMAGE='752160877725.dkr.ecr.us-east-2.amazonaws.com/pi05-repro@sha256:d76e6d73fca409e998304a6a8997f80fab1252fe0301d667a072f99dd6624f24'
 export PI05_LIBERO_LOCAL_IMAGE="pi05-repro-libero:${PI05_SOURCE_COMMIT}"
 export PI05_ECR_REPOSITORY='752160877725.dkr.ecr.us-east-2.amazonaws.com/pi05-repro'
 export PI05_LIBERO_TAG="libero-evaluator-${PI05_SOURCE_COMMIT}"
 export PI05_POLICY_BACKEND=eager
 
-test -z "$(git status --porcelain)"
+test "$(git -C "$PI05_SOURCE_CHECKOUT" rev-parse HEAD)" = "$PI05_SOURCE_COMMIT"
+test -z "$(git -C "$PI05_SOURCE_CHECKOUT" status --porcelain)"
 aws ecr get-login-password --region us-east-2 | \
   docker login --username AWS --password-stdin 752160877725.dkr.ecr.us-east-2.amazonaws.com
 docker pull "$PI05_POLICY_BASE_IMAGE"
 docker image inspect "$PI05_POLICY_BASE_IMAGE" --format '{{json .Config.Labels}}' | jq .
-git archive --format=tar "$PI05_SOURCE_COMMIT" | docker build --pull=false \
+git -C "$PI05_SOURCE_CHECKOUT" archive --format=tar "$PI05_SOURCE_COMMIT" | docker build --pull=false \
   --file repro/Dockerfile.libero \
   --build-arg POLICY_BASE_IMAGE="$PI05_POLICY_BASE_IMAGE" \
   --build-arg POLICY_BACKEND="$PI05_POLICY_BACKEND" \
@@ -58,6 +62,11 @@ docker run --rm --network none "$PI05_LIBERO_LOCAL_IMAGE" \
   /opt/libero-venv/bin/python -c \
   'import json, os, platform; value=json.load(open(os.environ["LIBERO_RUNTIME_CONTRACT"])); assert platform.python_version()=="3.8.20"; print(value)'
 
+if aws ecr describe-images --region us-east-2 --repository-name pi05-repro \
+  --image-ids imageTag="$PI05_LIBERO_TAG" >/dev/null 2>&1; then
+  echo "refusing existing immutable evaluator tag: $PI05_LIBERO_TAG" >&2
+  exit 1
+fi
 docker tag "$PI05_LIBERO_LOCAL_IMAGE" "$PI05_ECR_REPOSITORY:$PI05_LIBERO_TAG"
 docker push "$PI05_ECR_REPOSITORY:$PI05_LIBERO_TAG"
 export PI05_LIBERO_DIGEST="$(aws ecr describe-images --region us-east-2 \
@@ -109,38 +118,261 @@ workbench: it records this evaluation's non-overlapping share of the paid
 reservation, not the cost of launching another instance. Set that allocation
 from the cost ledger before starting.
 
+The block below is the exact retained-host record for accepted attempts 05 and
+06, including their create-once image and ledger inputs. Do not rerun it over
+those existing output directories; any future replay uses new attempt numbers.
+
 ```bash
-export PI05_LIBERO_IMAGE='752160877725.dkr.ecr.us-east-2.amazonaws.com/pi05-repro@sha256:FINAL_DIGEST'
-export PI05_CHECKPOINT=/absolute/path/to/pi05_libero
-export PI05_MODEL_REVISION=64_CHARACTER_STAGED_CHECKPOINT_REVISION
+set -euo pipefail
+export PI05_LIBERO_IMAGE='752160877725.dkr.ecr.us-east-2.amazonaws.com/pi05-repro@sha256:51b352c1a7205d6bdae668f99060ebd05049042e1d89916993830acbdc63b374'
+export PI05_EVALUATOR_SOURCE_COMMIT=e30480a6de404c74a996863c4fde89367350cf70
+export PI05_PARENT_POLICY_SOURCE_COMMIT=229c08ea2a13a70cbbf1a9c8a1f31cb1ca674dee
+export PI05_SOURCE_COMMIT="$PI05_EVALUATOR_SOURCE_COMMIT"
+export PI05_SOURCE_CHECKOUT="/opt/pi05/source/openpi-$PI05_EVALUATOR_SOURCE_COMMIT"
+export PI05_PARENT_POLICY_IMAGE_DIGEST=sha256:d76e6d73fca409e998304a6a8997f80fab1252fe0301d667a072f99dd6624f24
+export PI05_CHECKPOINT=/opt/pi05/checkpoints/pi05_libero_pytorch
+export PI05_CONVERTED_MANIFEST=/opt/pi05/checkpoints/_manifests/pi05_libero_pytorch.converted-manifest.json
+export PI05_MODEL_REVISION=c73bb6ff5cbaa3c7bba5f03ea38c22bd95e8274308285e2f17b6ed2d73688dd0
+export PI05_COST_LEDGER_VERSION_ID=WwdchX.Da46XNc5.cVFjkU7.qqryrA7h
+export PI05_COST_LEDGER_SHA256=13eb67119d0261a58f52a2b1633e125b2ff8e47214095c70807f96e88c316db9
 : "${PI05_EAGER_SMOKE_PROJECTED_COST_USD:?set the nonzero ledger allocation}"
 python3 -c 'import os; assert float(os.environ["PI05_EAGER_SMOKE_PROJECTED_COST_USD"]) > 0'
-mkdir -p /tmp/pi05-libero-smoke-output
 
-docker run --rm --gpus all --network none --ipc host --shm-size 32g \
-  --user 1000:1000 --workdir /opt/openpi \
-  --mount type=bind,src="$PI05_CHECKPOINT",dst=/mnt/openpi/checkpoints/pi05_libero,readonly \
-  --mount type=bind,src=/tmp/pi05-libero-smoke-output,dst=/output \
-  --env HOME=/tmp --env XDG_CACHE_HOME=/tmp/cache \
-  --env PYTHONPATH=/opt/openpi/src:/opt/openpi \
-  --env PI05_SOURCE_SHA="$PI05_SOURCE_COMMIT" \
-  --env PI05_IMAGE_DIGEST="${PI05_LIBERO_IMAGE##*@}" \
-  --env PI05_RUN_ID=libero-base-runtime-smoke \
-  --env PI05_SEED=7 \
-  "$PI05_LIBERO_IMAGE" \
-  python scripts/repro_libero_eval.py run \
-    --policy-config pi05_libero \
-    --checkpoint /mnt/openpi/checkpoints/pi05_libero \
-    --model-revision "$PI05_MODEL_REVISION" \
-    --stage base --trials-per-task 1 --seed 7 \
-    --instance-type g6e.4xlarge \
-    --projected-cost-usd "$PI05_EAGER_SMOKE_PROJECTED_COST_USD" \
-    --output-root /output
+imds_token="$(curl --fail --silent --show-error --request PUT \
+  --header 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+  http://169.254.169.254/latest/api/token)"
+instance_identity="$(curl --fail --silent --show-error \
+  --header "X-aws-ec2-metadata-token: $imds_token" \
+  http://169.254.169.254/latest/dynamic/instance-identity/document)"
+unset imds_token
+test "$(jq -r .accountId <<<"$instance_identity")" = 752160877725
+test "$(jq -r .region <<<"$instance_identity")" = us-east-2
+test "$(jq -r .instanceType <<<"$instance_identity")" = g6e.4xlarge
+export PI05_INSTANCE_ID="$(jq -r .instanceId <<<"$instance_identity")"
+printf '%s\n' "$PI05_INSTANCE_ID" | grep -Eq '^i-[0-9a-f]{17}$'
+
+test "$(git -C "$PI05_SOURCE_CHECKOUT" rev-parse HEAD)" = "$PI05_SOURCE_COMMIT"
+test -z "$(git -C "$PI05_SOURCE_CHECKOUT" status --porcelain)"
+test -d "$PI05_CHECKPOINT"
+test -f "$PI05_CONVERTED_MANIFEST"
+
+# /mnt/openpi is a retained-host symlink to /opt/pi05. Keep host inputs on the
+# canonical /opt/pi05 path; only the read-only container destination uses /mnt.
+
+for attempt in 05 06; do
+  run_id="libero-base-runtime-smoke-$attempt"
+  output="/opt/pi05/evidence/$run_id"
+  test ! -e "$output"
+  install -d -m 0700 -o 1000 -g 1000 "$output"
+  test ! -e "$output/replay.log"
+  test ! -e "$output/timing.json"
+  test ! -e "$output/timing.json.tmp"
+
+  started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  set +e
+  docker run --rm --gpus all --network none --hostname pi05-libero \
+    --add-host pi05-libero:127.0.0.1 --ipc host --shm-size 32g \
+    --user 1000:1000 --workdir /workspace/openpi \
+    --mount type=bind,src="$PI05_SOURCE_CHECKOUT",dst=/workspace/openpi,readonly \
+    --mount type=bind,src="$PI05_CHECKPOINT",dst=/mnt/openpi/checkpoints/pi05_libero,readonly \
+    --mount type=bind,src="$output",dst=/output \
+    --env HOME=/tmp --env XDG_CACHE_HOME=/tmp/cache \
+    --env USER=pi05 --env LOGNAME=pi05 \
+    --env TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor \
+    --env PYTHONDONTWRITEBYTECODE=1 \
+    --env PYTHONPATH=/workspace/openpi/src:/workspace/openpi \
+    --env PI05_SOURCE_SHA="$PI05_SOURCE_COMMIT" \
+    --env PI05_IMAGE_DIGEST="${PI05_LIBERO_IMAGE##*@}" \
+    --env PI05_INSTANCE_ID="$PI05_INSTANCE_ID" \
+    --env PI05_RUN_ID="$run_id" \
+    --env PI05_SEED=7 \
+    "$PI05_LIBERO_IMAGE" \
+    python scripts/repro_libero_eval.py run \
+      --policy-config pi05_libero \
+      --checkpoint /mnt/openpi/checkpoints/pi05_libero \
+      --model-revision "$PI05_MODEL_REVISION" \
+      --stage base --trials-per-task 1 --seed 7 \
+      --instance-type g6e.4xlarge \
+      --projected-cost-usd "$PI05_EAGER_SMOKE_PROJECTED_COST_USD" \
+      --output-root /output \
+    2>&1 | tee "$output/replay.log"
+  pipeline_status=("${PIPESTATUS[@]}")
+  smoke_exit_code="${pipeline_status[0]}"
+  if test "$smoke_exit_code" -eq 0; then
+    smoke_exit_code="${pipeline_status[1]}"
+  fi
+  set -e
+  finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  jq -n --arg started_at "$started_at" --arg finished_at "$finished_at" \
+    --argjson exit_code "$smoke_exit_code" \
+    '{started_at:$started_at,finished_at:$finished_at,exit_code:$exit_code}' \
+    > "$output/timing.json.tmp"
+  mv "$output/timing.json.tmp" "$output/timing.json"
+  test "$smoke_exit_code" -eq 0
+done
 ```
 
-Run this command twice from clean output directories with no interactive edits. Record both manifests and artifact
-hashes. If a dependency or command needs correction, make the edit in source, append it to the manual ledger,
-rebuild to a new digest, and restart the two-clean-replay count. Never patch a running container.
+Attempts 01 through 04 remain immutable failure evidence. The two accepted clean
+outputs are explicitly `libero-base-runtime-smoke-05` and `-06`; never reuse or
+publish a failed attempt directory. Record both successful manifests and
+artifact hashes. If a dependency or command needs correction, make the edit in
+source, append it to the manual ledger, rebuild to a new digest, and restart the
+two-clean-replay count with new attempt numbers. Never patch a running
+container.
+
+### Seal and publish each direct replay
+
+The host wrapper makes `replay.log` and an exact three-key `timing.json` part of
+the smoke output. Seal each otherwise complete root with the reviewed
+control-plane checkout. The evaluator and final evaluator image use
+`e30480a...`, which includes the explicit policy-client WebSocket close needed
+after the observed suite-shutdown hang. The parent policy image and converted
+teacher remain separately bound to `229c08e...`; neither identity substitutes
+for the other. Local `validate` and an `upload` without `--execute` make no AWS
+API calls or mutations, but both deliberately make a fresh IMDSv2 identity
+read on the executing workbench. The executing
+form snapshots the eight exact payloads, publishes a deterministic claim first,
+uses conditional AES256/SHA256 uploads with version-specific round trips, writes
+the publication receipt, and writes the manifest last. Its final gate requires
+exactly eleven sole/latest object versions, no delete markers, and no incomplete
+multipart uploads. The exact `worker_artifact` emitted by the retained
+converted-teacher publication is tracked at
+`repro/libero-teacher-pytorch.worker-artifact.json`; do not reconstruct or copy
+it into an untracked host path. The publisher hashes the three local checkpoint
+files against the converted manifest and requires their hashes and every S3
+VersionId to match that tracked object. It also requires a locally hashed
+exact-version cost-ledger copy with a paid entry covering the instance,
+complete wrapper interval, and projected cost. Before writing the publication
+claim, `upload --execute` downloads the teacher manifest, all three teacher
+objects, and the ledger again by exact S3 VersionId and reproduces every pinned
+SHA-256.
+
+```bash
+set -euo pipefail
+export AWS_REGION=us-east-2
+export AWS_DEFAULT_REGION=us-east-2
+: "${PI05_CONTROL_COMMIT:?set the reviewed commit containing the LIBERO evidence publisher}"
+printf '%s\n' "$PI05_CONTROL_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+export PI05_CONTROL_CHECKOUT="/opt/pi05/source/openpi-$PI05_CONTROL_COMMIT"
+export PI05_EVALUATOR_SOURCE_COMMIT=e30480a6de404c74a996863c4fde89367350cf70
+export PI05_PARENT_POLICY_SOURCE_COMMIT=229c08ea2a13a70cbbf1a9c8a1f31cb1ca674dee
+export PI05_LIBERO_IMAGE='752160877725.dkr.ecr.us-east-2.amazonaws.com/pi05-repro@sha256:51b352c1a7205d6bdae668f99060ebd05049042e1d89916993830acbdc63b374'
+export PI05_PARENT_POLICY_IMAGE_DIGEST=sha256:d76e6d73fca409e998304a6a8997f80fab1252fe0301d667a072f99dd6624f24
+export PI05_CHECKPOINT=/opt/pi05/checkpoints/pi05_libero_pytorch
+export PI05_CONVERTED_MANIFEST=/opt/pi05/checkpoints/_manifests/pi05_libero_pytorch.converted-manifest.json
+export PI05_MODEL_REVISION=c73bb6ff5cbaa3c7bba5f03ea38c22bd95e8274308285e2f17b6ed2d73688dd0
+export PI05_COST_LEDGER_VERSION_ID=WwdchX.Da46XNc5.cVFjkU7.qqryrA7h
+export PI05_COST_LEDGER_SHA256=13eb67119d0261a58f52a2b1633e125b2ff8e47214095c70807f96e88c316db9
+export PI05_EVIDENCE_S3_ROOT='s3://pi05-repro-752160877725-us-east-2/manual-smoke/libero'
+export PI05_COST_LEDGER_S3_URI='s3://pi05-repro-752160877725-us-east-2/control/cost-ledger.json'
+export PI05_CONVERTED_CHECKPOINT_ARTIFACT="$PI05_CONTROL_CHECKOUT/repro/libero-teacher-pytorch.worker-artifact.json"
+test "$(git -C "$PI05_CONTROL_CHECKOUT" rev-parse HEAD)" = "$PI05_CONTROL_COMMIT"
+test -z "$(git -C "$PI05_CONTROL_CHECKOUT" status --porcelain)"
+test -f "$PI05_CONVERTED_CHECKPOINT_ARTIFACT"
+test -d "$PI05_CHECKPOINT"
+test -f "$PI05_CONVERTED_MANIFEST"
+
+imds_token="$(curl --fail --silent --show-error --request PUT \
+  --header 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+  http://169.254.169.254/latest/api/token)"
+instance_identity="$(curl --fail --silent --show-error \
+  --header "X-aws-ec2-metadata-token: $imds_token" \
+  http://169.254.169.254/latest/dynamic/instance-identity/document)"
+unset imds_token
+test "$(jq -r .accountId <<<"$instance_identity")" = 752160877725
+test "$(jq -r .region <<<"$instance_identity")" = us-east-2
+test "$(jq -r .instanceType <<<"$instance_identity")" = g6e.4xlarge
+export PI05_INSTANCE_ID="$(jq -r .instanceId <<<"$instance_identity")"
+printf '%s\n' "$PI05_INSTANCE_ID" | grep -Eq '^i-[0-9a-f]{17}$'
+
+install -d -m 0700 /opt/pi05/evidence-inputs
+install -d -m 0700 /opt/pi05/evidence-publications
+
+export PI05_COST_LEDGER_PATH=/opt/pi05/evidence-inputs/cost-ledger.exact-version.json
+if test -e "$PI05_COST_LEDGER_PATH"; then
+  test -f "$PI05_COST_LEDGER_PATH"
+  test ! -L "$PI05_COST_LEDGER_PATH"
+else
+  ledger_tmp="$(mktemp /opt/pi05/evidence-inputs/.cost-ledger.XXXXXX)"
+  set +e
+  ledger_get_receipt="$(aws s3api get-object \
+    --bucket pi05-repro-752160877725-us-east-2 \
+    --key control/cost-ledger.json \
+    --version-id "$PI05_COST_LEDGER_VERSION_ID" \
+    --checksum-mode ENABLED \
+    --expected-bucket-owner 752160877725 \
+    --region us-east-2 --output json "$ledger_tmp")"
+  ledger_get_status=$?
+  set -e
+  if test "$ledger_get_status" -ne 0; then
+    rm -f "$ledger_tmp"
+    exit "$ledger_get_status"
+  fi
+  test "$(jq -r .VersionId <<<"$ledger_get_receipt")" = "$PI05_COST_LEDGER_VERSION_ID"
+  test "$(sha256sum "$ledger_tmp" | cut -d ' ' -f1)" = "$PI05_COST_LEDGER_SHA256"
+  chmod 0400 "$ledger_tmp"
+  ln "$ledger_tmp" "$PI05_COST_LEDGER_PATH"
+  rm "$ledger_tmp"
+fi
+test "$(sha256sum "$PI05_COST_LEDGER_PATH" | cut -d ' ' -f1)" = "$PI05_COST_LEDGER_SHA256"
+
+for attempt in 05 06; do
+  run_id="libero-base-runtime-smoke-$attempt"
+  output="/opt/pi05/evidence/$run_id"
+  common_args=(
+    --output-root "$output"
+    --run-id "$run_id"
+    --evaluator-source-commit "$PI05_EVALUATOR_SOURCE_COMMIT"
+    --evaluator-image-digest "${PI05_LIBERO_IMAGE##*@}"
+    --parent-policy-source-commit "$PI05_PARENT_POLICY_SOURCE_COMMIT"
+    --parent-policy-image-digest "$PI05_PARENT_POLICY_IMAGE_DIGEST"
+    --model-revision "$PI05_MODEL_REVISION"
+    --instance-id "$PI05_INSTANCE_ID"
+    --checkpoint-root "$PI05_CHECKPOINT"
+    --converted-manifest "$PI05_CONVERTED_MANIFEST"
+    --converted-checkpoint-artifact "$PI05_CONVERTED_CHECKPOINT_ARTIFACT"
+    --cost-ledger-path "$PI05_COST_LEDGER_PATH"
+    --cost-ledger-s3-uri "$PI05_COST_LEDGER_S3_URI"
+    --cost-ledger-version-id "$PI05_COST_LEDGER_VERSION_ID"
+    --cost-ledger-sha256 "$PI05_COST_LEDGER_SHA256"
+  )
+
+  python3 "$PI05_CONTROL_CHECKOUT/scripts/repro_stage_libero_evidence.py" \
+    validate "${common_args[@]}"
+  python3 "$PI05_CONTROL_CHECKOUT/scripts/repro_stage_libero_evidence.py" \
+    upload "${common_args[@]}" --s3-root "$PI05_EVIDENCE_S3_ROOT" \
+    --config "$PI05_CONTROL_CHECKOUT/repro/reproduction.json"
+
+  publication_receipt="/opt/pi05/evidence-publications/$run_id.json"
+  test ! -e "$publication_receipt"
+  publication_tmp="$(mktemp "/opt/pi05/evidence-publications/.${run_id}.XXXXXX")"
+  set +e
+  python3 "$PI05_CONTROL_CHECKOUT/scripts/repro_stage_libero_evidence.py" \
+    upload --execute "${common_args[@]}" --s3-root "$PI05_EVIDENCE_S3_ROOT" \
+    --config "$PI05_CONTROL_CHECKOUT/repro/reproduction.json" \
+    > "$publication_tmp"
+  publication_status=$?
+  set -e
+  if test "$publication_status" -ne 0; then
+    rm -f "$publication_tmp"
+    exit "$publication_status"
+  fi
+  jq -e '.s3.manifest.version_id and (.s3.publication.payload | length == 8)' \
+    "$publication_tmp"
+  chmod 0400 "$publication_tmp"
+  sync -f "$publication_tmp"
+  ln "$publication_tmp" "$publication_receipt"
+  rm "$publication_tmp"
+  sync -f /opt/pi05/evidence-publications
+done
+```
+
+Persist each local publication receipt outside its sealed output root and append
+its SHA-256, evidence revision, manifest URI/VersionId/hash, and all eight
+payload VersionIds to the manual-edit ledger. A prefix containing unknown
+history, multiple versions, or a delete marker is rejected rather than cleaned
+or overwritten. An interrupted exact publication can resume only when its
+deterministic claim and every existing version-specific byte are identical.
 
 ### TensorRT one-trial replay
 

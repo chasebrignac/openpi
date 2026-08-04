@@ -1,0 +1,29 @@
+{
+  "destination": "pi05_libero_pytorch",
+  "kind": "checkpoint",
+  "manifest": {
+    "s3_uri": "s3://pi05-repro-752160877725-us-east-2/checkpoints/pi05_libero_pytorch/c73bb6ff5cbaa3c7bba5f03ea38c22bd95e8274308285e2f17b6ed2d73688dd0/manifest.sha256.json",
+    "sha256": "b1eb42ac73351d749587e3c3fd1667bc140610819e73408099d39b262cd08daa",
+    "version_id": "2lhXK.lU9urPfUKPftPS._nqx_fFyTZa"
+  },
+  "name": "libero_teacher_pytorch",
+  "payload_objects": [
+    {
+      "path": "assets/physical-intelligence/libero/norm_stats.json",
+      "sha256": "b3a44bb2810436fb62917decaea58bd4d9110255df527dea21e8fd40c960bd84",
+      "version_id": "lovWxnfPjGXaumqqymRFSooyROWg0QqA"
+    },
+    {
+      "path": "config.json",
+      "sha256": "272039e8c92478c0cfce91491224d54b20d57225525099a368a6cc625b3e9ec6",
+      "version_id": "xkFsFoARHCXyKpuweYp7sSckoQcN24Ef"
+    },
+    {
+      "path": "model.safetensors",
+      "sha256": "c1efa01d7e5b97edd7880acacd85885dbd38d97cf826717d089b29d02184f44a",
+      "version_id": "CSsniON0z0hrMv7LrnLO0v9qnPlxYWGw"
+    }
+  ],
+  "payload_s3_uri": "s3://pi05-repro-752160877725-us-east-2/checkpoints/pi05_libero_pytorch/c73bb6ff5cbaa3c7bba5f03ea38c22bd95e8274308285e2f17b6ed2d73688dd0/checkpoint/",
+  "revision": "c73bb6ff5cbaa3c7bba5f03ea38c22bd95e8274308285e2f17b6ed2d73688dd0"
+}
