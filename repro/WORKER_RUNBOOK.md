@@ -247,6 +247,15 @@ checks complete before Docker starts.
 }
 ```
 
+The JSON above shows the ordinary two-GPU Shallow command. The sole
+single-GPU exception is the evidence-gated LIBERO 2k pilot authorized in
+`RUNBOOK_AWS.md` after the exact immutable A4 success. For that one fresh run,
+replace the three-item `torchrun --standalone --nproc-per-node=2` prefix with
+`python`; retain the exact 2k output and `publish_destination`; and forbid
+`--resume`, `--overwrite`, and every one-batch-overfit option. A4's checkpoint
+is not an eligible input. This exception does not alter the ordinary worker or
+launcher matrices and does not authorize a second pilot or a different track.
+
 `image.purpose` is mandatory; the worker rejects older ambiguous specs. Use
 `policy` for training, policy export, dataset/calibration generation, and eager
 non-simulator policy evaluation. A policy image must declare the approved
@@ -546,6 +555,16 @@ then restores model and optimizer state, verifies metadata step equality, and
 advances the deterministic data iterator past already-consumed microbatches.
 Use the same shape for Shallow 5k-to-10k/20k/30k and SnapFlow
 5k-to-10k/20k/30k continuations.
+
+The resume example uses the ordinary two-GPU command prefix. For the one
+evidence-gated single-GPU LIBERO 2k-to-5k continuation authorized by
+`RUNBOOK_AWS.md`, replace that prefix with `python` and change nothing else in
+the resume identity: use a fresh run ID, preserve the 2k experiment ID, copy
+the sole 2k `published_inputs` descriptor unchanged, target its exact
+`CONFIG/EXPERIMENT/2000`, require exactly one `--resume`, forbid
+`--overwrite`, and publish only `CONFIG/EXPERIMENT/5000`. Start it only after
+the 2k worker and any diagnostic GPU process have terminated. This does not
+authorize A4 resume or a generic single-GPU continuation path.
 
 At the soft deadline (hard launcher deadline minus the upload buffer), the wrapper stops the container, performs final sync, uploads `manifests/run-manifest.json`, and finally uploads `manifests/final-sync-evidence.json`. The launcher's independent hard shutdown timer remains the last-resort cutoff.
 The run manifest has top-level `metrics`, `metrics_provenance`, and `cost`

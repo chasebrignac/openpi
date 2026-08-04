@@ -344,21 +344,68 @@ capacity outage and retry later rather than launching a command that cannot
 run.
 
 The one-GPU fallback is not a capacity-outage substitution and never runs the
-two-process command. Use it only after the exact failed two-GPU manifest and
-successful final-sync evidence have been hash/version verified, and only when
-the worker spec contains direct `python scripts/train_pytorch.py` with no
-`torchrun`, resume, overwrite, or publication destination. Its preparation
-gate must bind those facts before rendering this read-only corrective plan:
+two-process command. A4 used it as a non-publishing methodology diagnostic:
+that spec contains direct `python scripts/train_pytorch.py` with no `torchrun`,
+resume, overwrite, or publication destination. A4's one-batch checkpoint is
+diagnostic evidence only and must never be selected as a worker artifact or
+resume target.
+
+After A4, this policy authorizes exactly one fresh single-GPU 2k LIBERO pilot,
+not a generic expansion of the fallback. Its preparation gate must bind all of
+the following before publishing a new spec or reserving spend:
+
+- A4 run manifest VersionId `JyxugbqH_T.B9biVyfcETR46Sa5VTJxG`, SHA-256
+  `6b642cbd90aba982fb59e84a9db7e0fbfa3d976878d81c08da28eca5be81a12c`,
+  reports `succeeded`, exit zero, the passing 300-step finite overfit gate, and
+  no reusable `published_inputs`.
+- A4 final-sync evidence VersionId `RmSnrJEqgm3wsXj6NFBYZa9hGv3Bd9Fd`,
+  SHA-256
+  `7dfcce4bfdc1f4230574eb14ceb776c5a97537a8ac4fb343fa2cf2b0baf2af21`,
+  reports successful final sync and binds that exact manifest receipt.
+- A4 instance `i-0a5a2502e114aaedc` is terminated, and no other training or
+  diagnostic GPU process or active Shallow worker exists. Never overlap a
+  promotion candidate with a CUDA/NCCL diagnostic.
+- The 2k worker has a fresh run ID and fresh experiment ID, retains the exact
+  accepted model source, image, LIBERO dataset, teachers, seed, config, and
+  batch semantics, and invokes direct `python scripts/train_pytorch.py` with
+  `--num-train-steps 2000 --save-interval 2000`. It contains no `torchrun`,
+  `--resume`, `--overwrite`, or one-batch-overfit option.
+- The 2k spec declares exactly one checkpoint output at
+  `checkpoints/CONFIG/EXPERIMENT/2000` and exactly one matching
+  `publish_destination` at `CONFIG/EXPERIMENT/2000`. No other output may be
+  promoted as a worker input.
+
+Launch that one pilot only as `corrective_run` plus `shallow_training` on one
+On-Demand `g7e.4xlarge` with `CapacityReservationPreference=none`. Four
+requested hours cover the measured approximately 13m24s launch-to-first-step,
+approximately 5.4 seconds for each of 2,000 optimizer steps (three hours), and
+the checkpoint/final-sync buffer; the launcher separately reserves its
+0.25-hour boot-and-shutdown margin:
 
 ```bash
 python3 scripts/repro_aws_launch.py \
   --category corrective_run \
   --workload shallow_training \
   --instance-type g7e.4xlarge \
-  --hours 6 \
-  --label shallow-libero-overfit-single-gpu \
-  --command-file /tmp/libero-shallow-overfit-single-gpu.command.sh
+  --hours 4 \
+  --label shallow-libero-pilot-single-gpu-2k \
+  --command-file /tmp/libero-shallow-pilot-single-gpu-2k.command.sh
 ```
+
+One later single-GPU 2k-to-5k continuation is authorized only after the 2k
+worker succeeds, final sync succeeds, its instance terminates, and its run
+manifest contains exactly one immutable `published_inputs` descriptor. Copy
+that descriptor unchanged into the fresh 5k run's `artifacts`; do not rebuild
+it from an S3 prefix. The 5k run keeps the 2k experiment ID, uses a fresh run
+ID, invokes direct Python with exactly one `--resume` and no `--overwrite`,
+targets exactly `CONFIG/EXPERIMENT/2000`, and declares exactly one matching
+published checkpoint at `CONFIG/EXPERIMENT/5000`. The worker must retrieve the
+manifest and every checkpoint file by exact VersionId, reproduce every hash,
+validate the schema-v2 resume fingerprint and complete optimizer/model state,
+and restore the 2k checkpoint without re-uploading it. This authorization does
+not admit additional pilots, sweeps, tracks, instance types, concurrent GPU
+processes, or ordinary `shallow_training` launches on `g7e.4xlarge`; any later
+continuation needs its own evidence-bound promotion decision.
 
 The manual TensorRT replay is intentionally different from an ephemeral
 training worker. It needs one bounded G7e session to survive a failed or
@@ -563,5 +610,6 @@ camera-enabled evaluator smoke, not a policy-quality evaluation.
 91. A4 cloud-init completed in 51.52 seconds, SSM came online, and both EC2 health checks passed. Read-only SSM command `ee1052f4-470d-490a-8dc5-62e5aad7f9e7` confirmed `pi05-job.service` active, the model bundle detached at exact commit 229c, and the controller bundle detached at exact commit 28f. Read-only staging check `a1158fb7-f2b1-43dd-bf8b-6491bc3247bc` made no GPU call; at 11:27Z it found the same single worker process active and the exact digest-qualified Docker pull running, which establishes that immutable input staging had completed and image retrieval was in progress. No container log object is expected until the image is verified, the output manager is created, and the training container starts.
 92. A4 entered the direct single-process container at `2026-08-04T11:30:54Z`. Log segment zero is VersionId `BXTLJLheNngLY1WiaQ7rnQhx5VZRTu69`, SHA-256 `03248e8f2149a67ccd99785fa126bb671d27614ddac34447a8cb15bf293923de`; segment one is VersionId `nIf_4fTY7ie_jhxxYC9fxxWqvuchFUl6`, SHA-256 `298443a253d3a203fff5bd276bf3ac28bf55a2de0bfa8f6d0d297d6abc7d07d4`. They prove world size one, local/global microbatch eight, accumulation eight, optimizer batch 64, fixed one-batch noise/time/mask, and held-out episode 276. Segment two is VersionId `b6agqX4.DU3hJd5W4bY97RXnR1Uhijp0`, SHA-256 `6c4570c6dac27b60fc3e8213ec64a39b6930fcc13b89829405a8e841694f2a4e`; it proves exact layer map `(0,2,4,6,8,11,13,15,17)`, 633 mapped state keys, BF16 and gradient checkpointing. GPU allocation/reservation was 12.45/20.03 GiB after model creation and peaked at 30.68 GiB during training. Segment three is VersionId `lSU1_Xi6MIdAnprvi1ENSkS.ap.aeFx5`, SHA-256 `8525d0ac9918a8f9f1c3238157d673fef5724ab4554f578f64ea9b8de0204441`; optimizer step zero completed at 11:33:52Z with finite loss 4.9232, and the ten-step report at 11:34:46Z showed approximately 5.39 seconds per optimizer step, finite loss/KD metrics, and an estimated 26 minutes remaining. No OOM, NCCL/Gloo path, second container, or error appeared.
 93. A4 completed all 300 optimizer steps and passed its methodology-only overfit gate. The first-20 mean loss was `4.861105489730835`, the last-20 mean was `0.00137333256425336`, every loss was finite, and relative decline was `0.9997174855457972`; final loss was `0.0012933362741023302`, held-out FM/KD MSE were `0.0006168886902742088`/`0.0006764474674127996`, KD cosine was `0.9996635913848877`, and per-joint normalized RMSE mean/max were `0.016945060342550278`/`0.09823093563318253`. Completion log segment 30 is VersionId `5LZtnNyRaRggs2FbCPap5drD0ugrAVjE`, SHA-256 `352b3b3e8b80bc8b0448eea4f8103ecc2166dd12449c06c7587b07fad5c9b336`. The immutable succeeded/exit-zero run manifest is VersionId `JyxugbqH_T.B9biVyfcETR46Sa5VTJxG`, SHA-256 `6b642cbd90aba982fb59e84a9db7e0fbfa3d976878d81c08da28eca5be81a12c`; exact-version final-sync evidence is VersionId `RmSnrJEqgm3wsXj6NFBYZa9hGv3Bd9Fd`, SHA-256 `7dfcce4bfdc1f4230574eb14ceb776c5a97537a8ac4fb343fa2cf2b0baf2af21`, with `final_sync_succeeded=true`, 34 receipts, and the exact manifest receipt. The run prefix has 41 singleton AES256 versions and no delete marker. Its eight checkpoint objects total 13,386,484,612 bytes: norm stats `PbNz90J04HlfdfXpZNTWjOKTxKs1tEsr`/`b3a44bb2810436fb62917decaea58bd4d9110255df527dea21e8fd40c960bd84`; metadata `SR81HNNpZxhJpBgKvLJ_YFxTrfKR9FSQ`/`8796b70dc3f5de5584eb85be9ca5e0114b50bf62af755220dc1beddb0c89690f`; model `goIhUfd2o.Bz20OIVRuJX8lgylgH4rZO`/`decf6c68d3a1af235f9c85e85bc75575d9bff93ae212b11ca80a4ca9de2be0f3`; optimizer `7Dx.zs2CQu.8OWhg0gO79zwpdn__6E7O`/`c2037e6561d5b9cb7b9c92ca0278ef327e9f567fb32d955064b34329e10deda0`; diagnostic `nefL9ggNj9an3jliTTv7RynXBvZLSf32`/`c34144ff02c393e265b82ba6e436adb77546b2c2d18958c1913051e47e81dd91`; resume state `9tpvaifBcRaZma.DFawwsOG2BXauCxC4`/`bf268d5127e72be2c91dc28f3db054e808497b782d1450de0c121a7f01ade930`; training metrics `rsEWNs2bcbSF9XsrgZnsdP0mCVVUpIwx`/`5a48a24c0adbd4c7669c7e734f7a3d9384d9a4181386ef07027b5acc60018280`; and W&B ID `ihXZJCuRu5VMhZMyrfqfhmoGYpBPC92k`/`d6bdb5da1ebfd1a0189d1712099f3825fc64bd4abed06eda30afdabaf6818b61`. Workbench SSM `5b185b29-72f5-4236-a998-da76bd059f4f` failed before any download because the document's POSIX shell rejected `set -o pipefail`; replay `375be167-67e8-4d2d-b450-b5d12d5926b9` used `set -eu`, downloaded every object by its exact VersionId, and independently reproduced all eight hashes in 2m34s. A4 deliberately has no `publish_destination` or reusable `published_inputs`; its one-batch checkpoint must never be resumed. Only after the durable final sync did instance `i-0a5a2502e114aaedc` self-terminate; terminal state code 48 and `Client.InstanceInitiatedShutdown` were observed at `2026-08-04T12:08:53Z`.
+94. As a second independent checkpoint gate, workbench SSM `4b73969d-2809-4a83-84c9-d41cf942e785` hard-linked the eight already hash-verified exact-version downloads into a numeric step-300 tree and ran `scripts/repro_checkpoint.py --require-overfit-report` inside the exact immutable LIBERO policy image with networking disabled, a read-only container root, read-only source/checkpoint mounts, and no GPU. It completed in 21 seconds with `/checkpoint/300` and `A4_STRUCTURAL_CHECKPOINT_VALIDATION_OK`, proving the safetensors archive, complete finite optimizer state, metadata, schema-v2 resume contract/fingerprint, normalization hash, and overfit report are mutually consistent. These local hard links remain audit evidence on the persistent workbench volume and do not make A4 resumable or published.
 
 Record any future console action or command here before incorporating it into CloudFormation.
