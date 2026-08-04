@@ -28,6 +28,7 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+LEROBOT_VIDEO_BACKEND = "pyav"
 
 
 class Dataset(Protocol[T_co]):
@@ -508,6 +509,12 @@ def create_torch_dataset(
         root=root,
         episodes=list(constructor_episodes) if constructor_episodes is not None else None,
         revision=data_config.lerobot_revision,
+        # The pinned AWS DLC uses a static CPython 3.12 build, while the
+        # lock-pinned TorchCodec wheel links libpython3.12.so. Both pinned
+        # LeRobot revisions support PyAV explicitly, so select it rather than
+        # allowing presence of an unusable TorchCodec package to choose the
+        # default backend.
+        video_backend=LEROBOT_VIDEO_BACKEND,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },

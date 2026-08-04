@@ -144,41 +144,160 @@ for TRACK in libero droid; do
   docker push "$ECR_REPOSITORY:$TAG"
 done
 
+export LIBERO_POLICY_TAG="tensorrt-policy-libero-$SOURCE_COMMIT"
 export DROID_POLICY_TAG="tensorrt-policy-droid-$SOURCE_COMMIT"
+export LIBERO_POLICY_DIGEST="$(aws ecr describe-images --region us-east-2 \
+  --repository-name pi05-repro --image-ids imageTag="$LIBERO_POLICY_TAG" \
+  --query 'imageDetails[0].imageDigest' --output text)"
 export DROID_POLICY_DIGEST="$(aws ecr describe-images --region us-east-2 \
   --repository-name pi05-repro --image-ids imageTag="$DROID_POLICY_TAG" \
   --query 'imageDetails[0].imageDigest' --output text)"
+[[ "$LIBERO_POLICY_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+[[ "$DROID_POLICY_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+test "$LIBERO_POLICY_DIGEST" != "$DROID_POLICY_DIGEST"
+export LIBERO_TENSORRT_POLICY_IMAGE="$ECR_REPOSITORY@$LIBERO_POLICY_DIGEST"
 export DROID_RUNTIME_IMAGE="$ECR_REPOSITORY@$DROID_POLICY_DIGEST"
+docker pull "$LIBERO_TENSORRT_POLICY_IMAGE"
 docker pull "$DROID_RUNTIME_IMAGE"
-docker image inspect --format '{{json .RepoDigests}}' "$DROID_RUNTIME_IMAGE" \
-  | jq -e --arg value "$DROID_RUNTIME_IMAGE" 'index($value) != null'
-test "$(docker image inspect --format '{{index .Config.Labels "ai.openpi.image-purpose"}}' \
-  "$DROID_RUNTIME_IMAGE")" = tensorrt-policy
-test "$(docker image inspect --format '{{index .Config.Labels "ai.openpi.lerobot-runtime"}}' \
-  "$DROID_RUNTIME_IMAGE")" = v3
-test "$(docker image inspect --format '{{index .Config.Labels "ai.openpi.lerobot-revision"}}' \
-  "$DROID_RUNTIME_IMAGE")" = "$DROID_LEROBOT_SHA"
+
+assert_combined_label() {
+  local image="$1" key="$2" expected="$3" actual
+  actual="$(docker image inspect "$image" \
+    | jq -er --arg key "$key" '.[0].Config.Labels[$key]')"
+  test "$actual" = "$expected"
+}
+verify_combined_image() {
+  local image="$1" runtime="$2" lerobot_sha="$3"
+  test "${image%@*}" = "$ECR_REPOSITORY"
+  [[ "${image##*@}" =~ ^sha256:[0-9a-f]{64}$ ]]
+  docker image inspect --format '{{json .RepoDigests}}' "$image" \
+    | jq -e --arg value "$image" 'index($value) != null'
+  test "$(docker image inspect --format '{{.Os}}' "$image")" = linux
+  test "$(docker image inspect --format '{{.Architecture}}' "$image")" = amd64
+  assert_combined_label "$image" org.opencontainers.image.revision "$SOURCE_COMMIT"
+  assert_combined_label "$image" ai.openpi.upstream-revision 15a9616a00943ada6c20a0f158e3adb39df2ccac
+  assert_combined_label "$image" ai.openpi.image-purpose tensorrt-policy
+  assert_combined_label "$image" ai.openpi.parent-image-purpose tensorrt-compiler
+  assert_combined_label "$image" ai.openpi.parent-tensorrt-compiler-image "$TENSORRT_COMPILER_IMAGE"
+  assert_combined_label "$image" ai.openpi.parent-tensorrt-compiler-source-revision "$SOURCE_COMMIT"
+  assert_combined_label "$image" ai.openpi.tensorrt-version 11.0.0.114
+  assert_combined_label "$image" ai.openpi.cuda-version 13.3.0
+  assert_combined_label "$image" ai.openpi.modelopt-version 0.45.0
+  assert_combined_label "$image" ai.openpi.torch-version 2.8.0
+  assert_combined_label "$image" ai.openpi.onnx-version 1.21.0
+  assert_combined_label "$image" ai.openpi.onnxruntime-gpu-version 1.24.2
+  assert_combined_label "$image" ai.openpi.runtime-lock-sha256 \
+    793488b5a55bb87200db90a61fd0af51922b686d94e1da4f4c587ab119b37d74
+  assert_combined_label "$image" ai.openpi.policy-runtime openpi-transform-websocket
+  assert_combined_label "$image" ai.openpi.policy-python /opt/modelopt/bin/python
+  assert_combined_label "$image" ai.openpi.policy-protocol openpi-policy-websocket-v1
+  assert_combined_label "$image" ai.openpi.lerobot-runtime "$runtime"
+  assert_combined_label "$image" ai.openpi.lerobot-revision "$lerobot_sha"
+  assert_combined_label "$image" ai.openpi.paligemma-tokenizer-sha256 \
+    8986bb4f423f07f8c7f70d0dbe3526fb2316056c17bae71b1ea975e77a168fc6
+}
+smoke_combined_image() {
+  local image="$1" runtime="$2" lerobot_version="$3"
+  docker run --rm --interactive --pull=never --gpus all --network none --user 1000:1000 \
+    --env HOME=/tmp --env XDG_CACHE_HOME=/tmp/cache \
+    --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 \
+    --env EXPECTED_LEROBOT_RUNTIME="$runtime" \
+    --env EXPECTED_LEROBOT_VERSION="$lerobot_version" \
+    "$image" /opt/modelopt/bin/python - <<'PY'
+import importlib.metadata as metadata
+import os
+
+import lerobot
+import modelopt
+import numpy as np
+import onnx
+import onnxruntime as ort
+import tensorrt
+import torch
+from openpi.exporting.tensorrt_policy import TensorRTPolicy
+from openpi.models.tokenizer import PaligemmaTokenizer
+from openpi.serving.websocket_policy_server import WebsocketPolicyServer
+from openpi.training import config
+from openpi_client import base_policy, msgpack_numpy
+
+actual = (
+    tensorrt.__version__,
+    modelopt.__version__,
+    torch.__version__.split("+", 1)[0],
+    onnx.__version__,
+    ort.__version__,
+    metadata.version("lerobot"),
+)
+expected = (
+    "11.0.0.114",
+    "0.45.0",
+    "2.8.0",
+    "1.21.0",
+    "1.24.2",
+    os.environ["EXPECTED_LEROBOT_VERSION"],
+)
+assert actual == expected, (actual, expected)
+assert os.environ["EXPECTED_LEROBOT_RUNTIME"] in {"v2", "v3"}
+assert lerobot is not None
+assert torch.cuda.is_available()
+value = torch.tensor([1.0, 2.0], device="cuda") * 2
+assert value.cpu().tolist() == [2.0, 4.0]
+torch.cuda.synchronize()
+
+x = onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1])
+y = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1])
+z = onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, [1])
+graph = onnx.helper.make_graph(
+    [onnx.helper.make_node("Add", ["x", "y"], ["z"])],
+    "combined-cuda-smoke",
+    [x, y],
+    [z],
+)
+model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+model.ir_version = 10
+options = ort.SessionOptions()
+options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+session = ort.InferenceSession(
+    model.SerializeToString(), sess_options=options, providers=["CUDAExecutionProvider"]
+)
+assert session.get_providers()[0] == "CUDAExecutionProvider", session.get_providers()
+output = session.run(
+    None,
+    {"x": np.asarray([1], np.float32), "y": np.asarray([2], np.float32)},
+)[0]
+np.testing.assert_array_equal(output, np.asarray([3], np.float32))
+logger = tensorrt.Logger(tensorrt.Logger.ERROR)
+assert tensorrt.Builder(logger) is not None
+
+tokenizer = PaligemmaTokenizer(48)
+tokens, mask = tokenizer.tokenize("combined runtime smoke")
+assert tokens.shape == mask.shape == (48,)
+assert config.get_config("pi05_libero_l09_snapflow").name == "pi05_libero_l09_snapflow"
+assert config.get_config("pi05_droid_l09_snapflow").name == "pi05_droid_l09_snapflow"
+assert issubclass(TensorRTPolicy, base_policy.BasePolicy)
+assert WebsocketPolicyServer is not None
+assert msgpack_numpy.Packer().pack({"probe": np.asarray([1], np.int32)})
+print(actual, torch.cuda.get_device_name(0), session.get_providers())
+PY
+}
+verify_combined_image "$LIBERO_TENSORRT_POLICY_IMAGE" v2 "$LIBERO_LEROBOT_SHA"
+verify_combined_image "$DROID_RUNTIME_IMAGE" v3 "$DROID_LEROBOT_SHA"
+smoke_combined_image "$LIBERO_TENSORRT_POLICY_IMAGE" v2 0.1.0
+smoke_combined_image "$DROID_RUNTIME_IMAGE" v3 0.4.3
 ```
 
-Resolve each pushed repository digest, pull it by digest, repeat the label and
-network-disabled GPU/import smokes, and record the compiler plus combined image
-digests. A tag is never a runtime identity. The pinned Dockerfile arguments are
-part of the reproduction contract and must not be overridden.
+Record the compiler plus combined image digests. A tag is never a runtime
+identity. The pinned Dockerfile arguments are part of the reproduction
+contract and must not be overridden.
 
 LIBERO has one additional image layer because the official simulator needs its
 separate pinned Python 3.8 environment. Resolve the v2 combined digest, then
 build and push the final evaluator from that digest:
 
 ```bash
-export LIBERO_POLICY_TAG="tensorrt-policy-libero-$SOURCE_COMMIT"
-export LIBERO_POLICY_DIGEST="$(aws ecr describe-images --region us-east-2 \
-  --repository-name pi05-repro --image-ids imageTag="$LIBERO_POLICY_TAG" \
-  --query 'imageDetails[0].imageDigest' --output text)"
-export LIBERO_TENSORRT_POLICY_IMAGE="$ECR_REPOSITORY@$LIBERO_POLICY_DIGEST"
 export LIBERO_EVALUATOR_LOCAL="pi05-libero-tensorrt-evaluator:$SOURCE_COMMIT"
 export LIBERO_EVALUATOR_TAG="libero-tensorrt-evaluator-$SOURCE_COMMIT"
 
-docker pull "$LIBERO_TENSORRT_POLICY_IMAGE"
 git archive --format=tar "$SOURCE_COMMIT" | docker build --platform linux/amd64 --pull=false \
   --file repro/Dockerfile.libero \
   --build-arg POLICY_BASE_IMAGE="$LIBERO_TENSORRT_POLICY_IMAGE" \

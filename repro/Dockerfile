@@ -112,7 +112,7 @@ RUN TRANSFORMERS_DIR="$(python -c 'import pathlib, transformers; print(pathlib.P
 
 RUN python -c "import importlib.metadata as m, importlib.util, onnx, onnxruntime, torch; expected = {'jax': '0.5.3', 'jaxlib': '0.5.3', 'onnx': '1.17.0', 'onnxruntime-gpu': '1.28.0', 'pytest': '8.4.1', 'torch': '2.7.1', 'torchcodec': '0.4.0', 'torchvision': '0.22.1', 'transformers': '4.53.2'}; actual = {name: m.version(name).split('+', 1)[0] for name in expected}; print(actual, torch.version.cuda, onnx.__version__, onnxruntime.__version__); assert actual == expected, (actual, expected); assert all(importlib.util.find_spec(name) is None for name in ('gym_aloha', 'mujoco')); assert onnx.__version__ == expected['onnx']; assert onnxruntime.__version__ == expected['onnxruntime-gpu']; assert torch.version.cuda == '12.8', torch.version.cuda" \
     && python -c "from openpi.training import config; assert config.get_config('pi05_libero_l09_distill').name == 'pi05_libero_l09_distill'; assert config.get_config('pi05_droid_l09_distill').name == 'pi05_droid_l09_distill'" \
-    && python -c "from torchcodec.decoders import VideoDecoder; print(VideoDecoder)" \
+    && python scripts/smoke_lerobot_video.py \
     && if [ "${LEROBOT_RUNTIME}" = "v3" ]; then \
          python -c "import importlib.metadata as m; from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata; expected = {'av': '15.1.0', 'datasets': '4.1.1', 'huggingface-hub': '0.35.3', 'lerobot': '0.4.3', 'pyarrow': '25.0.0'}; actual = {name: m.version(name) for name in expected}; print(LeRobotDataset, LeRobotDatasetMetadata, actual); assert actual == expected, (actual, expected)"; \
        else \
@@ -126,6 +126,7 @@ LABEL ai.openpi.lerobot-runtime=${LEROBOT_RUNTIME}
 LABEL ai.openpi.lerobot-revision=${LEROBOT_SHA}
 LABEL ai.openpi.paligemma-tokenizer-sha256=${PALIGEMMA_TOKENIZER_SHA256}
 LABEL ai.openpi.simulator-runtime="external"
+LABEL ai.openpi.video-decoder="pyav"
 LABEL org.opencontainers.image.title="pi05-aws-repro"
 
 ENTRYPOINT []

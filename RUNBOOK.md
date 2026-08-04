@@ -234,6 +234,8 @@ verify_training_image() {
     "$lerobot_sha"
   test "$(docker image inspect --format '{{index .Config.Labels "ai.openpi.paligemma-tokenizer-sha256"}}' "$image")" = \
     "$PALIGEMMA_TOKENIZER_SHA256"
+  test "$(docker image inspect --format '{{index .Config.Labels "ai.openpi.video-decoder"}}' "$image")" = \
+    pyav
 }
 smoke_policy_image() {
   local image="$1" runtime="$2"
@@ -251,9 +253,12 @@ import onnx
 import onnxruntime as ort
 import torch
 
+from scripts.smoke_lerobot_video import smoke_pyav_decoder
+
 assert torch.cuda.is_available()
 torch_value = torch.ones(1, device="cuda")
 assert torch_value.item() == 1
+smoke_pyav_decoder()
 
 devices = jax.devices()
 assert any(device.platform == "gpu" for device in devices), devices

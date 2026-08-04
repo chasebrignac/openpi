@@ -7,6 +7,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 POLICY_DOCKERFILE = ROOT / "repro/Dockerfile.tensorrt-policy"
 COMPILER_DOCKERFILE = ROOT / "repro/Dockerfile.tensorrt"
 TRAINING_DOCKERFILE = ROOT / "repro/Dockerfile"
+EXPORT_RUNBOOK = ROOT / "repro/EXPORT_RUNBOOK.md"
 
 
 def _arg(text: str, name: str) -> str:
@@ -199,3 +200,24 @@ def test_build_smokes_do_not_claim_target_gpu_validation():
         assert forbidden not in policy
     assert "do not" in policy[policy.index("# These checks are imports") :].lower()
     assert "GPU validation" in policy
+
+
+def test_both_combined_digests_receive_network_disabled_gpu_policy_smokes():
+    runbook = EXPORT_RUNBOOK.read_text()
+    pulls_end = runbook.index('docker pull "$DROID_RUNTIME_IMAGE"')
+    smoke_definition = runbook.index("smoke_combined_image()")
+    libero_smoke = runbook.index('smoke_combined_image "$LIBERO_TENSORRT_POLICY_IMAGE" v2 0.1.0')
+    droid_smoke = runbook.index('smoke_combined_image "$DROID_RUNTIME_IMAGE" v3 0.4.3')
+
+    assert pulls_end < smoke_definition < libero_smoke < droid_smoke
+    assert "--pull=never --gpus all --network none" in runbook
+    assert "session.disable_cpu_ep_fallback" in runbook
+    assert 'providers=["CUDAExecutionProvider"]' in runbook
+    assert "tensorrt.Builder(logger)" in runbook
+    assert "from openpi.exporting.tensorrt_policy import TensorRTPolicy" in runbook
+    assert "from openpi.serving.websocket_policy_server import WebsocketPolicyServer" in runbook
+    assert "from openpi_client import base_policy, msgpack_numpy" in runbook
+    assert 'config.get_config("pi05_libero_l09_snapflow")' in runbook
+    assert 'config.get_config("pi05_droid_l09_snapflow")' in runbook
+    assert 'verify_combined_image "$LIBERO_TENSORRT_POLICY_IMAGE" v2 "$LIBERO_LEROBOT_SHA"' in runbook
+    assert 'verify_combined_image "$DROID_RUNTIME_IMAGE" v3 "$DROID_LEROBOT_SHA"' in runbook

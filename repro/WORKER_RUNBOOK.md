@@ -76,7 +76,7 @@ printf 'source.commit=%s\nsource.s3_uri=%s\nsource.version_id=%s\nsource.sha256=
   "$SOURCE_COMMIT" "$SOURCE_BUNDLE_S3_URI" "$SOURCE_VERSION_ID" "$SOURCE_BUNDLE_SHA256"
 ```
 
-Copy the three printed values into the worker spec. Never substitute a later
+Copy the four printed values into the worker spec. Never substitute a later
 unversioned `head-object` result for the captured `source.version_id`.
 
 ## 2. Write and validate a worker spec

@@ -55,7 +55,8 @@
     "base_container": {
       "uri": "763104351884.dkr.ecr.us-east-2.amazonaws.com/pytorch-training@sha256:f861e28dd9b8ecc86722bd37306b2f7b7e74336bc9c98dba37223cf031d04a7a",
       "source_tag": "2.7.1-gpu-py312-cu128-ubuntu22.04-ec2-v1.42-2026-04-22-18-04-12",
-      "worker_image_purpose": "policy"
+      "worker_image_purpose": "policy",
+      "video_decoder": "pyav"
     },
     "tensorrt_container": {
       "uri": "nvcr.io/nvidia/tensorrt@sha256:7cd94ee931d2b5b85ad1c5af723d485b2625f6ce167e1e4abe577850b96ceac3",

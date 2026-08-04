@@ -954,6 +954,7 @@ def test_image_digest_must_carry_the_pinned_source_revision(tmp_path):
         "ai.openpi.image-purpose": "policy",
         "ai.openpi.lerobot-runtime": "v2",
         "ai.openpi.lerobot-revision": "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
+        "ai.openpi.video-decoder": "pyav",
     }
     assert repro_worker.validate_image_identity(spec, [spec["image"]["uri"]], labels) == [spec["image"]["uri"]]
 
@@ -969,6 +970,10 @@ def test_image_digest_must_carry_the_pinned_source_revision(tmp_path):
     wrong_runtime = {**labels, "ai.openpi.lerobot-runtime": "v3"}
     with pytest.raises(repro_worker.WorkerError, match="LeRobot runtime"):
         repro_worker.validate_image_identity(spec, [spec["image"]["uri"]], wrong_runtime)
+
+    wrong_decoder = {**labels, "ai.openpi.video-decoder": "torchcodec"}
+    with pytest.raises(repro_worker.WorkerError, match="video decoder"):
+        repro_worker.validate_image_identity(spec, [spec["image"]["uri"]], wrong_decoder)
 
     wrong_purpose = {**labels, "ai.openpi.image-purpose": "tensorrt-compiler"}
     with pytest.raises(repro_worker.WorkerError, match="purpose label"):

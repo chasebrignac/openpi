@@ -46,6 +46,10 @@ def test_training_container_pins_match_reproduction_config() -> None:
     assert "config.get_config('pi05_libero_l09_distill')" in dockerfile
     assert "config.get_config('pi05_droid_l09_distill')" in dockerfile
     assert 'LABEL ai.openpi.simulator-runtime="external"' in dockerfile
+    assert reproduction["aws"]["base_container"]["video_decoder"] == "pyav"
+    assert f'LABEL ai.openpi.video-decoder="{reproduction["aws"]["base_container"]["video_decoder"]}"' in dockerfile
+    assert "python scripts/smoke_lerobot_video.py" in dockerfile
+    assert "from torchcodec.decoders import VideoDecoder" not in dockerfile
     for package_version in ("0.5.3", "1.17.0", "1.28.0", "2.7.1", "0.4.0", "0.22.1", "4.53.2"):
         assert package_version in dockerfile
 
@@ -140,6 +144,8 @@ def test_official_publication_uses_committed_amd64_context_and_both_registries()
     assert "ai.openpi.lerobot-revision" in runbook
     assert "ai.openpi.image-purpose" in runbook
     assert "ai.openpi.paligemma-tokenizer-sha256" in runbook
+    assert "ai.openpi.video-decoder" in runbook
+    assert "smoke_pyav_decoder()" in runbook
     assert "docker run --rm --gpus all --network none --user 1000:1000" in runbook
     assert "torch.cuda.is_available()" in runbook
     assert "jax.devices()" in runbook

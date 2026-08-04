@@ -207,6 +207,7 @@ def test_create_torch_dataset_filters_episodes_before_action_deltas(monkeypatch)
     )
 
     assert captured["episodes"] == [5, 11]
+    assert captured["video_backend"] == "pyav"
     assert captured["delta_timestamps"] == {"actions": [0.0, 0.1, 0.2]}
 
 
@@ -246,6 +247,7 @@ def test_lerobot_v2_uses_whole_episode_view_without_noncontiguous_constructor_id
     )
 
     assert captured["episodes"] is None
+    assert captured["video_backend"] == "pyav"
     assert [dataset[index] for index in range(len(dataset))] == [0, 1, 2, 5, 6, 7, 8]
 
 

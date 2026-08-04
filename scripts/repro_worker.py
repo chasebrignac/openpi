@@ -65,6 +65,7 @@ LEROBOT_REVISIONS = {
     "v2": "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
     "v3": "0b067df57d21d3a02d6c511f1609172fa39ac29b",
 }
+POLICY_VIDEO_DECODER = "pyav"
 IMAGE_PURPOSE_POLICY = "policy"
 IMAGE_PURPOSE_LIBERO_EVALUATOR = "libero-evaluator"
 IMAGE_PURPOSE_TENSORRT_COMPILER = "tensorrt-compiler"
@@ -1736,6 +1737,8 @@ def validate_image_identity(spec: Mapping[str, Any], repo_digests: Any, labels: 
             or labels.get("ai.openpi.lerobot-revision") != spec["image"]["lerobot_revision"]
         ):
             raise WorkerError("pulled policy image LeRobot runtime labels do not match the worker spec")
+        if labels.get("ai.openpi.video-decoder") != POLICY_VIDEO_DECODER:
+            raise WorkerError("pulled policy image video decoder label does not match the reproduction contract")
     elif purpose == IMAGE_PURPOSE_LIBERO_EVALUATOR:
         expected_labels = {
             "ai.openpi.policy-backend": spec["image"]["policy_backend"],
