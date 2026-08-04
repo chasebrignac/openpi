@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from openpi.training import config as training_config
+from openpi.training import data_loader as training_data_loader
 from scripts import train_pytorch
 
 
@@ -305,6 +306,60 @@ def test_one_batch_overfit_gate_is_explicit_and_fail_closed():
         )
     with pytest.raises(ValueError, match="at least 40"):
         train_pytorch.evaluate_one_batch_overfit([1.0, 0.7], minimum_relative_decline=0.2)
+
+
+def test_one_batch_mode_requires_explicit_zero_loader_workers():
+    config = types.SimpleNamespace(
+        one_batch_overfit=True,
+        resume=False,
+        num_train_steps=300,
+        one_batch_overfit_min_relative_decline=0.2,
+        num_workers=0,
+    )
+    train_pytorch.validate_training_mode(config)
+
+    config.num_workers = 4
+    with pytest.raises(ValueError, match="--num-workers 0"):
+        train_pytorch.validate_training_mode(config)
+
+
+def test_disabled_wandb_never_constructs_a_sample_loader(monkeypatch):
+    config = types.SimpleNamespace(wandb_enabled=False, one_batch_overfit=True)
+    monkeypatch.setattr(
+        training_data_loader,
+        "create_data_loader",
+        lambda *_args, **_kwargs: pytest.fail("disabled W&B constructed a sample loader"),
+    )
+
+    assert (
+        train_pytorch.materialize_wandb_sample_batch(
+            config,
+            is_main=True,
+            resuming=False,
+            overfit_batch=object(),
+        )
+        is None
+    )
+
+
+def test_one_batch_wandb_reuses_the_materialized_training_batch(monkeypatch):
+    config = types.SimpleNamespace(wandb_enabled=True, one_batch_overfit=True)
+    batch = object()
+    monkeypatch.setattr(
+        training_data_loader,
+        "create_data_loader",
+        lambda *_args, **_kwargs: pytest.fail("one-batch W&B constructed a second loader"),
+    )
+
+    assert (
+        train_pytorch.materialize_wandb_sample_batch(
+            config,
+            is_main=True,
+            resuming=False,
+            overfit_batch=batch,
+        )
+        is batch
+    )
 
 
 def test_counter_seed_is_resume_stable_and_overfit_locks_every_microstep():

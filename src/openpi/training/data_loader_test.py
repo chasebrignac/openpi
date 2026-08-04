@@ -178,7 +178,7 @@ def test_offline_holdout_rejects_nonpositive_or_oversized_split():
         _data_loader.select_offline_episode_split(records, holdout_samples=5, seed=0)
 
 
-def test_create_torch_dataset_filters_episodes_before_action_deltas(monkeypatch):
+def test_lerobot_v3_keeps_native_filter_for_small_episode_subset(monkeypatch):
     captured = {}
 
     class FakeMetadata:
@@ -192,7 +192,13 @@ def test_create_torch_dataset_filters_episodes_before_action_deltas(monkeypatch)
             captured.update(kwargs)
 
         def __len__(self):
-            return 0
+            return 9
+
+    records = (
+        _data_loader.EpisodeRecord(episode_id=5, frames=3, start_index=0),
+        _data_loader.EpisodeRecord(episode_id=11, frames=2, start_index=3),
+        _data_loader.EpisodeRecord(episode_id=19, frames=4, start_index=5),
+    )
 
     monkeypatch.setattr(_data_loader.lerobot_dataset, "LeRobotDataset", FakeLeRobotDataset)
     data_config = _config.DataConfig(repo_id="test/repo", prompt_from_task=False)
@@ -202,21 +208,23 @@ def test_create_torch_dataset_filters_episodes_before_action_deltas(monkeypatch)
         data_config,
         action_horizon=3,
         model_config=model_config,
-        episodes=(5, 11),
+        episodes=(11,),
+        episode_records=records,
         dataset_meta=FakeMetadata(),
     )
 
-    assert captured["episodes"] == [5, 11]
+    assert captured["episodes"] == [11]
     assert captured["video_backend"] == "pyav"
     assert captured["delta_timestamps"] == {"actions": [0.0, 0.1, 0.2]}
 
 
-def test_lerobot_v2_uses_whole_episode_view_without_noncontiguous_constructor_ids(monkeypatch):
+@pytest.mark.parametrize("codebase_version", ["v2.0", "v3.0"])
+def test_large_lerobot_split_uses_whole_episode_view_without_materializing_filter(monkeypatch, codebase_version):
     captured = {}
 
     class FakeMetadata:
         def __init__(self):
-            self.info = {"codebase_version": "v2.0"}
+            self.info = {"codebase_version": codebase_version}
             self.fps = 10
             self.tasks = {0: "pick banana"}
 

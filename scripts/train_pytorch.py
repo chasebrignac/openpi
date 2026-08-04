@@ -155,6 +155,36 @@ def build_datasets(config: _config.TrainConfig):
     return data_loader, data_loader.data_config()
 
 
+def validate_training_mode(config: _config.TrainConfig) -> None:
+    """Fail before any checkpoint or external-logging mutation for an unsafe diagnostic config."""
+    if config.one_batch_overfit and config.resume:
+        raise ValueError("one-batch diagnostics cannot resume because their complete loss history is part of the gate")
+    if config.one_batch_overfit and config.num_train_steps < 40:
+        raise ValueError("one-batch diagnostics require at least 40 optimizer steps for first/last-20 windows")
+    if config.one_batch_overfit and config.one_batch_overfit_min_relative_decline < 0.20:
+        raise ValueError("one-batch diagnostics require at least a 20% relative loss-decline gate")
+    if config.one_batch_overfit and config.num_workers != 0:
+        raise ValueError("one-batch diagnostics require explicit --num-workers 0 to avoid dataset worker duplication")
+
+
+def materialize_wandb_sample_batch(
+    config: _config.TrainConfig,
+    *,
+    is_main: bool,
+    resuming: bool,
+    overfit_batch,
+):
+    """Return a W&B image batch without duplicating a one-batch diagnostic loader."""
+    if not is_main or not config.wandb_enabled or resuming:
+        return None
+    if config.one_batch_overfit:
+        if overfit_batch is None:
+            raise ValueError("one-batch W&B sampling requires the already materialized training batch")
+        return overfit_batch
+    sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
+    return next(iter(sample_data_loader))
+
+
 def validate_training_split_metadata(config: _config.TrainConfig, loader) -> dict | None:
     metadata = loader.split_metadata()
     if not config.offline_holdout_samples:
@@ -939,12 +969,7 @@ def log_memory_usage(device, step, phase="unknown"):
 
 
 def train_loop(config: _config.TrainConfig):
-    if config.one_batch_overfit and config.resume:
-        raise ValueError("one-batch diagnostics cannot resume because their complete loss history is part of the gate")
-    if config.one_batch_overfit and config.num_train_steps < 40:
-        raise ValueError("one-batch diagnostics require at least 40 optimizer steps for first/last-20 windows")
-    if config.one_batch_overfit and config.one_batch_overfit_min_relative_decline < 0.20:
-        raise ValueError("one-batch diagnostics require at least a 20% relative loss-decline gate")
+    validate_training_mode(config)
     use_ddp, _local_rank, device = setup_ddp()
     process_rank = dist.get_rank() if use_ddp else 0
     is_main = process_rank == 0
@@ -994,11 +1019,15 @@ def train_loop(config: _config.TrainConfig):
     if is_main and config.one_batch_overfit:
         logging.info("One-batch overfit mode: repeating one materialized batch with fixed noise/time/mask")
 
-    # Log sample images to wandb on first batch
-    if is_main and config.wandb_enabled and not resuming:
-        # Create a separate data loader for sample batch to avoid consuming the main loader
-        sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
-        sample_batch = next(iter(sample_data_loader))
+    # Log sample images to W&B on the first batch. One-batch diagnostics reuse
+    # their sole materialized batch, and disabled W&B never constructs a loader.
+    sample_batch = materialize_wandb_sample_batch(
+        config,
+        is_main=is_main,
+        resuming=resuming,
+        overfit_batch=overfit_batch,
+    )
+    if sample_batch is not None:
         # Convert observation and actions to torch tensors
         observation, actions = sample_batch
         sample_batch = observation.to_dict()
@@ -1019,11 +1048,10 @@ def train_loop(config: _config.TrainConfig):
 
         # Clear sample batch from memory aggressively
         del sample_batch, observation, actions, images_to_log, img_concatenated
-        del sample_data_loader  # Also delete the sample data loader
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        logging.info("Cleared sample batch and data loader from memory")
+        logging.info("Cleared W&B sample batch from memory")
 
     # Build model
     if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):

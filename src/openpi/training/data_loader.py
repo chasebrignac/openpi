@@ -499,11 +499,20 @@ def create_torch_dataset(
     root = _lerobot_root(data_config)
     dataset_meta = dataset_meta or _load_lerobot_metadata(data_config)
     codebase_version = str(dataset_meta.info.get("codebase_version", ""))
-    # The pinned v2 loader indexes action deltas by absolute episode ID even
-    # after loading an arbitrary episode subset. Load its full local dataset
-    # and apply a compact whole-episode frame view instead. The v3 loader has
-    # an explicit absolute-to-relative map and safely filters in its constructor.
-    constructor_episodes = None if codebase_version.startswith("v2.") else episodes
+    # The pinned v2 loader indexes action deltas by absolute episode ID after
+    # loading a subset, so it always needs a full-dataset view. The pinned v3
+    # constructor is safe for a small subset, but eagerly materializes the
+    # filtered Arrow table and a Python absolute-to-relative entry for every
+    # selected frame. A training split that is most of the dataset is therefore
+    # cheaper as a memory-mapped full dataset plus this module's compact episode
+    # range view. Both paths preserve absolute indices and whole-episode bounds.
+    use_episode_view = codebase_version.startswith("v2.")
+    if codebase_version.startswith("v3.") and episodes is not None and episode_records is not None:
+        selected_ids = set(episodes)
+        selected_frames = sum(record.frames for record in episode_records if record.episode_id in selected_ids)
+        total_frames = sum(record.frames for record in episode_records)
+        use_episode_view = selected_frames * 2 > total_frames
+    constructor_episodes = None if use_episode_view else episodes
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         root=root,
@@ -521,7 +530,7 @@ def create_torch_dataset(
     )
     if episodes is not None and constructor_episodes is None:
         if episode_records is None:
-            raise ValueError("LeRobot v2 episode filtering requires normalized episode metadata")
+            raise ValueError("A whole-episode dataset view requires normalized episode metadata")
         dataset = EpisodeFilteredDataset(dataset, episode_records, episodes)
 
     standard_tasks = normalize_lerobot_tasks(dataset_meta.tasks)
