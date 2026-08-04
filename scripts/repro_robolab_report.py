@@ -4,18 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import pathlib
 import re
 import statistics
 from typing import Any
+import urllib.parse
 
 if __package__:
-    from scripts.repro_make_golden import sha256_file
     from scripts.repro_promotion_report import validate_evidence_provenance
 else:
-    from repro_make_golden import sha256_file
     from repro_promotion_report import validate_evidence_provenance
 
 
@@ -34,6 +34,16 @@ EPISODES_PER_TASK = {"intermediate": 50, "final": 200}
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _IMAGE_DIGEST_RE = re.compile(r"(?:.+@)?sha256:[0-9a-f]{64}")
 _STAGE_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+_CONFIG_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _require_sha256(value: Any, label: str) -> str:
@@ -85,14 +95,14 @@ def _finite_number(value: Any, label: str) -> float:
     return float(value)
 
 
-def validate_native_results(
+def _validate_native_records(
     records: list[dict[str, Any]],
     *,
     mode: str,
     num_envs: int,
     num_runs: int,
+    require_complete: bool,
 ) -> dict[tuple[str, int], dict[str, Any]]:
-    """Validate the exact schema/count contract emitted by pinned RoboLab."""
     if mode not in EPISODES_PER_TASK:
         raise ValueError(f"Unknown RoboLab evaluation mode: {mode}")
     if (
@@ -110,8 +120,10 @@ def validate_native_results(
             f"{mode} requires exactly {episodes_per_task} episodes/task; num_envs*num_runs is {num_envs * num_runs}"
         )
     expected_total = episodes_per_task * len(TASKS)
-    if len(records) != expected_total:
+    if require_complete and len(records) != expected_total:
         raise ValueError(f"RoboLab results contain {len(records)} episodes; exactly {expected_total} are required")
+    if not require_complete and len(records) > expected_total:
+        raise ValueError(f"RoboLab partial results exceed the exact {expected_total}-episode contract")
 
     indexed: dict[tuple[str, int], dict[str, Any]] = {}
     for record_index, record in enumerate(records):
@@ -159,9 +171,84 @@ def validate_native_results(
     expected_keys = {(task, episode) for task in TASKS for episode in range(episodes_per_task)}
     missing = sorted(expected_keys - indexed.keys())
     extra = sorted(indexed.keys() - expected_keys)
-    if missing or extra:
+    if extra or (require_complete and missing):
         raise ValueError(f"RoboLab episode identities are not exact: missing={missing[:5]}, extra={extra[:5]}")
     return indexed
+
+
+def validate_native_results(
+    records: list[dict[str, Any]],
+    *,
+    mode: str,
+    num_envs: int,
+    num_runs: int,
+) -> dict[tuple[str, int], dict[str, Any]]:
+    """Validate the exact schema/count contract emitted by pinned RoboLab."""
+
+    return _validate_native_records(
+        records,
+        mode=mode,
+        num_envs=num_envs,
+        num_runs=num_runs,
+        require_complete=True,
+    )
+
+
+def complete_native_run_prefix(
+    records: list[dict[str, Any]],
+    *,
+    mode: str,
+    num_envs: int,
+    num_runs: int,
+) -> list[dict[str, Any]]:
+    """Return only the strict prefix of complete RoboLab run batches.
+
+    A process can be interrupted while its ten JSONL records are being
+    appended. RoboLab reruns an incomplete batch, so only whole, ordered
+    ``(task, run)`` groups are safe continuation state.
+    """
+
+    indexed = _validate_native_records(
+        records,
+        mode=mode,
+        num_envs=num_envs,
+        num_runs=num_runs,
+        require_complete=False,
+    )
+    expected_groups = [(task, run) for task in TASKS for run in range(num_runs)]
+    observed_by_group: dict[tuple[str, int], set[int]] = {}
+    for (task, _episode), record in indexed.items():
+        observed_by_group.setdefault((task, int(record["run"])), set()).add(int(record["env_id"]))
+    expected_envs = set(range(num_envs))
+    complete_groups = {group for group, env_ids in observed_by_group.items() if env_ids == expected_envs}
+    prefix_length = 0
+    while prefix_length < len(expected_groups) and expected_groups[prefix_length] in complete_groups:
+        prefix_length += 1
+    prefix_groups = set(expected_groups[:prefix_length])
+    if complete_groups != prefix_groups:
+        raise ValueError("RoboLab partial results contain a complete run beyond the resumable prefix")
+    incomplete_groups = set(observed_by_group) - complete_groups
+    permitted_incomplete = {expected_groups[prefix_length]} if prefix_length < len(expected_groups) else set()
+    if incomplete_groups - permitted_incomplete:
+        raise ValueError("RoboLab partial results contain out-of-order incomplete run batches")
+    return [
+        indexed[(task, run * num_envs + env_id)]
+        for task, run in expected_groups[:prefix_length]
+        for env_id in range(num_envs)
+    ]
+
+
+def validate_native_continuation(
+    records: list[dict[str, Any]],
+    *,
+    mode: str,
+    num_envs: int,
+    num_runs: int,
+) -> dict[tuple[str, int], dict[str, Any]]:
+    complete = complete_native_run_prefix(records, mode=mode, num_envs=num_envs, num_runs=num_runs)
+    if len(complete) != len(records):
+        raise ValueError("RoboLab continuation contains an incomplete run batch")
+    return {(str(record["task_name"]), int(record["episode"])): record for record in complete}
 
 
 def create_run_identity(
@@ -176,6 +263,14 @@ def create_run_identity(
     policy_server_seed: int,
     image_digest: str,
     robolab_git_sha: str,
+    policy_image_digest: str,
+    policy_source_s3_uri: str,
+    policy_source_version_id: str,
+    policy_source_sha256: str,
+    policy_source_commit: str,
+    policy_config: str,
+    policy_command_sha256: str,
+    checkpoint_model_identity_path: str | None = None,
 ) -> dict[str, Any]:
     """Create a portable sidecar that binds a model hash to one native result file."""
     stage = _require_stage(stage)
@@ -183,6 +278,25 @@ def create_run_identity(
         raise ValueError(f"RoboLab must be pinned to {ROBOLAB_GIT_SHA}")
     if _IMAGE_DIGEST_RE.fullmatch(image_digest) is None:
         raise ValueError("image_digest must be an immutable sha256 digest or repository@digest")
+    if _IMAGE_DIGEST_RE.fullmatch(policy_image_digest) is None:
+        raise ValueError("policy_image_digest must be an immutable sha256 digest or repository@digest")
+    if not isinstance(policy_source_commit, str) or _COMMIT_RE.fullmatch(policy_source_commit) is None:
+        raise ValueError("policy_source_commit must be a full lowercase Git SHA")
+    source_uri = urllib.parse.urlsplit(policy_source_s3_uri)
+    if (
+        source_uri.scheme != "s3"
+        or not source_uri.netloc
+        or source_uri.path.lstrip("/") != f"source/openpi-{policy_source_commit}-complete.bundle"
+        or source_uri.query
+        or source_uri.fragment
+    ):
+        raise ValueError("policy_source_s3_uri must identify the commit-qualified complete source bundle")
+    if not policy_source_version_id or any(character in policy_source_version_id for character in "\x00\r\n"):
+        raise ValueError("policy_source_version_id must be a non-empty immutable version")
+    _require_sha256(policy_source_sha256, "policy source hash")
+    if not isinstance(policy_config, str) or _CONFIG_RE.fullmatch(policy_config) is None:
+        raise ValueError("policy_config is invalid")
+    _require_sha256(policy_command_sha256, "policy command hash")
     if isinstance(policy_server_seed, bool) or not isinstance(policy_server_seed, int) or policy_server_seed < 0:
         raise ValueError("policy_server_seed must be a non-negative integer")
     checkpoint_model = checkpoint_model.expanduser().resolve()
@@ -202,7 +316,10 @@ def create_run_identity(
         "benchmark": "robolab",
         "stage": stage,
         "stage_identity": stage_identity(stage, model_hash),
-        "checkpoint": {"model_path": str(checkpoint_model), "model_sha256": model_hash},
+        "checkpoint": {
+            "model_path": checkpoint_model_identity_path or str(checkpoint_model),
+            "model_sha256": model_hash,
+        },
         "results": {"path": result_path, "sha256": sha256_file(results)},
         "runtime": {
             "image_digest": image_digest,
@@ -210,6 +327,18 @@ def create_run_identity(
             "openpi_client_git_sha": ROBOLAB_OPENPI_CLIENT_GIT_SHA,
             "isaac_sim_version": ISAAC_SIM_VERSION,
             "isaac_lab_version": ISAAC_LAB_VERSION,
+        },
+        "policy_server": {
+            "image_digest": policy_image_digest,
+            "source": {
+                "s3_uri": policy_source_s3_uri,
+                "version_id": policy_source_version_id,
+                "sha256": policy_source_sha256,
+                "commit": policy_source_commit,
+            },
+            "config": policy_config,
+            "command_sha256": policy_command_sha256,
+            "checkpoint_model_sha256": model_hash,
         },
         "evaluation": {
             "mode": mode,
@@ -237,8 +366,9 @@ def _load_identity(path: pathlib.Path) -> tuple[dict[str, Any], dict[tuple[str, 
     checkpoint = identity.get("checkpoint")
     results = identity.get("results")
     runtime = identity.get("runtime")
+    policy_server = identity.get("policy_server")
     evaluation = identity.get("evaluation")
-    if not all(isinstance(value, dict) for value in (checkpoint, results, runtime, evaluation)):
+    if not all(isinstance(value, dict) for value in (checkpoint, results, runtime, policy_server, evaluation)):
         raise ValueError(f"RoboLab identity {path} is missing required objects")
 
     model_hash = _require_sha256(checkpoint.get("model_sha256"), "checkpoint model hash")
@@ -256,6 +386,43 @@ def _load_identity(path: pathlib.Path) -> tuple[dict[str, Any], dict[tuple[str, 
             raise ValueError(f"RoboLab identity {path} has unpinned runtime {key}")
     if _IMAGE_DIGEST_RE.fullmatch(str(runtime.get("image_digest", ""))) is None:
         raise ValueError(f"RoboLab identity {path} has no immutable image digest")
+
+    if set(policy_server) != {
+        "image_digest",
+        "source",
+        "config",
+        "command_sha256",
+        "checkpoint_model_sha256",
+    }:
+        raise ValueError(f"RoboLab identity {path} has an incomplete policy-server identity")
+    if _IMAGE_DIGEST_RE.fullmatch(str(policy_server.get("image_digest", ""))) is None:
+        raise ValueError(f"RoboLab identity {path} has no immutable policy image digest")
+    source = policy_server.get("source")
+    if not isinstance(source, dict) or set(source) != {"s3_uri", "version_id", "sha256", "commit"}:
+        raise ValueError(f"RoboLab identity {path} has an incomplete policy source identity")
+    if not isinstance(source.get("commit"), str) or _COMMIT_RE.fullmatch(source["commit"]) is None:
+        raise ValueError(f"RoboLab identity {path} has an invalid policy source commit")
+    source_uri = urllib.parse.urlsplit(str(source.get("s3_uri", "")))
+    if (
+        source_uri.scheme != "s3"
+        or not source_uri.netloc
+        or source_uri.path.lstrip("/") != f"source/openpi-{source['commit']}-complete.bundle"
+        or source_uri.query
+        or source_uri.fragment
+    ):
+        raise ValueError(f"RoboLab identity {path} has an invalid policy source URI")
+    if (
+        not isinstance(source.get("version_id"), str)
+        or not source["version_id"]
+        or any(character in source["version_id"] for character in "\x00\r\n")
+    ):
+        raise ValueError(f"RoboLab identity {path} has an invalid policy source version")
+    _require_sha256(source.get("sha256"), "policy source hash")
+    if not isinstance(policy_server.get("config"), str) or _CONFIG_RE.fullmatch(policy_server["config"]) is None:
+        raise ValueError(f"RoboLab identity {path} has an invalid policy config")
+    _require_sha256(policy_server.get("command_sha256"), "policy command hash")
+    if _require_sha256(policy_server.get("checkpoint_model_sha256"), "policy checkpoint hash") != model_hash:
+        raise ValueError(f"RoboLab identity {path} policy checkpoint differs from its sealed model")
 
     mode = evaluation.get("mode")
     if mode not in EPISODES_PER_TASK:
@@ -335,6 +502,8 @@ def build_report(
     expected_candidate_hash = provenance["student_checkpoint"]["model_sha256"]
     if candidate["checkpoint"]["model_sha256"] != expected_candidate_hash:
         raise ValueError("RoboLab candidate model does not match offline student checkpoint")
+    if candidate["policy_server"]["config"] != provenance["student_config"]["name"]:
+        raise ValueError("RoboLab candidate policy config does not match offline student config")
     if reference_model_sha256 is None:
         expected_reference_hash = provenance["teacher_checkpoint"]["model_sha256"]
         reference_source = "offline_teacher"
@@ -343,6 +512,8 @@ def build_report(
         reference_source = "explicit_base"
     if reference["checkpoint"]["model_sha256"] != expected_reference_hash:
         raise ValueError("RoboLab reference model does not match the required checkpoint")
+    if reference_model_sha256 is None and reference["policy_server"]["config"] != provenance["teacher_config"]["name"]:
+        raise ValueError("RoboLab reference policy config does not match offline teacher config")
 
     if reference["runtime"] != candidate["runtime"]:
         raise ValueError("Reference and candidate RoboLab runtime pins differ")
@@ -438,6 +609,10 @@ def build_report(
         },
         "evaluation": reference["evaluation"],
         "runtime": reference["runtime"],
+        "policy_server": {
+            "reference": reference["policy_server"],
+            "candidate": candidate["policy_server"],
+        },
         "task_evidence": task_evidence,
         "aggregate_motion_evidence": {
             "paired_ee_path_length_delta_mean": statistics.fmean(paired_path_deltas),
@@ -486,6 +661,13 @@ def parse_args() -> argparse.Namespace:
     seal.add_argument("--policy-server-seed", type=int, required=True)
     seal.add_argument("--image-digest", required=True)
     seal.add_argument("--robolab-git-sha", required=True)
+    seal.add_argument("--policy-image-digest", required=True)
+    seal.add_argument("--policy-source-s3-uri", required=True)
+    seal.add_argument("--policy-source-version-id", required=True)
+    seal.add_argument("--policy-source-sha256", required=True)
+    seal.add_argument("--policy-source-commit", required=True)
+    seal.add_argument("--policy-config", required=True)
+    seal.add_argument("--policy-command-sha256", required=True)
 
     report = subparsers.add_parser("report", help="compare two sealed runs and emit promotion evidence")
     report.add_argument("--reference-identity", type=pathlib.Path, required=True)
@@ -515,6 +697,13 @@ def main() -> int:
             policy_server_seed=args.policy_server_seed,
             image_digest=args.image_digest,
             robolab_git_sha=args.robolab_git_sha,
+            policy_image_digest=args.policy_image_digest,
+            policy_source_s3_uri=args.policy_source_s3_uri,
+            policy_source_version_id=args.policy_source_version_id,
+            policy_source_sha256=args.policy_source_sha256,
+            policy_source_commit=args.policy_source_commit,
+            policy_config=args.policy_config,
+            policy_command_sha256=args.policy_command_sha256,
         )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(identity, indent=2, sort_keys=True) + "\n")

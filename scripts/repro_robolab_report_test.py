@@ -80,6 +80,18 @@ def _write_jsonl(path: pathlib.Path, records: list[dict]) -> None:
     path.write_text("".join(json.dumps(record) + "\n" for record in records))
 
 
+def _policy_identity_kwargs(*, config: str) -> dict:
+    return {
+        "policy_image_digest": "sha256:" + "8" * 64,
+        "policy_source_s3_uri": "s3://pi05-test/source/openpi-" + "7" * 40 + "-complete.bundle",
+        "policy_source_version_id": "source-version",
+        "policy_source_sha256": "6" * 64,
+        "policy_source_commit": "7" * 40,
+        "policy_config": config,
+        "policy_command_sha256": "5" * 64,
+    }
+
+
 def _seal(
     root: pathlib.Path,
     *,
@@ -105,6 +117,7 @@ def _seal(
         policy_server_seed=7003,
         image_digest="sha256:" + "9" * 64,
         robolab_git_sha=repro_robolab_report.ROBOLAB_GIT_SHA,
+        **_policy_identity_kwargs(config="pi05_droid_jointpos" if stage == "base" else "pi05_droid_l09_distill"),
     )
     identity_path.write_text(json.dumps(identity))
     return identity_path, repro_robolab_report.sha256_file(model), results
@@ -173,6 +186,7 @@ def test_rejects_missing_or_extra_episode_instead_of_shrinking_count(tmp_path: p
             policy_server_seed=7,
             image_digest="sha256:" + "9" * 64,
             robolab_git_sha=repro_robolab_report.ROBOLAB_GIT_SHA,
+            **_policy_identity_kwargs(config="pi05_droid_jointpos"),
         )
 
 
@@ -206,6 +220,30 @@ def test_final_mode_requires_exactly_200_episodes_per_task():
         repro_robolab_report.validate_native_results(records, mode="final", num_envs=10, num_runs=5)
 
 
+def test_partial_continuation_keeps_only_complete_ordered_run_batches():
+    records = _records(successes=dict.fromkeys(repro_robolab_report.TASKS, 50))
+
+    assert (
+        len(repro_robolab_report.complete_native_run_prefix(records[:27], mode="intermediate", num_envs=10, num_runs=5))
+        == 20
+    )
+    complete = records[:30]
+    assert (
+        len(repro_robolab_report.validate_native_continuation(complete, mode="intermediate", num_envs=10, num_runs=5))
+        == 30
+    )
+    with pytest.raises(ValueError, match="incomplete run batch"):
+        repro_robolab_report.validate_native_continuation(records[:27], mode="intermediate", num_envs=10, num_runs=5)
+
+
+def test_partial_continuation_rejects_out_of_order_complete_batches():
+    records = _records(successes=dict.fromkeys(repro_robolab_report.TASKS, 50))
+    out_of_order = records[10:20]
+
+    with pytest.raises(ValueError, match="beyond the resumable prefix"):
+        repro_robolab_report.complete_native_run_prefix(out_of_order, mode="intermediate", num_envs=10, num_runs=5)
+
+
 def test_rejects_tampered_results_and_wrong_stage_identity(tmp_path: pathlib.Path):
     identity_path, _, results = _seal(
         tmp_path,
@@ -221,6 +259,34 @@ def test_rejects_tampered_results_and_wrong_stage_identity(tmp_path: pathlib.Pat
     identity["stage_identity"] = "base-sha256:" + "f" * 64
     identity_path.write_text(json.dumps(identity))
     with pytest.raises(ValueError, match="stage_identity"):
+        repro_robolab_report._load_identity(identity_path)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement", "message"),
+    [
+        (("policy_server", "image_digest"), "not-a-digest", "policy image digest"),
+        (("policy_server", "command_sha256"), "f" * 63, "policy command hash"),
+        (("policy_server", "checkpoint_model_sha256"), "f" * 64, "policy checkpoint"),
+        (("policy_server", "source", "commit"), "f" * 39, "policy source commit"),
+        (("policy_server", "source", "version_id"), "", "policy source version"),
+    ],
+)
+def test_identity_rejects_tampered_policy_server_pins(tmp_path, path, replacement, message):
+    identity_path, _, _ = _seal(
+        tmp_path,
+        stage="base",
+        model_bytes=b"teacher",
+        successes=dict.fromkeys(repro_robolab_report.TASKS, 50),
+    )
+    document = json.loads(identity_path.read_text())
+    target = document
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = replacement
+    identity_path.write_text(json.dumps(document))
+
+    with pytest.raises(ValueError, match=message):
         repro_robolab_report._load_identity(identity_path)  # noqa: SLF001
 
 

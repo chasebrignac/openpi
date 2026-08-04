@@ -266,6 +266,13 @@ def _identity(
         policy_server_seed=7,
         image_digest="sha256:" + "9" * 64,
         robolab_git_sha=robolab_expert_dataset.ROBOLAB_GIT_SHA,
+        policy_image_digest="sha256:" + "8" * 64,
+        policy_source_s3_uri="s3://pi05-test/source/openpi-" + "6" * 40 + "-complete.bundle",
+        policy_source_version_id="test-version",
+        policy_source_sha256="7" * 64,
+        policy_source_commit="6" * 40,
+        policy_config=f"pi05_droid_{stage}",
+        policy_command_sha256="5" * 64,
     )
     path.write_text(json.dumps(identity))
     return path
