@@ -406,6 +406,23 @@ def test_equivalence_gate_binds_exact_manifests_and_velocity_evidence(tmp_path):
     assert evidence["gate_pass"] is True
     assert evidence["report"]["sha256"] == repro_stage_data.sha256_file(report_path)
 
+    alias_root = tmp_path.parent / f"{tmp_path.name}-alias"
+    alias_root.symlink_to(tmp_path, target_is_directory=True)
+    report["velocities"]["path"] = str(alias_root / velocity_path.name)
+    report_path.write_text(json.dumps(report))
+    assert (
+        converted.validate_equivalence_report(report_path, spec, source_manifest_path, manifest_path, manifest)[
+            "gate_pass"
+        ]
+        is True
+    )
+
+    report["velocities"]["path"] = str(alias_root / "missing.npz")
+    report_path.write_text(json.dumps(report))
+    with pytest.raises(repro_stage_data.StageError, match="velocity evidence"):
+        converted.validate_equivalence_report(report_path, spec, source_manifest_path, manifest_path, manifest)
+
+    report["velocities"]["path"] = str(alias_root / velocity_path.name)
     report["gate_pass"] = False
     report_path.write_text(json.dumps(report))
     with pytest.raises(repro_stage_data.StageError, match="does not pass"):

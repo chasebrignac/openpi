@@ -262,6 +262,16 @@ def validate_saved_manifest(saved: Mapping[str, Any], rebuilt: Mapping[str, Any]
         )
 
 
+def _report_path_references(path_value: Any, expected: pathlib.Path) -> bool:
+    """Allow container/host aliases only when they resolve to one file."""
+    if not isinstance(path_value, str) or not path_value or not pathlib.Path(path_value).is_absolute():
+        return False
+    try:
+        return pathlib.Path(path_value).expanduser().resolve(strict=True) == expected.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+
+
 def validate_equivalence_report(
     report_path: pathlib.Path,
     spec: ConvertedCheckpointSpec,
@@ -333,7 +343,7 @@ def validate_equivalence_report(
     velocity_path = report_path.with_suffix(".npz").resolve()
     if (
         not isinstance(velocities, Mapping)
-        or velocities.get("path") != str(velocity_path)
+        or not _report_path_references(velocities.get("path"), velocity_path)
         or not velocity_path.is_file()
         or velocities.get("sha256") != repro_stage_data.sha256_file(velocity_path)
     ):
