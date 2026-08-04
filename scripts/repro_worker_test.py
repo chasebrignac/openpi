@@ -989,8 +989,22 @@ def test_docker_command_is_argv_digest_pinned_and_read_only(tmp_path):
         pathlib.Path("/opt/pi05/repo"),
         pathlib.Path("/opt/dlami/nvme"),
     )
-    assert command[:2] == ["docker", "run"]
-    assert command[command.index("--network") + 1] == "none"
+    hostname = "pi05-worker-a4b12b31c35ecbae6dedcf62f39d8446"
+    assert command[:12] == [
+        "docker",
+        "run",
+        "--name",
+        "pi05-shallow-libero-pilot-01",
+        "--hostname",
+        hostname,
+        "--add-host",
+        f"{hostname}:127.0.0.1",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+    ]
+    assert command.count("--hostname") == command.count("--add-host") == 1
     assert "type=bind,src=/opt/pi05/repo,dst=/workspace/openpi,readonly" in command
     assert "type=bind,src=/opt/dlami/nvme/inputs,dst=/mnt/openpi,readonly" in command
     assert "type=bind,src=/opt/dlami/nvme/output,dst=/output" not in command
@@ -1008,6 +1022,58 @@ def test_docker_command_is_argv_digest_pinned_and_read_only(tmp_path):
     image_index = command.index(spec["image"]["uri"])
     assert command[image_index + 1 :] == spec["container"]["command"]
     assert not any(part in {"sh", "bash", "-c"} for part in command[image_index + 1 :])
+
+
+def test_worker_container_hostname_is_deterministic_dns_safe_and_validated():
+    run_id = "a.with_docker-unsafe.hostname_punctuation"
+    first = repro_worker.worker_container_hostname(run_id)
+    assert first == repro_worker.worker_container_hostname(run_id)
+    assert len(first) <= 63
+    assert repro_worker.DOCKER_HOSTNAME_RE.fullmatch(first)
+    assert "." not in first
+    assert "_" not in first
+
+    for invalid in ("Uppercase", "-leading", "unsafe/name", "a" * 65, 7):
+        with pytest.raises(repro_worker.WorkerError, match="invalid run ID for Docker hostname"):
+            repro_worker.worker_container_hostname(invalid)
+
+
+def test_multi_process_torchrun_forces_loopback_transports_without_weakening_network_none(tmp_path):
+    spec = repro_worker.validate_worker_spec(make_resume_spec(tmp_path))
+    command = repro_worker.build_docker_command(spec, tmp_path / "source", tmp_path / "scratch")
+    seed_index = command.index("PI05_SEED=7")
+    assert command[seed_index + 1 : seed_index + 5] == [
+        "--env",
+        "NCCL_SOCKET_IFNAME=lo",
+        "--env",
+        "GLOO_SOCKET_IFNAME=lo",
+    ]
+    assert command[command.index("--network") + 1] == "none"
+    assert not any(item.startswith("MASTER_ADDR=") for item in command)
+
+    single_process = repro_worker.validate_worker_spec(make_spec(tmp_path))
+    single_command = repro_worker.build_docker_command(single_process, tmp_path / "source", tmp_path / "scratch")
+    assert "NCCL_SOCKET_IFNAME=lo" not in single_command
+    assert "GLOO_SOCKET_IFNAME=lo" not in single_command
+
+
+def test_multi_process_torchrun_loopback_contract_is_fail_closed(tmp_path):
+    for key in repro_worker.TORCHRUN_LOOPBACK_ENVIRONMENT:
+        override = make_resume_spec(tmp_path)
+        override["container"]["environment"][key] = "^docker0,lo"
+        with pytest.raises(repro_worker.WorkerError, match="unsafe container environment"):
+            repro_worker.validate_worker_spec(override)
+
+    symbolic_process_count = make_resume_spec(tmp_path)
+    option_index = symbolic_process_count["container"]["command"].index("--nproc-per-node=2")
+    symbolic_process_count["container"]["command"][option_index] = "--nproc-per-node=gpu"
+    with pytest.raises(repro_worker.WorkerError, match="explicit positive integer"):
+        repro_worker.validate_worker_spec(symbolic_process_count)
+
+    non_standalone = make_resume_spec(tmp_path)
+    non_standalone["container"]["command"].remove("--standalone")
+    with pytest.raises(repro_worker.WorkerError, match="network none requires --standalone"):
+        repro_worker.validate_worker_spec(non_standalone)
 
 
 def test_all_nested_mnt_openpi_mount_destinations_exist_before_readonly_handoff(tmp_path, monkeypatch):
@@ -1275,6 +1341,8 @@ def test_libero_evaluator_docker_command_renders_headless_gpu_contract(tmp_path)
     command = repro_worker.build_docker_command(spec, tmp_path / "source", tmp_path / "scratch")
     assert "NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics" in command
     assert "MUJOCO_EGL_DEVICE_ID=0" in command
+    assert "NCCL_SOCKET_IFNAME=lo" not in command
+    assert "GLOO_SOCKET_IFNAME=lo" not in command
     image_index = command.index(spec["image"]["uri"])
     assert command[image_index + 1 :] == spec["container"]["command"]
 

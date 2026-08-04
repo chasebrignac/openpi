@@ -51,6 +51,7 @@ RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+DOCKER_HOSTNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 INSTANCE_ID_RE = re.compile(r"^i-[0-9a-f]{17}$")
 INSTANCE_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,63}$")
 OUTPUT_KIND_ROOT = {
@@ -81,6 +82,10 @@ LIBERO_EVALUATOR_ENVIRONMENT = {
     "NVIDIA_DRIVER_CAPABILITIES": "compute,utility,graphics",
 }
 WORKER_OWNED_ENVIRONMENT = {"HOME", "PATH", "PYTHONDONTWRITEBYTECODE", "PYTHONPATH", "XDG_CACHE_HOME"}
+TORCHRUN_LOOPBACK_ENVIRONMENT = {
+    "NCCL_SOCKET_IFNAME": "lo",
+    "GLOO_SOCKET_IFNAME": "lo",
+}
 DROID_LAYOUT_CONTRACT = "molmoact2-v3-exact-media-references-v1"
 DROID_CAMERA_FILE_COUNTS = {
     "observation.images.exterior_1_left": 518,
@@ -377,6 +382,53 @@ def _single_command_option(command: Sequence[str], name: str, context: str) -> s
     if len(positions) != 1 or positions[0] + 1 >= len(command):
         raise WorkerError(f"{context} must contain exactly one {name} VALUE")
     return command[positions[0] + 1]
+
+
+def _torchrun_processes_per_node(command: Sequence[str]) -> int | None:
+    """Return the explicit local process count for a torchrun training argv."""
+
+    train_positions = [index for index, item in enumerate(command) if item == "scripts/train_pytorch.py"]
+    if len(train_positions) != 1:
+        return None
+    launcher = command[: train_positions[0]]
+    torchrun_positions = [
+        index for index, item in enumerate(launcher) if pathlib.PurePosixPath(item).name == "torchrun"
+    ]
+    if not torchrun_positions:
+        return None
+    if len(torchrun_positions) != 1:
+        raise WorkerError("training worker command must invoke torchrun exactly once")
+
+    option_names = ("--nproc-per-node", "--nproc_per_node")
+    values: list[str] = []
+    index = torchrun_positions[0] + 1
+    while index < len(launcher):
+        item = launcher[index]
+        if item in option_names:
+            if index + 1 >= len(launcher):
+                raise WorkerError("torchrun --nproc-per-node requires a value")
+            values.append(launcher[index + 1])
+            index += 2
+            continue
+        matching_names = [name for name in option_names if item.startswith(f"{name}=")]
+        if matching_names:
+            values.append(item.split("=", 1)[1])
+        index += 1
+    if not values:
+        return 1
+    if len(values) != 1 or re.fullmatch(r"[1-9][0-9]*", values[0]) is None:
+        raise WorkerError("torchrun --nproc-per-node must be one explicit positive integer")
+    return int(values[0])
+
+
+def _uses_multi_process_torchrun(command: Sequence[str]) -> bool:
+    processes = _torchrun_processes_per_node(command)
+    if processes is None or processes == 1:
+        return False
+    train_index = command.index("scripts/train_pytorch.py")
+    if command[:train_index].count("--standalone") != 1:
+        raise WorkerError("multi-process torchrun under network none requires --standalone exactly once")
+    return True
 
 
 def validate_compiled_pipeline_command(spec: Mapping[str, Any]) -> None:
@@ -717,6 +769,7 @@ def validate_worker_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
         or any(not isinstance(part, str) or not part or "\x00" in part for part in command)
     ):
         raise WorkerError("container.command must be a non-empty argv string list")
+    uses_multi_process_torchrun = _uses_multi_process_torchrun(command)
     environment = container.get("environment", {})
     if not isinstance(environment, dict):
         raise WorkerError("container.environment must be an object")
@@ -726,6 +779,7 @@ def validate_worker_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
             or ENV_RE.fullmatch(key) is None
             or key.startswith(("AWS_", "DOCKER_", "PI05_"))
             or key in WORKER_OWNED_ENVIRONMENT
+            or (uses_multi_process_torchrun and key in TORCHRUN_LOOPBACK_ENVIRONMENT)
             or not isinstance(value, str)
             or "\x00" in value
         ):
@@ -2004,6 +2058,18 @@ def verify_and_pull_image(spec: Mapping[str, Any], runner: CommandRunner) -> lis
     return validate_image_identity(spec, repo_digests, labels)
 
 
+def worker_container_hostname(run_id: str) -> str:
+    """Derive a stable DNS hostname without exposing run-ID punctuation to Docker."""
+
+    if not isinstance(run_id, str) or RUN_ID_RE.fullmatch(run_id) is None:
+        raise WorkerError(f"invalid run ID for Docker hostname: {run_id!r}")
+    digest = hashlib.sha256(run_id.encode()).hexdigest()[:32]
+    hostname = f"pi05-worker-{digest}"
+    if len(hostname) > 63 or DOCKER_HOSTNAME_RE.fullmatch(hostname) is None:
+        raise WorkerError("derived Docker hostname violates the DNS hostname contract")
+    return hostname
+
+
 def build_docker_command(
     spec: Mapping[str, Any],
     source_root: pathlib.Path,
@@ -2013,12 +2079,17 @@ def build_docker_command(
     instance_type: str | None = None,
 ) -> list[str]:
     run_id = spec["run_id"]
+    hostname = worker_container_hostname(run_id)
     output = scratch_root / "output"
     command = [
         "docker",
         "run",
         "--name",
         f"pi05-{run_id}",
+        "--hostname",
+        hostname,
+        "--add-host",
+        f"{hostname}:127.0.0.1",
         "--gpus",
         "all",
         "--network",
@@ -2075,6 +2146,12 @@ def build_docker_command(
         "--env",
         f"PI05_SEED={spec['seed']}",
     ]
+    if _uses_multi_process_torchrun(spec["container"]["command"]):
+        # Network isolation leaves only loopback. Override any image-level NCCL
+        # exclusions and bind optional Gloo control collectives to the same
+        # deterministic interface. Standalone torchrun owns MASTER_ADDR itself.
+        for key, value in TORCHRUN_LOOPBACK_ENVIRONMENT.items():
+            command.extend(["--env", f"{key}={value}"])
     if (instance_id is None) != (instance_type is None):
         raise WorkerError("container instance ID and type must be supplied together from live IMDS")
     if instance_id is not None and instance_type is not None:
