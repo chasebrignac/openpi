@@ -5,6 +5,7 @@ import json
 import pathlib
 import re
 import shlex
+import subprocess
 
 import pytest
 
@@ -22,6 +23,12 @@ def make_spec(tmp_path: pathlib.Path) -> dict:
             "account_id": "752160877725",
             "region": "us-east-2",
             "artifact_bucket": "pi05-repro-752160877725-us-east-2",
+        },
+        "controller_source": {
+            "s3_uri": "s3://pi05-repro-752160877725-us-east-2/source/controller.bundle",
+            "version_id": "controller-v1",
+            "sha256": "9" * 64,
+            "commit": "8" * 40,
         },
         "source": {
             "s3_uri": "s3://pi05-repro-752160877725-us-east-2/source/openpi.bundle",
@@ -51,7 +58,15 @@ def make_spec(tmp_path: pathlib.Path) -> dict:
             }
         ],
         "container": {
-            "command": ["python", "scripts/train_pytorch.py", "pi05_libero_l09_distill", "--seed", "7"],
+            "command": [
+                "python",
+                "scripts/train_pytorch.py",
+                "pi05_libero_l09_distill",
+                "--checkpoint-base-dir",
+                "/mnt/openpi/runs",
+                "--seed",
+                "7",
+            ],
             "environment": {"WANDB_MODE": "offline"},
             "shm_size_gib": 64,
         },
@@ -332,6 +347,16 @@ def make_teacher_cross_contract(tmp_path: pathlib.Path, track: str = "libero") -
 def test_spec_requires_digest_pins_revisions_and_exact_run_prefix(tmp_path):
     spec = make_spec(tmp_path)
     assert repro_worker.validate_worker_spec(spec)["seed"] == 7
+
+    missing_controller = json.loads(json.dumps(spec))
+    del missing_controller["controller_source"]
+    with pytest.raises(repro_worker.WorkerError, match=r"controller_source must be an object"):
+        repro_worker.validate_worker_spec(missing_controller)
+
+    unpinned_controller = json.loads(json.dumps(spec))
+    unpinned_controller["controller_source"]["commit"] = "main"
+    with pytest.raises(repro_worker.WorkerError, match=r"controller_source\.commit"):
+        repro_worker.validate_worker_spec(unpinned_controller)
 
     tagged = json.loads(json.dumps(spec))
     tagged["image"]["uri"] = "752160877725.dkr.ecr.us-east-2.amazonaws.com/pi05-repro:latest"
@@ -830,31 +855,50 @@ def test_complete_staged_input_tree_is_readable_and_nonwritable_for_container_ui
     root = tmp_path / "inputs"
     payload = root / "checkpoints" / "model" / "model.safetensors"
     manifest = root / ".manifests" / "model.json"
+    reserved = [root / name for name in repro_worker.RESERVED_INPUT_MOUNTPOINTS]
     payload.parent.mkdir(parents=True, mode=0o700)
     manifest.parent.mkdir(parents=True, mode=0o700)
+    for path in reserved:
+        path.mkdir(mode=0o700)
     payload.write_bytes(b"model")
     manifest.write_text("{}")
 
     repro_worker.make_staged_input_container_readable(root)
 
-    for path in (root, root / "checkpoints", payload.parent, manifest.parent):
+    for path in (root, root / "checkpoints", payload.parent, manifest.parent, *reserved):
         assert path.stat().st_mode & 0o777 == 0o555
     for path in (payload, manifest):
         assert path.stat().st_mode & 0o777 == 0o444
 
     # Restore owner directory permissions so pytest can remove its tree.
-    for path in (root, root / "checkpoints", payload.parent, manifest.parent):
+    for path in (root, root / "checkpoints", payload.parent, manifest.parent, *reserved):
         path.chmod(0o755)
+
+
+def test_staged_input_handoff_rejects_missing_or_nonempty_reserved_mountpoint(tmp_path):
+    root = tmp_path / "inputs"
+    root.mkdir()
+    for name in repro_worker.RESERVED_INPUT_MOUNTPOINTS:
+        (root / name).mkdir()
+    (root / "evidence/payload").write_text("collision")
+    with pytest.raises(repro_worker.WorkerError, match="reserved input mountpoint"):
+        repro_worker.make_staged_input_container_readable(root)
 
 
 def test_source_evidence_and_deadline_reserve_are_checked(tmp_path):
     spec = make_spec(tmp_path)
     evidence = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": dict(spec["source"]),
+        "controller_source": dict(spec["controller_source"]),
         "bundle_sha256_actual": spec["source"]["sha256"],
         "head_commit": spec["source"]["commit"],
         "source_clean": True,
+        "controller_bundle_sha256_actual": spec["controller_source"]["sha256"],
+        "controller_head_commit": spec["controller_source"]["commit"],
+        "controller_source_clean": True,
+        "checkout_path": "/opt/pi05/model-source",
+        "controller_checkout_path": "/opt/pi05/controller-source",
     }
     repro_worker.validate_source_evidence(spec, evidence)
     evidence["head_commit"] = "0" * 40
@@ -863,6 +907,14 @@ def test_source_evidence_and_deadline_reserve_are_checked(tmp_path):
     evidence["head_commit"] = spec["source"]["commit"]
     evidence["source_clean"] = False
     with pytest.raises(repro_worker.WorkerError, match="checked-out"):
+        repro_worker.validate_source_evidence(spec, evidence)
+    evidence["source_clean"] = True
+    evidence["controller_head_commit"] = "0" * 40
+    with pytest.raises(repro_worker.WorkerError, match="controller bundle"):
+        repro_worker.validate_source_evidence(spec, evidence)
+    evidence["controller_head_commit"] = spec["controller_source"]["commit"]
+    evidence["controller_checkout_path"] = evidence["checkout_path"]
+    with pytest.raises(repro_worker.WorkerError, match="fixed distinct checkout"):
         repro_worker.validate_source_evidence(spec, evidence)
 
     now = dt.datetime(2026, 8, 3, 12, 0, tzinfo=dt.UTC)
@@ -904,7 +956,14 @@ def test_run_workspace_is_fresh_and_keeps_host_control_state_out_of_container_ow
         expected_owner_uid=repro_worker.os.getuid(),
     )
 
-    for relative in ("output/.ready", "output/.receipts", "output/.spool", "output/.active"):
+    for relative in (
+        "inputs/runs",
+        "inputs/evidence",
+        "output/.ready",
+        "output/.receipts",
+        "output/.spool",
+        "output/.active",
+    ):
         assert (run_root / relative).stat().st_mode & 0o777 == 0o700
         assert run_root / relative not in chowned
     for relative in ("output/checkpoints", "output/logs", "output/manifests", "output/artifacts", "tmp", "cache"):
@@ -935,6 +994,7 @@ def test_docker_command_is_argv_digest_pinned_and_read_only(tmp_path):
         "/.ready" in part or "/.receipts" in part or "/.spool" in part or "/.active" in part for part in command
     )
     assert "type=bind,src=/opt/dlami/nvme/output/checkpoints,dst=/mnt/openpi/runs" in command
+    assert not any(part.endswith("dst=/workspace/openpi/checkpoints") for part in command)
     assert "type=bind,src=/opt/dlami/nvme/output/artifacts,dst=/mnt/openpi/evidence" in command
     assert "PYTHONPATH=/workspace/openpi/src:/workspace/openpi" in command
     assert "PI05_INPUT_LIBERO=/mnt/openpi/datasets/libero" in command
@@ -942,6 +1002,51 @@ def test_docker_command_is_argv_digest_pinned_and_read_only(tmp_path):
     image_index = command.index(spec["image"]["uri"])
     assert command[image_index + 1 :] == spec["container"]["command"]
     assert not any(part in {"sh", "bash", "-c"} for part in command[image_index + 1 :])
+
+
+def test_all_nested_mnt_openpi_mount_destinations_exist_before_readonly_handoff(tmp_path, monkeypatch):
+    monkeypatch.setattr(repro_worker.os, "chown", lambda *_args: None)
+    run_root = repro_worker.create_run_workspace(
+        tmp_path,
+        "nested-mount-topology",
+        expected_owner_uid=tmp_path.stat().st_uid,
+    )
+    inputs = run_root / "inputs"
+    repro_worker.make_staged_input_container_readable(inputs)
+    spec = repro_worker.validate_worker_spec(make_spec(tmp_path))
+    command = repro_worker.build_docker_command(spec, tmp_path / "source", run_root)
+    mounts = [command[index + 1] for index, item in enumerate(command) if item == "--mount"]
+    nested_destinations = {
+        option.removeprefix("dst=")
+        for mount in mounts
+        for option in mount.split(",")
+        if option.startswith("dst=/mnt/openpi/")
+    }
+    assert nested_destinations == {"/mnt/openpi/runs", "/mnt/openpi/evidence"}
+    for destination in nested_destinations:
+        mountpoint = inputs / pathlib.PurePosixPath(destination).relative_to("/mnt/openpi")
+        assert mountpoint.is_dir()
+        assert not any(mountpoint.iterdir())
+        assert mountpoint.stat().st_mode & 0o777 == 0o555
+
+
+def test_training_worker_requires_the_single_writable_checkpoint_base(tmp_path):
+    missing = make_spec(tmp_path)
+    option = missing["container"]["command"].index("--checkpoint-base-dir")
+    del missing["container"]["command"][option : option + 2]
+    with pytest.raises(repro_worker.WorkerError, match="exactly one --checkpoint-base-dir"):
+        repro_worker.validate_worker_spec(missing)
+
+    wrong = make_spec(tmp_path)
+    option = wrong["container"]["command"].index("--checkpoint-base-dir")
+    wrong["container"]["command"][option + 1] = "/workspace/openpi/checkpoints"
+    with pytest.raises(repro_worker.WorkerError, match="must be /mnt/openpi/runs"):
+        repro_worker.validate_worker_spec(wrong)
+
+    duplicated = make_spec(tmp_path)
+    duplicated["container"]["command"].extend(["--checkpoint-base-dir", "/mnt/openpi/runs"])
+    with pytest.raises(repro_worker.WorkerError, match="exactly one --checkpoint-base-dir"):
+        repro_worker.validate_worker_spec(duplicated)
 
 
 def test_host_json_publication_is_create_once_and_does_not_follow_collision(tmp_path):
@@ -1367,6 +1472,17 @@ def test_expected_checkpoint_publishes_worker_compatible_input_manifest(tmp_path
 
 def _training_metrics_output(tmp_path, metrics_document=None):
     raw = make_spec(tmp_path)
+    raw["container"]["command"] = [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "scripts/train_pytorch.py",
+        "pi05_libero_l09_distill",
+        "--checkpoint-base-dir",
+        "/mnt/openpi/runs",
+        "--seed",
+        "7",
+    ]
     relative = "checkpoints/pi05_libero_l09_distill/libero-shallow/2000"
     raw["expected_outputs"] = [{"name": "pilot_checkpoint", "kind": "checkpoint", "path": relative}]
     spec = repro_worker.validate_worker_spec(raw)
@@ -1404,7 +1520,7 @@ def _write_expected_json(tmp_path, spec, relative, document):
     return root, source, manager.commit_expected_outputs()
 
 
-def test_run_metrics_are_finite_hash_covered_and_old_checkpoint_absence_is_compatible(tmp_path):
+def test_run_metrics_are_finite_hash_covered_and_training_sidecar_is_mandatory(tmp_path):
     document = {
         "schema_version": 1,
         "config_name": "pi05_libero_l09_distill",
@@ -1425,7 +1541,8 @@ def test_run_metrics_are_finite_hash_covered_and_old_checkpoint_absence_is_compa
     ]
 
     old_spec, old_root, _old_checkpoint, old_markers = _training_metrics_output(tmp_path / "old")
-    assert repro_worker.collect_run_metrics(old_spec, old_root, old_markers) == ({}, [])
+    with pytest.raises(repro_worker.WorkerError, match="mandatory hash-covered metrics sidecar"):
+        repro_worker.collect_run_metrics(old_spec, old_root, old_markers)
 
 
 def test_run_metrics_ingest_declared_evaluation_manifest(tmp_path):
@@ -1805,3 +1922,17 @@ def test_rendered_bootstrap_is_versioned_hashed_and_dry_by_default():
     assert "WORKER_SPEC_VERSION_ID=spec-v1" in command
     assert "WORKER_EXECUTE=0" in command
     assert "latest" not in command
+
+
+def test_controller_v2_bootstrap_independently_materializes_model_and_controller_sources():
+    bootstrap = pathlib.Path(__file__).parents[1] / "repro/worker-bootstrap-controller-v2.sh"
+    subprocess.run(["bash", "-n", str(bootstrap)], check=True)
+    text = bootstrap.read_text()
+    assert "read_source_pin source" in text
+    assert "read_source_pin controller_source" in text
+    assert "source_checkout=/opt/pi05/model-source" in text
+    assert "controller_checkout=/opt/pi05/controller-source" in text
+    assert 'exec python3 "${controller_checkout}/scripts/repro_worker.py"' in text
+    assert '"checkout_path": source_checkout' in text
+    assert '"controller_checkout_path": controller_checkout' in text
+    assert 'schema_version": 2' in text

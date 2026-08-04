@@ -8,9 +8,19 @@ Experiment names accept only ASCII letters, digits, `.`, `_`, and `-`, may not
 contain `..`, and must begin and end with a letter or digit. Fresh jobs omit
 `--overwrite`; an accidental retry with an existing ID therefore fails closed.
 
-## 1. Prepare an exact source artifact
+## 1. Prepare exact model and controller source artifacts
 
-Commit the reviewed tree first. A source bundle must contain that commit; never bundle uncommitted files.
+`source` is the model checkout mounted read-only into the policy container and
+must match the OCI image revision. `controller_source` is a separate reviewed
+checkout used only by the host bootstrap and worker. This separation permits a
+controller-only safety fix without silently changing model/training code or
+rebuilding the policy image. Both bundles are independently immutable and both
+pins are recorded in the terminal run manifest.
+
+Commit the reviewed controller tree first. A source bundle must contain its
+declared commit; never bundle uncommitted files. Run the create-once sequence
+below independently for the selected model commit and controller commit, using
+distinct local paths, object keys, captured VersionIds, and round-trip files.
 
 ```bash
 set -euo pipefail
@@ -76,8 +86,27 @@ printf 'source.commit=%s\nsource.s3_uri=%s\nsource.version_id=%s\nsource.sha256=
   "$SOURCE_COMMIT" "$SOURCE_BUNDLE_S3_URI" "$SOURCE_VERSION_ID" "$SOURCE_BUNDLE_SHA256"
 ```
 
-Copy the four printed values into the worker spec. Never substitute a later
-unversioned `head-object` result for the captured `source.version_id`.
+Copy the model bundle's four printed values into `source` and the reviewed
+controller bundle's values into `controller_source`. Never substitute a later
+unversioned `head-object` result for either captured VersionId.
+
+### Controller-v2 migration
+
+Specs executed by `worker-bootstrap-controller-v2.sh` must contain both pins;
+the controller rejects a missing or malformed `controller_source`. Do not edit
+an already-published legacy spec. Generate a fresh run ID and spec, preserve its
+original model `source`, and add the exact controller pin. Publish
+`repro/worker-bootstrap-controller-v2.sh` to
+`bootstrap/worker-bootstrap-controller-CONTROLLER_COMMIT.sh` with create-once
+semantics. The existing `bootstrap/worker-bootstrap.sh` object is immutable and
+must not be overwritten or reused for a dual-source spec.
+
+The v2 bootstrap verifies and clones both bundles independently, executes
+`scripts/repro_worker.py` from the controller checkout, and passes only the
+model checkout to Docker. Every training command must explicitly use exactly
+`--checkpoint-base-dir /mnt/openpi/runs`. The controller mounts that writable
+host output at `/mnt/openpi/runs`; it deliberately does not add a nested mount
+at `/workspace/openpi/checkpoints` beneath the read-only model source.
 
 ## 2. Write and validate a worker spec
 
@@ -107,6 +136,12 @@ checks complete before Docker starts.
     "account_id": "752160877725",
     "region": "us-east-2",
     "artifact_bucket": "pi05-repro-752160877725-us-east-2"
+  },
+  "controller_source": {
+    "s3_uri": "s3://pi05-repro-752160877725-us-east-2/source/openpi-CONTROLLER_GIT_COMMIT.bundle",
+    "version_id": "CONTROLLER_SOURCE_VERSION_ID",
+    "sha256": "CONTROLLER_SOURCE_BUNDLE_SHA256",
+    "commit": "CONTROLLER_GIT_COMMIT"
   },
   "source": {
     "s3_uri": "s3://pi05-repro-752160877725-us-east-2/source/openpi-SOURCE_GIT_COMMIT.bundle",
@@ -341,9 +376,10 @@ is never a valid compiled-stage output path.
 
 The `expected_count` must come from the selected EC2 type's documented instance-store layout. If discovery finds a different number, if the selected model is EBS, if the root device cannot be resolved exactly, or if the selected disk contains an unknown filesystem, the worker exits without formatting anything.
 
-The bootstrap keeps `/opt/pi05`, the worker spec, source bundle, launch
-metadata, and verification evidence owner-only. After the commit is checked
-out, `repro_checkout_permissions.py` makes only that checkout readable and
+The bootstrap keeps `/opt/pi05`, the worker spec, both source bundles, the
+controller checkout, launch metadata, and verification evidence owner-only.
+After both commits are checked independently,
+`repro_checkout_permissions.py` makes only the model checkout readable and
 non-writable for the UID-1000 container. The worker performs the equivalent
 read-only handoff for each input only after checking every manifest size and
 SHA-256.
@@ -364,16 +400,18 @@ python scripts/repro_worker.py run --spec /tmp/libero-shallow-20260804T120000Z-a
 
 Upload the validated spec with AES256 encryption, then record its S3 `VersionId` and local SHA-256.
 
-## 3. Publish the tiny bootstrap
+## 3. Publish the tiny commit-qualified bootstrap
 
 ```bash
-sha256sum repro/worker-bootstrap.sh
+CONTROLLER_COMMIT="$(jq -r '.controller_source.commit' /tmp/libero-shallow-20260804T120000Z-a1-2k.json)"
+BOOTSTRAP_KEY="bootstrap/worker-bootstrap-controller-$CONTROLLER_COMMIT.sh"
+sha256sum repro/worker-bootstrap-controller-v2.sh
 aws s3api put-object --bucket pi05-repro-752160877725-us-east-2 \
-  --key bootstrap/worker-bootstrap.sh --body repro/worker-bootstrap.sh \
+  --key "$BOOTSTRAP_KEY" --body repro/worker-bootstrap-controller-v2.sh \
   --region us-east-2 --expected-bucket-owner 752160877725 \
-  --server-side-encryption AES256
+  --server-side-encryption AES256 --if-none-match '*'
 aws s3api head-object --bucket pi05-repro-752160877725-us-east-2 \
-  --key bootstrap/worker-bootstrap.sh --region us-east-2 \
+  --key "$BOOTSTRAP_KEY" --region us-east-2 \
   --expected-bucket-owner 752160877725
 ```
 
@@ -381,7 +419,7 @@ Render the launcher's command file in dry-run mode first:
 
 ```bash
 python scripts/repro_worker.py render-bootstrap \
-  --bootstrap-s3-uri s3://pi05-repro-752160877725-us-east-2/bootstrap/worker-bootstrap.sh \
+  --bootstrap-s3-uri "s3://pi05-repro-752160877725-us-east-2/$BOOTSTRAP_KEY" \
   --bootstrap-version-id BOOTSTRAP_VERSION_ID \
   --bootstrap-sha256 BOOTSTRAP_SHA256 \
   --spec-s3-uri s3://pi05-repro-752160877725-us-east-2/specs/libero-shallow-20260804T120000Z-a1-2k.json \

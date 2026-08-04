@@ -9,7 +9,7 @@ image, or starts a container.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 import contextlib
 import dataclasses
 import datetime as dt
@@ -39,6 +39,9 @@ EXPECTED_REGION = "us-east-2"
 # reproduction training configurations.
 SCRATCH_ROOT = pathlib.Path("/opt/dlami/nvme")
 CONTAINER_INPUT_ROOT = pathlib.PurePosixPath("/mnt/openpi")
+MODEL_SOURCE_CHECKOUT = pathlib.PurePosixPath("/opt/pi05/model-source")
+CONTROLLER_SOURCE_CHECKOUT = pathlib.PurePosixPath("/opt/pi05/controller-source")
+RESERVED_INPUT_MOUNTPOINTS = ("runs", "evidence")
 INSTANCE_STORE_MODEL = "Amazon EC2 NVMe Instance Storage"
 SCRATCH_LABEL = "PI05_SCRATCH"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -445,6 +448,7 @@ def validate_worker_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
             "project",
             "run_id",
             "aws",
+            "controller_source",
             "source",
             "image",
             "artifacts",
@@ -475,18 +479,23 @@ def validate_worker_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
         raise WorkerError("worker AWS account/region differs from the reproduction boundary")
     bucket = _required_string(aws, "artifact_bucket", "aws")
 
-    source = spec.get("source")
-    if not isinstance(source, dict):
-        raise WorkerError("worker spec.source must be an object")
-    _only_keys(source, {"s3_uri", "version_id", "sha256", "commit"}, "source")
-    source_location = parse_s3_uri(_required_string(source, "s3_uri", "source"))
-    if source_location.bucket != bucket:
-        raise WorkerError("source bundle must be in the pinned artifact bucket")
-    _required_string(source, "version_id", "source")
-    if SHA256_RE.fullmatch(_required_string(source, "sha256", "source")) is None:
-        raise WorkerError("source.sha256 must be a lowercase SHA-256")
-    if COMMIT_RE.fullmatch(_required_string(source, "commit", "source")) is None:
-        raise WorkerError("source.commit must be a full lowercase git commit")
+    def validate_source_pin(name: str) -> dict[str, Any]:
+        value = spec.get(name)
+        if not isinstance(value, dict):
+            raise WorkerError(f"worker spec.{name} must be an object")
+        _only_keys(value, {"s3_uri", "version_id", "sha256", "commit"}, name)
+        location = parse_s3_uri(_required_string(value, "s3_uri", name))
+        if location.bucket != bucket:
+            raise WorkerError(f"{name} bundle must be in the pinned artifact bucket")
+        _required_string(value, "version_id", name)
+        if SHA256_RE.fullmatch(_required_string(value, "sha256", name)) is None:
+            raise WorkerError(f"{name}.sha256 must be a lowercase SHA-256")
+        if COMMIT_RE.fullmatch(_required_string(value, "commit", name)) is None:
+            raise WorkerError(f"{name}.commit must be a full lowercase git commit")
+        return value
+
+    validate_source_pin("controller_source")
+    source = validate_source_pin("source")
 
     image = spec.get("image")
     if not isinstance(image, dict):
@@ -771,6 +780,11 @@ def validate_worker_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
             raise WorkerError("training worker --seed must be an integer") from exc
         if command_seed != spec["seed"]:
             raise WorkerError("training worker --seed must equal worker spec.seed")
+        checkpoint_base_positions = [index for index, item in enumerate(command) if item == "--checkpoint-base-dir"]
+        if len(checkpoint_base_positions) != 1 or checkpoint_base_positions[0] + 1 >= len(command):
+            raise WorkerError("training worker command must contain exactly one --checkpoint-base-dir VALUE")
+        if command[checkpoint_base_positions[0] + 1] != str(CONTAINER_INPUT_ROOT / "runs"):
+            raise WorkerError("training worker --checkpoint-base-dir must be /mnt/openpi/runs")
 
     output = spec.get("output")
     if not isinstance(output, dict):
@@ -911,17 +925,32 @@ def sha256_file(path: pathlib.Path) -> str:
 
 def validate_source_evidence(spec: Mapping[str, Any], evidence: Mapping[str, Any]) -> None:
     expected = spec["source"]
-    if evidence.get("schema_version") != 1:
+    expected_controller = spec["controller_source"]
+    if evidence.get("schema_version") != 2:
         raise WorkerError("source verification evidence has the wrong schema")
     for key in ("s3_uri", "version_id", "sha256", "commit"):
         if evidence.get("source", {}).get(key) != expected[key]:
             raise WorkerError(f"source evidence does not match the worker spec for {key}")
+        if evidence.get("controller_source", {}).get(key) != expected_controller[key]:
+            raise WorkerError(f"controller source evidence does not match the worker spec for {key}")
     if (
         evidence.get("bundle_sha256_actual") != expected["sha256"]
         or evidence.get("head_commit") != expected["commit"]
         or evidence.get("source_clean") is not True
     ):
         raise WorkerError("source bundle hash or checked-out commit was not verified")
+    if (
+        evidence.get("controller_bundle_sha256_actual") != expected_controller["sha256"]
+        or evidence.get("controller_head_commit") != expected_controller["commit"]
+        or evidence.get("controller_source_clean") is not True
+    ):
+        raise WorkerError("controller bundle hash or checked-out commit was not verified")
+    if (
+        pathlib.PurePosixPath(str(evidence.get("checkout_path", ""))) != MODEL_SOURCE_CHECKOUT
+        or pathlib.PurePosixPath(str(evidence.get("controller_checkout_path", "")))
+        != CONTROLLER_SOURCE_CHECKOUT
+    ):
+        raise WorkerError("model and controller evidence must name the fixed distinct checkout paths")
 
 
 def validate_launch_metadata(
@@ -1130,6 +1159,8 @@ def create_run_workspace(
 
     root_owned = (
         run_root / "inputs",
+        run_root / "inputs/runs",
+        run_root / "inputs/evidence",
         run_root / "output",
         run_root / "output/.ready",
         run_root / "output/.receipts",
@@ -1476,6 +1507,15 @@ def make_staged_input_container_readable(destination: pathlib.Path) -> None:
 
     if destination.is_symlink() or not destination.is_dir():
         raise WorkerError(f"staged input is not a safe directory: {destination}")
+    for name in RESERVED_INPUT_MOUNTPOINTS:
+        mountpoint = destination / name
+        if (
+            mountpoint.is_symlink()
+            or not mountpoint.is_dir()
+            or mountpoint.stat().st_uid != destination.stat().st_uid
+            or any(mountpoint.iterdir())
+        ):
+            raise WorkerError(f"reserved input mountpoint is missing, nonempty, or unsafe: {mountpoint}")
     directories = [destination]
     for path in destination.rglob("*"):
         if path.is_symlink():
@@ -2010,8 +2050,6 @@ def build_docker_command(
         "--mount",
         f"type=bind,src={output / 'artifacts'},dst=/output/artifacts",
         "--mount",
-        f"type=bind,src={output / 'checkpoints'},dst=/workspace/openpi/checkpoints",
-        "--mount",
         f"type=bind,src={output / 'checkpoints'},dst={CONTAINER_INPUT_ROOT / 'runs'}",
         "--mount",
         f"type=bind,src={output / 'artifacts'},dst={CONTAINER_INPUT_ROOT / 'evidence'}",
@@ -2495,6 +2533,9 @@ def _require_finite_json_numbers(value: Any, *, context: str) -> None:
 
 def _metric_command_argv(spec: Mapping[str, Any]) -> list[str]:
     command = list(spec["container"]["command"])
+    training_positions = [index for index, value in enumerate(command) if value == "scripts/train_pytorch.py"]
+    if len(training_positions) == 1:
+        return command[training_positions[0] :]
     if len(command) < 2 or command[0] not in {"python", "python3", "/opt/modelopt/bin/python"}:
         raise WorkerError("metrics manifest requires a direct Python worker command")
     return command[1:]
@@ -2837,9 +2878,9 @@ def collect_run_metrics(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Copy metrics only from files covered by immutable expected-output markers.
 
-    Older checkpoints have no training sidecar and therefore yield an empty
-    metrics object. Once a sidecar or stage manifest is present, its live hash
-    must still equal the marker created after the container exited.
+    Every checkpoint produced by a training command must contain its training
+    sidecar. Its live hash, and every stage manifest hash, must still equal the
+    marker created after the container exited.
     """
 
     marker_by_name = {path.name: path for path in committed_markers}
@@ -2863,6 +2904,11 @@ def collect_run_metrics(
         relative_target = _safe_relative_path(str(expected["path"]), "metrics expected output")
         target = root.joinpath(*relative_target.parts)
         training_relative = (relative_target / TRAINING_METRICS_FILENAME).as_posix()
+        training_output = (
+            expected["kind"] == "checkpoint" and "scripts/train_pytorch.py" in spec["container"]["command"]
+        )
+        if training_output and training_relative not in covered:
+            raise WorkerError("training checkpoint is missing its mandatory hash-covered metrics sidecar")
         if (
             expected["kind"] == "checkpoint"
             and training_relative in covered
@@ -2963,6 +3009,8 @@ def run_container_until_deadline(
     soft_deadline: dt.datetime,
     spec: Mapping[str, Any],
     runner: CommandRunner,
+    *,
+    periodic_callback: Callable[[], None] | None = None,
 ) -> tuple[int, str | None]:
     name = f"pi05-{spec['run_id']}"
     existing = runner(["docker", "container", "ls", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"])
@@ -3005,6 +3053,8 @@ def run_container_until_deadline(
                     log.write(data)
             now_mono = time.monotonic()
             if now_mono >= next_sync:
+                if periodic_callback is not None:
+                    periodic_callback()
                 log.rotate()
                 manager.sync_once()
                 next_sync = now_mono + interval
@@ -3060,6 +3110,11 @@ def run_container_until_deadline(
             cleanup_errors.append(exc)
         try:
             log.close()
+        except Exception as exc:
+            cleanup_errors.append(exc)
+        try:
+            if periodic_callback is not None:
+                periodic_callback()
         except Exception as exc:
             cleanup_errors.append(exc)
         try:
@@ -3243,6 +3298,7 @@ def execute_worker(
         "termination": termination,
         "exit_code": exit_code,
         "failure": failure,
+        "controller_source": dict(spec["controller_source"]),
         "source": dict(spec["source"]),
         "source_evidence": dict(source_evidence),
         "image": {**dict(spec["image"]), "repo_digests": repo_digests},
@@ -3353,6 +3409,7 @@ def render_plan(spec: Mapping[str, Any], launch_metadata: Mapping[str, Any] | No
     result = {
         "mode": "dry-run",
         "run_id": spec["run_id"],
+        "controller_source": spec["controller_source"],
         "source": spec["source"],
         "image": spec["image"],
         "artifacts": [
