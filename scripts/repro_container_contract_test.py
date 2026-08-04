@@ -175,10 +175,10 @@ def test_source_bundle_seed_and_single_corpus_contracts_are_documented() -> None
     assert "source bundle HEAD mismatch" in bootstrap
     assert "git bundle list-heads /tmp/openpi.bundle HEAD" in worker_runbook
     assert '--version-id "$SOURCE_VERSION_ID"' in worker_runbook
-    assert 'SOURCE_BUNDLE_KEY="source/openpi-$SOURCE_COMMIT.bundle"' in worker_runbook
+    assert 'SOURCE_BUNDLE_KEY="source/openpi-$SOURCE_COMMIT-complete.bundle"' in worker_runbook
     assert "--if-none-match '*'" in worker_runbook
     assert "SOURCE_FINAL_HISTORY_JSON" in worker_runbook
-    assert "openpi-SOURCE_GIT_COMMIT.bundle" in worker_runbook
+    assert "openpi-SOURCE_GIT_COMMIT-complete.bundle" in worker_runbook
     assert "source-commit=$SOURCE_COMMIT,sha256=$SOURCE_BUNDLE_SHA256" in worker_runbook
     assert '"--seed", "42"' in worker_runbook
     assert '"seed": 42' in worker_runbook

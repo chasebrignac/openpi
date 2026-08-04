@@ -465,6 +465,12 @@ def test_upload_emits_a_copy_ready_worker_artifact(tmp_path):
             "region": "us-east-2",
             "artifact_bucket": "pi05-repro-752160877725-us-east-2",
         },
+        "controller_source": {
+            "s3_uri": "s3://pi05-repro-752160877725-us-east-2/source/controller-complete.bundle",
+            "version_id": "controller-v1",
+            "sha256": "6" * 64,
+            "commit": "5" * 40,
+        },
         "source": {
             "s3_uri": "s3://pi05-repro-752160877725-us-east-2/source/openpi.bundle",
             "version_id": "source-v1",

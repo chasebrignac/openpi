@@ -529,7 +529,11 @@ the same validator as `scripts/repro_worker.py`.
 ```bash
 python scripts/repro_libero_eval.py render-worker-spec \
   --run-id libero-base-intermediate-01 \
-  --source-s3-uri s3://pi05-repro-752160877725-us-east-2/source/openpi-SOURCE_GIT_COMMIT.bundle \
+  --controller-source-s3-uri s3://pi05-repro-752160877725-us-east-2/source/openpi-CONTROLLER_GIT_COMMIT-complete.bundle \
+  --controller-source-version-id CONTROLLER_SOURCE_VERSION_ID \
+  --controller-source-sha256 CONTROLLER_SOURCE_BUNDLE_SHA256 \
+  --controller-source-commit "$PI05_CONTROLLER_COMMIT" \
+  --source-s3-uri s3://pi05-repro-752160877725-us-east-2/source/openpi-SOURCE_GIT_COMMIT-complete.bundle \
   --source-version-id SOURCE_VERSION_ID \
   --source-sha256 SOURCE_BUNDLE_SHA256 \
   --source-commit "$PI05_SOURCE_COMMIT" \
@@ -545,11 +549,14 @@ python scripts/repro_libero_eval.py render-worker-spec \
 python scripts/repro_worker.py run --spec /tmp/libero-base-intermediate-01.json
 ```
 
-The rendered spec uses one On-Demand `g6e.4xlarge`, one digest-pinned image with purpose `libero-evaluator`, one
-immutable checkpoint input, and six expected outputs: four suite JSONL files, one combined JSONL file, and one
-evaluation manifest. `repro_worker.py` adds `--network none`, verifies image/source/input identities, uploads only
-complete expected outputs, and writes the authoritative instance identity, command, receipts, timing, and final cost
-evidence to its run manifest.
+The rendered spec binds the host controller and container model source as two
+independently versioned complete-history bundles. It uses one On-Demand
+`g6e.4xlarge`, one digest-pinned image with purpose `libero-evaluator`, one
+immutable checkpoint input, and six expected outputs: four suite JSONL files,
+one combined JSONL file, and one evaluation manifest. `repro_worker.py` adds
+`--network none`, verifies controller/model/image/input identities, uploads only
+complete expected outputs, and writes the authoritative instance identity,
+command, receipts, timing, and final cost evidence to its run manifest.
 
 Review the rendered spec and normal worker bootstrap dry-run before using the separately gated `--execute` workflow
 in `repro/WORKER_RUNBOOK.md`. The evaluator renderer itself never creates or terminates AWS capacity.
@@ -560,7 +567,11 @@ contract as a machine-validated future orchestration artifact:
 ```bash
 python scripts/repro_libero_eval.py render-worker-spec \
   --run-id libero-final-fp8-official-01 \
-  --source-s3-uri s3://pi05-repro-752160877725-us-east-2/source/openpi-SOURCE_GIT_COMMIT.bundle \
+  --controller-source-s3-uri s3://pi05-repro-752160877725-us-east-2/source/openpi-CONTROLLER_GIT_COMMIT-complete.bundle \
+  --controller-source-version-id CONTROLLER_SOURCE_VERSION_ID \
+  --controller-source-sha256 CONTROLLER_SOURCE_BUNDLE_SHA256 \
+  --controller-source-commit "$PI05_CONTROLLER_COMMIT" \
+  --source-s3-uri s3://pi05-repro-752160877725-us-east-2/source/openpi-SOURCE_GIT_COMMIT-complete.bundle \
   --source-version-id SOURCE_VERSION_ID \
   --source-sha256 SOURCE_BUNDLE_SHA256 \
   --source-commit "$PI05_SOURCE_COMMIT" \

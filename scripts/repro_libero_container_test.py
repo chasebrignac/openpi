@@ -68,6 +68,10 @@ def _checkpoint_artifact(tmp_path: pathlib.Path) -> pathlib.Path:
 def _render_args(tmp_path: pathlib.Path) -> argparse.Namespace:
     return argparse.Namespace(
         run_id="libero-base-smoke-01",
+        controller_source_s3_uri=f"s3://{repro_libero_eval.BUCKET}/source/controller-complete.bundle",
+        controller_source_version_id="controller-version-1",
+        controller_source_sha256="9" * 64,
+        controller_source_commit="8" * 40,
         source_s3_uri=f"s3://{repro_libero_eval.BUCKET}/source/openpi.bundle",
         source_version_id="version-1",
         source_sha256="c" * 64,
@@ -140,6 +144,12 @@ def test_runtime_contract_validation_fails_after_lock_tampering(tmp_path):
 
 def test_rendered_worker_spec_uses_one_network_none_policy_container(tmp_path):
     spec = repro_libero_eval.render_worker_spec(_render_args(tmp_path))
+    assert spec["controller_source"] == {
+        "s3_uri": f"s3://{repro_libero_eval.BUCKET}/source/controller-complete.bundle",
+        "version_id": "controller-version-1",
+        "sha256": "9" * 64,
+        "commit": "8" * 40,
+    }
     assert spec["image"] == {
         "uri": (
             f"{repro_libero_eval.ACCOUNT}.dkr.ecr.{repro_libero_eval.REGION}.amazonaws.com/pi05-repro@sha256:{'e' * 64}"

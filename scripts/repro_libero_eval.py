@@ -779,6 +779,12 @@ def render_worker_spec(args: argparse.Namespace) -> dict[str, Any]:
         "project": PROJECT,
         "run_id": args.run_id,
         "aws": {"account_id": ACCOUNT, "region": REGION, "artifact_bucket": BUCKET},
+        "controller_source": {
+            "s3_uri": args.controller_source_s3_uri,
+            "version_id": args.controller_source_version_id,
+            "sha256": args.controller_source_sha256,
+            "commit": args.controller_source_commit,
+        },
         "source": {
             "s3_uri": args.source_s3_uri,
             "version_id": args.source_version_id,
@@ -875,6 +881,10 @@ def add_render_parser(subparsers: Any) -> None:
         ),
     )
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--controller-source-s3-uri", required=True)
+    parser.add_argument("--controller-source-version-id", required=True)
+    parser.add_argument("--controller-source-sha256", required=True)
+    parser.add_argument("--controller-source-commit", required=True)
     parser.add_argument("--source-s3-uri", required=True)
     parser.add_argument("--source-version-id", required=True)
     parser.add_argument("--source-sha256", required=True)

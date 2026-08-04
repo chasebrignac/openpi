@@ -376,6 +376,10 @@ def _compiled_render_args(tmp_path: pathlib.Path) -> argparse.Namespace:
     contract_path.write_text(json.dumps(contract))
     return argparse.Namespace(
         run_id="libero-final-fp8",
+        controller_source_s3_uri=f"s3://{repro_libero_eval.BUCKET}/source/controller-complete.bundle",
+        controller_source_version_id="controller-version",
+        controller_source_sha256="9" * 64,
+        controller_source_commit="8" * 40,
         source_s3_uri=f"s3://{repro_libero_eval.BUCKET}/source/openpi.bundle",
         source_version_id="source-version",
         source_sha256="6" * 64,
@@ -419,6 +423,12 @@ def _compiled_render_args(tmp_path: pathlib.Path) -> argparse.Namespace:
 def test_rendered_tensorrt_spec_stages_complete_tree_and_binds_build_contract(tmp_path):
     args = _compiled_render_args(tmp_path)
     spec = repro_libero_eval.render_worker_spec(args)
+    assert spec["controller_source"] == {
+        "s3_uri": f"s3://{repro_libero_eval.BUCKET}/source/controller-complete.bundle",
+        "version_id": "controller-version",
+        "sha256": "9" * 64,
+        "commit": "8" * 40,
+    }
     assert [item["kind"] for item in spec["artifacts"]] == ["checkpoint", "asset"]
     command = spec["container"]["command"]
     assert command[0] == str(repro_libero_eval.TENSORRT_POLICY_PYTHON)
