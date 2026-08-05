@@ -3115,14 +3115,22 @@ def _validate_libero_metrics_manifest(
     runtime = _require_exact_keys(
         document.get("instance"), {"type", "id", "identity_recorded_by"}, context="LIBERO metrics instance"
     )
-    _dataset_name, dataset_revision = _command_dataset_identity(spec, command)
+    # LIBERO's benchmark assets are baked into and pinned by the evaluator
+    # image contract.  Evaluator specs stage policy checkpoints, not a dataset
+    # artifact, so the generic command/artifact resolver cannot establish this
+    # identity.  Bind the report to the exact simulator revision that worker
+    # spec validation already verifies against the immutable image label.
+    dataset_revision = spec["image"].get("libero_simulator_revision")
+    if not isinstance(dataset_revision, str) or COMMIT_RE.fullmatch(dataset_revision) is None:
+        raise WorkerError("LIBERO metrics cannot resolve the pinned simulator revision from the worker contract")
+    expected_dataset = {"name": "LIBERO fixed benchmark assets", "revision": dataset_revision}
     if (
         document.get("project") != EXPECTED_PROJECT
         or document.get("kind") != "libero-evaluation"
         or document.get("run_id") != spec["run_id"]
         or source.get("commit") != spec["source"]["commit"]
         or image.get("digest") != spec["image"]["digest"]
-        or dataset.get("revision") != dataset_revision
+        or dataset != expected_dataset
         or runtime.get("type") != instance_type
         or runtime.get("id") != instance_id
         or document.get("command") != command

@@ -2079,7 +2079,10 @@ def test_run_metrics_ingest_declared_evaluation_manifest(tmp_path):
         "finished_at": "2026-08-04T10:01:00+00:00",
         "source": {"commit": spec["source"]["commit"]},
         "image": {"digest": spec["image"]["digest"]},
-        "dataset": {"name": "LIBERO fixed benchmark assets", "revision": spec["artifacts"][0]["revision"]},
+        "dataset": {
+            "name": "LIBERO fixed benchmark assets",
+            "revision": spec["image"]["libero_simulator_revision"],
+        },
         "simulator": {},
         "dependencies": {},
         "policy": {},
@@ -2108,6 +2111,57 @@ def test_run_metrics_ingest_declared_evaluation_manifest(tmp_path):
 
     assert metrics == {relative: {"success": 0.97}}
     assert provenance[0]["sha256"] == repro_worker.sha256_file(source)
+
+
+@pytest.mark.parametrize(
+    ("dataset_name", "dataset_revision"),
+    [
+        ("wrong benchmark", repro_worker.LIBERO_SIMULATOR_REVISION),
+        ("LIBERO fixed benchmark assets", "f" * 40),
+    ],
+)
+def test_run_metrics_reject_libero_dataset_identity_mismatch(tmp_path, dataset_name, dataset_revision):
+    raw = make_libero_evaluator_spec(tmp_path)
+    raw["container"]["command"].extend(["--stage", "base", "--seed", "7"])
+    relative = "manifests/libero-base.json"
+    raw["expected_outputs"] = [{"name": "evaluation_manifest", "kind": "manifest", "path": relative}]
+    spec = repro_worker.validate_worker_spec(raw)
+    command = spec["container"]["command"][1:]
+    launch, identity = _metrics_runtime_context()
+    document = {
+        "schema_version": 1,
+        "project": repro_worker.EXPECTED_PROJECT,
+        "kind": "libero-evaluation",
+        "run_id": spec["run_id"],
+        "started_at": "2026-08-04T10:00:00+00:00",
+        "finished_at": "2026-08-04T10:01:00+00:00",
+        "source": {"commit": spec["source"]["commit"]},
+        "image": {"digest": spec["image"]["digest"]},
+        "dataset": {"name": dataset_name, "revision": dataset_revision},
+        "simulator": {},
+        "dependencies": {},
+        "policy": {},
+        "evaluation": {
+            "stage": "base",
+            "seed": spec["seed"],
+            "suites": ["libero_spatial"],
+            "trials_per_task": 50,
+            "metrics": {"success": 0.97},
+        },
+        "command": command,
+        "child_commands": [],
+        "instance": {
+            "type": identity["instanceType"],
+            "id": identity["instanceId"],
+            "identity_recorded_by": "worker run manifest",
+        },
+        "cost": {"projected_usd": 18.0, "actual_recorded_by": "worker run manifest"},
+        "artifacts": [],
+    }
+    root, _source, markers = _write_expected_json(tmp_path, spec, relative, document)
+
+    with pytest.raises(repro_worker.WorkerError, match="identity differs"):
+        repro_worker.collect_run_metrics(spec, root, markers, launch_metadata=launch, instance_identity=identity)
 
 
 def test_run_metrics_reject_unrecognized_or_mismatched_evaluation_manifest(tmp_path):
