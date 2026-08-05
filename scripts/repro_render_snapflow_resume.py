@@ -107,7 +107,7 @@ def render_snapflow_resume_spec(
         "--num-train-steps",
         str(target_step),
         "--save-interval",
-        str(target_step - source_step),
+        "5000",
         "--log-interval",
         "10",
     ]

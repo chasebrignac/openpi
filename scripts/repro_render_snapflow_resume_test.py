@@ -16,26 +16,27 @@ def accepted_snapflow(track: str, step: int) -> dict:
 
 
 @pytest.mark.parametrize("track", ["libero", "droid"])
-def test_rendered_snapflow_resume_is_worker_valid(track):
+@pytest.mark.parametrize("source_step,target_step", [(5_000, 10_000), (10_000, 20_000), (20_000, 30_000)])
+def test_rendered_snapflow_resume_is_worker_valid(track, source_step, target_step):
     rendered = repro_render_snapflow_resume.render_snapflow_resume_spec(
         base_spec(track),
-        accepted_snapflow(track, 5_000),
+        accepted_snapflow(track, source_step),
         controller_source(),
         track=track,
-        target_step=10_000,
-        run_id=f"{track}-snapflow-long-10000",
+        target_step=target_step,
+        run_id=f"{track}-snapflow-long-{target_step}",
     )
 
     config = f"pi05_{track}_l09_snapflow"
     command = rendered["container"]["command"]
     assert command[:3] == ["python", "scripts/train_pytorch.py", config]
-    assert command[command.index("--num-train-steps") + 1] == "10000"
+    assert command[command.index("--num-train-steps") + 1] == str(target_step)
     assert command[command.index("--save-interval") + 1] == "5000"
     assert rendered["resume_checkpoint"] == {
         "artifact_name": "accepted_snapflow",
-        "target": f"{config}/{track}-snapflow/5000",
+        "target": f"{config}/{track}-snapflow/{source_step}",
     }
-    assert rendered["expected_outputs"][0]["publish_destination"] == f"{config}/{track}-snapflow/10000"
+    assert rendered["expected_outputs"][0]["publish_destination"] == f"{config}/{track}-snapflow/{target_step}"
     assert rendered["controller_source"] == controller_source()
     assert [item["name"] for item in rendered["artifacts"]] == [
         track,
