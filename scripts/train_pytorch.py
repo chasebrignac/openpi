@@ -1255,17 +1255,14 @@ def train_loop(config: _config.TrainConfig):
     latest_optimizer_metrics = None
 
     while global_step < config.num_train_steps:
-        # Set epoch for distributed training
-        if use_ddp and hasattr(loader, "set_epoch"):
-            loader.set_epoch(data_epoch)
-
         if overfit_batch is not None:
             batch_iterator = itertools.repeat(overfit_batch)
         else:
+            if not hasattr(loader, "set_epoch"):
+                raise TypeError(f"{type(loader).__name__} does not support resumable epoch control")
+            loader.set_epoch(data_epoch, batch_offset=resume_batches_to_skip)
+            resume_batches_to_skip = 0
             batch_iterator = iter(loader)
-            if resume_batches_to_skip:
-                batch_iterator = itertools.islice(batch_iterator, resume_batches_to_skip, None)
-                resume_batches_to_skip = 0
         for observation, actions in batch_iterator:
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:

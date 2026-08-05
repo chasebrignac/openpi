@@ -1,4 +1,5 @@
 import dataclasses
+import pathlib
 
 import jax
 import numpy as np
@@ -9,6 +10,44 @@ import torch
 from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+
+
+class _IndexDataset:
+    def __init__(self, size: int):
+        self._size = size
+
+    def __getitem__(self, index: int) -> dict[str, np.ndarray]:
+        return {"index": np.asarray(index, dtype=np.int64)}
+
+    def __len__(self) -> int:
+        return self._size
+
+
+class _RecordingIndexDataset(_IndexDataset):
+    def __init__(self, size: int, record_dir: str):
+        super().__init__(size)
+        self._record_dir = record_dir
+
+    def __getitem__(self, index: int) -> dict[str, np.ndarray]:
+        pathlib.Path(self._record_dir, f"{index}.seen").touch()
+        return super().__getitem__(index)
+
+
+def _index_batches(loader: _data_loader.TorchDataLoader) -> list[list[int]]:
+    return [batch["index"].tolist() for batch in loader]
+
+
+def _sampler_for(kind: str, dataset: _IndexDataset):
+    if kind == "distributed":
+        return torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=2,
+            rank=1,
+            shuffle=True,
+            drop_last=True,
+            seed=53,
+        )
+    return None
 
 
 def test_episode_prompt_prefers_annotation_and_falls_back():
@@ -121,6 +160,56 @@ def test_torch_data_loader_resume_reproduces_single_gpu_shuffle_epoch():
             torch.equal(left, right)
             for left, right in zip(jax.tree.leaves(expected), jax.tree.leaves(actual), strict=True)
         )
+
+
+@pytest.mark.parametrize("sampler_kind", ["sequential", "random", "distributed"])
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_resume_batch_offset_preserves_sampler_order(sampler_kind, num_workers):
+    dataset = _IndexDataset(24)
+    baseline = _data_loader.TorchDataLoader(
+        dataset,
+        local_batch_size=3,
+        shuffle=sampler_kind == "random",
+        sampler=_sampler_for(sampler_kind, dataset),
+        num_batches=4,
+        num_workers=num_workers,
+        seed=79,
+        framework="pytorch",
+    )
+    baseline.set_epoch(3)
+    expected = _index_batches(baseline)
+
+    resumed = _data_loader.TorchDataLoader(
+        dataset,
+        local_batch_size=3,
+        shuffle=sampler_kind == "random",
+        sampler=_sampler_for(sampler_kind, dataset),
+        num_batches=2,
+        num_workers=num_workers,
+        seed=79,
+        framework="pytorch",
+    )
+    resumed.set_epoch(3, batch_offset=2)
+
+    assert _index_batches(resumed) == expected[2:]
+
+
+def test_resume_batch_offset_skips_before_multiworker_decode(tmp_path):
+    record_dir = tmp_path / "decoded"
+    record_dir.mkdir()
+    dataset = _RecordingIndexDataset(12, str(record_dir))
+    loader = _data_loader.TorchDataLoader(
+        dataset,
+        local_batch_size=3,
+        num_batches=2,
+        num_workers=2,
+        seed=101,
+        framework="pytorch",
+    )
+    loader.set_epoch(0, batch_offset=2)
+
+    assert _index_batches(loader) == [[6, 7, 8], [9, 10, 11]]
+    assert sorted(int(path.stem) for path in record_dir.glob("*.seen")) == list(range(6, 12))
 
 
 def test_normalize_episode_records_supports_lerobot_v2_and_v3():

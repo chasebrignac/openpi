@@ -934,6 +934,8 @@ class TorchDataLoader:
 
         if len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
+        if sampler is not None and shuffle:
+            raise ValueError("sampler option is mutually exclusive with shuffle")
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
@@ -944,9 +946,9 @@ class TorchDataLoader:
                 jax.sharding.PartitionSpec("B"),
             )
         self._num_batches = num_batches
-        self._sampler = sampler
         self._epoch = 0
         self._seed = seed
+        self._next_batch_offset = 0
 
         mp_context = None
         if num_workers > 0:
@@ -955,17 +957,24 @@ class TorchDataLoader:
         generator = torch.Generator()
         generator.manual_seed(seed)
         self._generator = generator
+        if sampler is None:
+            sampler = (
+                torch.utils.data.RandomSampler(dataset, generator=generator)
+                if shuffle
+                else torch.utils.data.SequentialSampler(dataset)
+            )
+        self._sampler = sampler
+        self._batch_sampler = _BatchOffsetSampler(
+            torch.utils.data.BatchSampler(sampler, batch_size=local_batch_size, drop_last=True)
+        )
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
-            batch_size=local_batch_size,
-            shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
-            sampler=sampler,
+            batch_sampler=self._batch_sampler,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
             persistent_workers=num_workers > 0,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
-            drop_last=True,
             generator=generator,
         )
 
@@ -987,7 +996,14 @@ class TorchDataLoader:
                 "big",
             ) % (2**63 - 1)
             self._generator.manual_seed(epoch_seed)
-            data_iter = iter(self._data_loader)
+            self._batch_sampler.set_batch_offset(self._next_batch_offset)
+            self._next_batch_offset = 0
+            try:
+                data_iter = iter(self._data_loader)
+            finally:
+                # _BatchOffsetSampler snapshots the offset when DataLoader
+                # constructs its sampler iterator, before workers are queued.
+                self._batch_sampler.set_batch_offset(0)
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
                     return
@@ -1008,10 +1024,53 @@ class TorchDataLoader:
             return self._num_batches
         return len(self._data_loader)
 
-    def set_epoch(self, epoch: int) -> None:
+    def set_epoch(self, epoch: int, *, batch_offset: int = 0) -> None:
         if epoch < 0:
             raise ValueError("epoch must be non-negative")
+        if batch_offset < 0 or batch_offset > len(self._batch_sampler):
+            raise ValueError(f"batch_offset must be in [0, {len(self._batch_sampler)}]")
         self._epoch = epoch
+        self._next_batch_offset = batch_offset
+
+
+class _BatchOffsetSampler(torch.utils.data.Sampler[list[int]]):
+    """Skip complete sampler batches before DataLoader dispatches indices to workers."""
+
+    def __init__(self, batch_sampler: torch.utils.data.BatchSampler):
+        self._batch_sampler = batch_sampler
+        self._batch_offset = 0
+
+    def __iter__(self):
+        # Snapshot the offset now, but defer consuming the sampler until
+        # DataLoader asks for its first index batch. This preserves DataLoader's
+        # generator draw for worker base seeds before RandomSampler draws its
+        # permutation, exactly matching an uninterrupted iterator.
+        return _BatchOffsetIterator(iter(self._batch_sampler), self._batch_offset)
+
+    def __len__(self) -> int:
+        # Report the complete epoch length. The one-time resume offset changes
+        # only the first iterator, not the training schedule's epoch geometry.
+        return len(self._batch_sampler)
+
+    def set_batch_offset(self, batch_offset: int) -> None:
+        if batch_offset < 0 or batch_offset > len(self):
+            raise ValueError(f"batch_offset must be in [0, {len(self)}]")
+        self._batch_offset = batch_offset
+
+
+class _BatchOffsetIterator(Iterator[list[int]]):
+    def __init__(self, batch_iterator: Iterator[list[int]], batch_offset: int):
+        self._batch_iterator = batch_iterator
+        self._remaining_offset = batch_offset
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> list[int]:
+        while self._remaining_offset:
+            next(self._batch_iterator)
+            self._remaining_offset -= 1
+        return next(self._batch_iterator)
 
 
 def _collate_fn(items):
@@ -1098,7 +1157,7 @@ class DataLoaderImpl(DataLoader):
     def __len__(self) -> int:
         return len(self._data_loader)
 
-    def set_epoch(self, epoch: int) -> None:
+    def set_epoch(self, epoch: int, *, batch_offset: int = 0) -> None:
         if not hasattr(self._data_loader, "set_epoch"):
             raise TypeError(f"{type(self._data_loader).__name__} does not support epoch control")
-        self._data_loader.set_epoch(epoch)
+        self._data_loader.set_epoch(epoch, batch_offset=batch_offset)
