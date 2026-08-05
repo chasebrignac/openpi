@@ -1180,6 +1180,8 @@ def test_docker_command_is_argv_digest_pinned_and_read_only(tmp_path):
     assert not any(part.endswith("dst=/workspace/openpi/checkpoints") for part in command)
     assert "type=bind,src=/opt/dlami/nvme/output/artifacts,dst=/mnt/openpi/evidence" in command
     assert "PYTHONPATH=/workspace/openpi/src:/workspace/openpi" in command
+    assert "USER=pi05" in command
+    assert "LOGNAME=pi05" in command
     assert "PI05_INPUT_LIBERO=/mnt/openpi/datasets/libero" in command
     assert spec["image"]["uri"] in command
     image_index = command.index(spec["image"]["uri"])
@@ -1230,6 +1232,12 @@ def test_multi_process_torchrun_loopback_contract_is_fail_closed(tmp_path):
     for key in repro_worker.TORCHRUN_LOOPBACK_ENVIRONMENT:
         override = make_resume_spec(tmp_path)
         override["container"]["environment"][key] = "^docker0,lo"
+        with pytest.raises(repro_worker.WorkerError, match="unsafe container environment"):
+            repro_worker.validate_worker_spec(override)
+
+    for key in ("USER", "LOGNAME"):
+        override = make_spec(tmp_path)
+        override["container"]["environment"][key] = "attacker-controlled"
         with pytest.raises(repro_worker.WorkerError, match="unsafe container environment"):
             repro_worker.validate_worker_spec(override)
 

@@ -14,6 +14,7 @@ trainable.
 from __future__ import annotations
 
 from collections.abc import Callable
+import copy
 import dataclasses
 from typing import Any
 
@@ -86,15 +87,15 @@ def _select_prefix_context(
 ) -> SnapFlowPrefixContext:
     """Select a batch subset after the full-batch student query has run.
 
-    Transformers' ``DynamicCache`` performs this selection in place. The
-    caller must therefore finish every full-batch use of ``context`` before
-    calling this helper.
+    Transformers' ``DynamicCache`` performs this selection in place. Clone it
+    first so gradient-checkpoint recomputation can still replay the earlier
+    full-batch student query against the original cache.
     """
 
     if sample_indices.ndim != 1 or sample_indices.dtype != torch.long:
         raise ValueError("sample_indices must be a one-dimensional int64 tensor")
 
-    past_key_values = context.past_key_values
+    past_key_values = copy.deepcopy(context.past_key_values)
     if not hasattr(past_key_values, "batch_select_indices"):
         raise TypeError(
             "SnapFlow consistency-subset execution requires a cache with "

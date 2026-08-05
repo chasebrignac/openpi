@@ -8,6 +8,7 @@ from openpi.models import pi0_config
 from openpi.models_pytorch import snapflow
 from openpi.models_pytorch.snapflow import SnapFlowHyperparameters
 from openpi.models_pytorch.snapflow import SnapFlowPI0Pytorch
+from openpi.models_pytorch.snapflow import SnapFlowPrefixContext
 from openpi.models_pytorch.snapflow import TargetTimeProjection
 from openpi.models_pytorch.snapflow import add_target_time_condition
 from openpi.models_pytorch.snapflow import snapflow_objective
@@ -60,6 +61,30 @@ def test_freeze_vlm_leaves_only_expert_and_projection_trainable():
     assert not any(parameter.requires_grad for parameter in model.paligemma_with_expert.paligemma.parameters())
     assert all(parameter.requires_grad for parameter in model.paligemma_with_expert.gemma_expert.parameters())
     assert all(parameter.requires_grad for parameter in model.target_time_projection.parameters())
+
+
+def test_prefix_subset_does_not_mutate_cache_needed_by_checkpoint_recomputation():
+    class InPlaceCache:
+        def __init__(self, values):
+            self.values = values
+
+        def batch_select_indices(self, indices):
+            self.values = self.values.index_select(0, indices)
+
+    original_values = torch.arange(12).reshape(4, 3)
+    context = SnapFlowPrefixContext(
+        state=torch.arange(8).reshape(4, 2),
+        prefix_pad_masks=torch.ones(4, 3, dtype=torch.bool),
+        past_key_values=InPlaceCache(original_values.clone()),
+    )
+    indices = torch.tensor([1, 3])
+
+    subset = snapflow._select_prefix_context(context, indices)  # noqa: SLF001
+
+    assert torch.equal(context.past_key_values.values, original_values)
+    assert torch.equal(subset.past_key_values.values, original_values.index_select(0, indices))
+    assert torch.equal(subset.state, context.state.index_select(0, indices))
+    assert torch.equal(subset.prefix_pad_masks, context.prefix_pad_masks.index_select(0, indices))
 
 
 def test_two_step_shortcut_uses_local_target_times_and_stop_gradient():

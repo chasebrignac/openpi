@@ -81,7 +81,15 @@ LIBERO_EVALUATOR_ENVIRONMENT = {
     "MUJOCO_EGL_DEVICE_ID": "0",
     "NVIDIA_DRIVER_CAPABILITIES": "compute,utility,graphics",
 }
-WORKER_OWNED_ENVIRONMENT = {"HOME", "PATH", "PYTHONDONTWRITEBYTECODE", "PYTHONPATH", "XDG_CACHE_HOME"}
+WORKER_OWNED_ENVIRONMENT = {
+    "HOME",
+    "LOGNAME",
+    "PATH",
+    "PYTHONDONTWRITEBYTECODE",
+    "PYTHONPATH",
+    "USER",
+    "XDG_CACHE_HOME",
+}
 TORCHRUN_LOOPBACK_ENVIRONMENT = {
     "NCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
@@ -2447,6 +2455,10 @@ def build_docker_command(
         f"type=bind,src={scratch_root / 'cache'},dst=/cache",
         "--env",
         "HOME=/tmp",
+        "--env",
+        "USER=pi05",
+        "--env",
+        "LOGNAME=pi05",
         "--env",
         "XDG_CACHE_HOME=/cache",
         "--env",
