@@ -614,6 +614,18 @@ def build_user_data(plan: LaunchPlan, reservation_id: str) -> str:
         job_section = f"""
 printf '%s' '{command_b64}' | base64 --decode > /opt/pi05/run-command.sh
 chmod 0700 /opt/pi05/run-command.sh
+# Automatic package maintenance can restart systemd, containerd, and the
+# NVIDIA services underneath a healthy multi-hour GPU job.  Quiesce any
+# package job that won the boot race before starting the workload, then mask
+# only the four apt timer/service units for this bounded ephemeral worker.
+systemctl mask --now apt-daily.timer apt-daily-upgrade.timer
+timeout 600 /bin/bash -c 'while systemctl is-active --quiet apt-daily.service || systemctl is-active --quiet apt-daily-upgrade.service; do sleep 2; done'
+systemctl mask apt-daily.service apt-daily-upgrade.service
+systemctl reset-failed apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+for package_unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service; do
+  test "$(systemctl is-enabled "$package_unit" 2>/dev/null || true)" = masked
+  test "$(systemctl is-active "$package_unit" 2>/dev/null || true)" = inactive
+done
 cat > /etc/systemd/system/pi05-job.service <<'PI05_JOB_SERVICE'
 [Unit]
 Description=pi05 reproduction job

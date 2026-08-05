@@ -449,9 +449,14 @@ def test_run_request_is_on_demand_hardened_and_tagged(tmp_path, config, foundati
         assert tags["Workload"] == "export_compile_quantize"
         assert tags["CommandSha256"] == plan.command_sha256
     user_data = arguments[arguments.index("--user-data") + 1]
+    subprocess.run(["bash", "-n"], input=user_data, text=True, check=True)
     assert "pi05-hard-deadline.timer" in user_data
     assert "OnCalendar=2026-08-03 22:00:00 UTC" in user_data
     assert "amazon-ssm-agent.service" in user_data
+    assert "systemctl mask --now apt-daily.timer apt-daily-upgrade.timer" in user_data
+    assert "systemctl mask apt-daily.service apt-daily-upgrade.service" in user_data
+    assert "systemctl reset-failed apt-daily.timer apt-daily-upgrade.timer" in user_data
+    assert "while systemctl is-active --quiet apt-daily.service" in user_data
     assert "After=network-online.target dlami-nvme.service docker.service" in user_data
     assert "KillSignal=SIGTERM" in user_data
     assert (
@@ -487,6 +492,7 @@ def test_empty_workbench_preserves_manual_lifecycle(tmp_path, config, foundation
     user_data = repro_aws_launch.build_user_data(plan, "manual-workbench-preview")
     assert "cat > /etc/systemd/system/pi05-job.service" not in user_data
     assert "ExecStopPost" not in user_data
+    assert "apt-daily.timer" not in user_data
     assert plan.shutdown_behavior == "stop"
 
 
