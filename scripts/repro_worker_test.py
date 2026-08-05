@@ -1711,6 +1711,7 @@ def test_libero_evaluator_identity_requires_dedicated_exact_image_contract(tmp_p
         "ai.openpi.libero-simulator-revision": repro_worker.LIBERO_SIMULATOR_REVISION,
         "ai.openpi.libero-requirements-sha256": repro_worker.LIBERO_REQUIREMENTS_SHA256,
         "ai.openpi.parent-policy-image": spec["image"]["parent_policy_image"],
+        "ai.openpi.onnxruntime-gpu-version": repro_worker.POLICY_ONNXRUNTIME_GPU_VERSION,
     }
     assert repro_worker.validate_image_identity(spec, [spec["image"]["uri"]], labels) == [spec["image"]["uri"]]
 
@@ -1734,6 +1735,14 @@ def test_libero_evaluator_identity_requires_dedicated_exact_image_contract(tmp_p
         wrong = {**labels, label: "wrong"}
         with pytest.raises(repro_worker.WorkerError, match=re.escape(label)):
             repro_worker.validate_image_identity(spec, [spec["image"]["uri"]], wrong)
+
+    wrong_ort = {**labels, "ai.openpi.onnxruntime-gpu-version": "wrong"}
+    with pytest.raises(repro_worker.WorkerError, match="ONNX Runtime"):
+        repro_worker.validate_image_identity(spec, [spec["image"]["uri"]], wrong_ort)
+
+    compiler_claim = {**labels, "ai.openpi.tensorrt-version": "11.0.0.114"}
+    with pytest.raises(repro_worker.WorkerError, match="TensorRT compiler identity"):
+        repro_worker.validate_image_identity(spec, [spec["image"]["uri"]], compiler_claim)
 
 
 def test_tensorrt_libero_identity_includes_combined_parent_compiler_source_and_toolchain(tmp_path):

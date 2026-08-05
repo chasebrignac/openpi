@@ -2301,9 +2301,11 @@ def validate_image_identity(spec: Mapping[str, Any], repo_digests: Any, labels: 
             "ai.openpi.parent-image-purpose",
             "ai.openpi.parent-tensorrt-compiler-image",
             "ai.openpi.parent-tensorrt-compiler-source-revision",
-            *TENSORRT_TOOLCHAIN_LABELS.values(),
+            *(label for key, label in TENSORRT_TOOLCHAIN_LABELS.items() if key != "onnxruntime_gpu_version"),
         }
         if spec["image"]["policy_backend"] == "eager":
+            if labels.get("ai.openpi.onnxruntime-gpu-version") != POLICY_ONNXRUNTIME_GPU_VERSION:
+                raise WorkerError("pulled eager LIBERO evaluator ONNX Runtime label does not match")
             if any(label in labels for label in compiler_identity_labels):
                 raise WorkerError("pulled eager LIBERO evaluator must not claim a TensorRT compiler identity")
         else:
