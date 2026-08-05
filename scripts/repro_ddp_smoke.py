@@ -159,7 +159,6 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         identity = {
             "rank": rank,
             "hostname": socket.gethostname(),
-            "fqdn": socket.getfqdn(),
             "private_ip": args.expected_private_ip,
             "gpu_name": torch.cuda.get_device_name(local_rank),
             "gpu_total_memory": torch.cuda.get_device_properties(local_rank).total_memory,
@@ -285,6 +284,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     "MASTER_ADDR",
                     "MASTER_PORT",
                     "NCCL_SOCKET_IFNAME",
+                    "GLOO_SOCKET_IFNAME",
                     "NCCL_IB_DISABLE",
                     "NCCL_CUMEM_ENABLE",
                     "NCCL_CUMEM_HOST_ENABLE",

@@ -101,6 +101,11 @@ def foundation():
                 {"subnet_id": "subnet-b", "availability_zone": "us-east-2b"},
             ],
             "security_group": {"id": "sg-test", "ingress_rule_count": 0},
+            "distributed_security_group": {
+                "id": "sg-distributed",
+                "ingress_rule_count": 1,
+                "ingress_contract": "self_referencing_tcp_all_ports",
+            },
         },
         "resources": {
             "s3": {"bucket": "pi05-repro-752160877725-us-east-2"},
@@ -178,6 +183,78 @@ def test_rejects_unassigned_instance_and_unpinned_subnet(tmp_path, config, found
             instance_type="g6e.4xlarge",
             instance_count=1,
         )
+
+
+def test_distributed_validation_requires_exactly_two_corrective_g7e_nodes(tmp_path, config, foundation):
+    config_path, foundation_path = write_inputs(tmp_path, config, foundation)
+    inputs = repro_aws_launch.load_static_inputs(
+        config_path,
+        foundation_path,
+        subnet_id=None,
+        category="corrective_run",
+        workload="distributed_validation",
+        instance_type="g7e.2xlarge",
+        instance_count=2,
+    )
+    assert inputs.workload == "distributed_validation"
+    assert inputs.security_group_id == "sg-distributed"
+    assert inputs.security_group_contract == "self_referencing_tcp_all_ports"
+    plan = make_plan(
+        tmp_path,
+        inputs,
+        category="corrective_run",
+        workload="distributed_validation",
+        instance_type="g7e.2xlarge",
+        instance_count=2,
+        max_runtime_hours=1,
+        label="two-node-ddp-smoke",
+        command="python scripts/repro_ddp_smoke.py",
+    )
+    arguments = repro_aws_launch.build_run_instances_arguments(plan, "reservation-ddp")
+    assert arguments[arguments.index("--count") + 1] == "2"
+    interfaces = json.loads(arguments[arguments.index("--network-interfaces") + 1])
+    assert interfaces[0]["Groups"] == ["sg-distributed"]
+
+    for count in (1, 3):
+        with pytest.raises(repro_aws_launch.LaunchError, match="exactly 2 for distributed_validation"):
+            repro_aws_launch.load_static_inputs(
+                config_path,
+                foundation_path,
+                subnet_id=None,
+                category="corrective_run",
+                workload="distributed_validation",
+                instance_type="g7e.2xlarge",
+                instance_count=count,
+            )
+    with pytest.raises(repro_aws_launch.LaunchError, match="must use the corrective_run"):
+        repro_aws_launch.load_static_inputs(
+            config_path,
+            foundation_path,
+            subnet_id=None,
+            category="distributed_validation",
+            instance_type="g7e.2xlarge",
+            instance_count=2,
+        )
+
+
+def test_distributed_validation_requires_pinned_self_only_contract(tmp_path, config, foundation):
+    for missing_or_wrong in (None, {}, {"id": "sg-distributed", "ingress_rule_count": 0}):
+        candidate = json.loads(json.dumps(foundation))
+        if missing_or_wrong is None:
+            candidate["network"].pop("distributed_security_group")
+        else:
+            candidate["network"]["distributed_security_group"] = missing_or_wrong
+        config_path, foundation_path = write_inputs(tmp_path, config, candidate)
+        with pytest.raises(repro_aws_launch.LaunchError, match="self-referencing TCP all-ports"):
+            repro_aws_launch.load_static_inputs(
+                config_path,
+                foundation_path,
+                subnet_id=None,
+                category="corrective_run",
+                workload="distributed_validation",
+                instance_type="g7e.2xlarge",
+                instance_count=2,
+            )
 
 
 def test_shallow_training_rejects_single_gpu_fallback(tmp_path, config, foundation):
@@ -1050,6 +1127,8 @@ class PreflightAws:
         image_virtualization_type="hvm",
         image_root_device_name="/dev/sda1",
         instance_type="g7e.4xlarge",
+        security_group_id="sg-test",
+        ingress_permissions=None,
     ):
         self.account = account
         self.ingress = ingress
@@ -1063,6 +1142,8 @@ class PreflightAws:
         self.image_virtualization_type = image_virtualization_type
         self.image_root_device_name = image_root_device_name
         self.instance_type = instance_type
+        self.security_group_id = security_group_id
+        self.ingress_permissions = ingress_permissions
         self.calls = []
 
     def json(self, arguments):
@@ -1079,9 +1160,13 @@ class PreflightAws:
             ("ec2", "describe-security-groups"): {
                 "SecurityGroups": [
                     {
-                        "GroupId": "sg-test",
+                        "GroupId": self.security_group_id,
                         "VpcId": "vpc-test",
-                        "IpPermissions": [{}] if self.ingress else [],
+                        "IpPermissions": (
+                            self.ingress_permissions
+                            if self.ingress_permissions is not None
+                            else ([{}] if self.ingress else [])
+                        ),
                         "IpPermissionsEgress": [{}],
                     }
                 ]
@@ -1135,6 +1220,82 @@ def test_preflight_rejects_wrong_account_and_live_ingress(tmp_path, config, foun
         "--image-ids",
         BASE_AMI["id"],
     ]
+
+
+def distributed_self_only_permission():
+    return {
+        "IpProtocol": "tcp",
+        "FromPort": 0,
+        "ToPort": 65535,
+        "IpRanges": [],
+        "Ipv6Ranges": [],
+        "PrefixListIds": [],
+        "UserIdGroupPairs": [
+            {
+                "GroupId": "sg-distributed",
+                "UserId": "752160877725",
+            }
+        ],
+    }
+
+
+def test_distributed_preflight_accepts_only_same_group_tcp_ingress(tmp_path, config, foundation):
+    inputs = make_inputs(
+        tmp_path,
+        config,
+        foundation,
+        category="corrective_run",
+        workload="distributed_validation",
+        instance_type="g7e.2xlarge",
+        instance_count=2,
+    )
+    aws = PreflightAws(
+        instance_type="g7e.2xlarge",
+        security_group_id="sg-distributed",
+        ingress_permissions=[distributed_self_only_permission()],
+    )
+    assert repro_aws_launch.verify_live_environment(aws, inputs, "g7e.2xlarge") == "/dev/sda1"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda rule: rule.update(IpProtocol="-1"), "TCP ports"),
+        (lambda rule: rule.update(FromPort=1), "TCP ports"),
+        (lambda rule: rule["IpRanges"].append({"CidrIp": "172.31.0.0/16"}), "non-group source"),
+        (
+            lambda rule: rule["UserIdGroupPairs"][0].update(GroupId="sg-other"),
+            "account-local self reference",
+        ),
+        (
+            lambda rule: rule["UserIdGroupPairs"][0].update(UserId="000000000000"),
+            "account-local self reference",
+        ),
+        (lambda rule: rule.update(UserIdGroupPairs=[]), "exactly one group source"),
+    ],
+)
+def test_distributed_preflight_rejects_broader_or_nonself_ingress(tmp_path, config, foundation, mutate, message):
+    inputs = make_inputs(
+        tmp_path,
+        config,
+        foundation,
+        category="corrective_run",
+        workload="distributed_validation",
+        instance_type="g7e.2xlarge",
+        instance_count=2,
+    )
+    rule = distributed_self_only_permission()
+    mutate(rule)
+    with pytest.raises(repro_aws_launch.LaunchError, match=message):
+        repro_aws_launch.verify_live_environment(
+            PreflightAws(
+                instance_type="g7e.2xlarge",
+                security_group_id="sg-distributed",
+                ingress_permissions=[rule],
+            ),
+            inputs,
+            "g7e.2xlarge",
+        )
 
 
 def test_evaluation_preflight_verifies_exact_ami_identity_and_owner(tmp_path, config, foundation):

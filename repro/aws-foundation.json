@@ -68,6 +68,16 @@
       "arn": "arn:aws:ec2:us-east-2:752160877725:security-group/sg-05e45a674dacd5e01",
       "ingress_rule_count": 0,
       "egress": "all IPv4; required for SSM and artifact endpoints until VPC endpoints exist"
+    },
+    "distributed_security_group": {
+      "name": "pi05-repro-ddp-self-only",
+      "id": "sg-0aaef0a46e1a785ea",
+      "arn": "arn:aws:ec2:us-east-2:752160877725:security-group/sg-0aaef0a46e1a785ea",
+      "ingress_rule_count": 1,
+      "ingress_contract": "self_referencing_tcp_all_ports",
+      "ingress_rule_id": "sgr-046fffa8785d53b28",
+      "egress": "all IPv4; required for SSM, ECR and versioned S3 evidence",
+      "scope": "bounded two-node DDP validation only"
     }
   },
   "resources": {

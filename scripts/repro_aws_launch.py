@@ -46,6 +46,10 @@ UTC = getattr(dt, "UTC", dt.timezone.utc)  # noqa: UP017 -- direct-script compat
 SCHEDULER_ROLE_RE = re.compile(r"^arn:aws:iam::752160877725:role/[A-Za-z0-9+=,.@_/-]{1,512}$")
 DEFAULT_AMI_KEY = "base"
 WORKLOAD_AMI_KEYS = {"evaluation": "evaluation"}
+DEFAULT_SECURITY_GROUP_KEY = "security_group"
+DISTRIBUTED_SECURITY_GROUP_KEY = "distributed_security_group"
+ZERO_INGRESS_CONTRACT = "zero_ingress"
+SELF_REFERENCING_TCP_CONTRACT = "self_referencing_tcp_all_ports"
 
 # A workload may only launch the machines assigned to that stage in the plan.
 # Spend categories are separate: ``corrective_run`` can fund a bounded retry,
@@ -61,6 +65,10 @@ WORKLOAD_MATRIX: dict[str, dict[str, int]] = {
     "snapflow_bc": {"g7e.2xlarge": 2},
     "export_compile_quantize": {"g7e.4xlarge": 1},
     "evaluation": {"g6e.4xlarge": 4},
+    # This is a bounded two-node control-plane/runtime diagnostic.  It is
+    # deliberately available only through the corrective-run budget category
+    # and must launch both nodes in one guarded RunInstances request.
+    "distributed_validation": {"g7e.2xlarge": 2},
 }
 
 # Corrective capacity may narrow a workload's hardware shape when the manual
@@ -172,6 +180,7 @@ class StaticInputs:
     subnet_id: str
     availability_zone: str
     security_group_id: str
+    security_group_contract: str
     instance_profile_name: str
     instance_role_name: str
     artifact_bucket: str
@@ -234,6 +243,8 @@ def resolve_workload(category: str, workload: str | None) -> str:
         raise LaunchError(f"budget category {category} cannot declare workload {workload}")
     if workload not in WORKLOAD_MATRIX:
         raise LaunchError(f"unsupported workload: {workload}")
+    if workload == "distributed_validation" and category != "corrective_run":
+        raise LaunchError("distributed_validation must use the corrective_run budget category")
     return workload
 
 
@@ -250,9 +261,12 @@ def validate_launch_policy(
     maximum = allowed.get(instance_type)
     if maximum is None:
         raise LaunchError(f"{instance_type} is not approved for category {category}")
-    if instance_count != 1:
-        raise LaunchError(f"instance count must be exactly 1 per guarded launch, got {instance_count}")
     resolved_workload = resolve_workload(category, workload)
+    required_count = 2 if resolved_workload == "distributed_validation" else 1
+    if instance_count != required_count:
+        raise LaunchError(
+            f"instance count must be exactly {required_count} for {resolved_workload}, got {instance_count}"
+        )
     workload_maximum = WORKLOAD_MATRIX[resolved_workload].get(instance_type)
     if workload_maximum is None and category == "corrective_run":
         workload_maximum = CORRECTIVE_WORKLOAD_FALLBACKS.get(resolved_workload, {}).get(instance_type)
@@ -373,10 +387,26 @@ def load_static_inputs(
     artifact_bucket = str(resources.get("s3", {}).get("bucket", ""))
     if artifact_bucket != EXPECTED_ARTIFACT_BUCKET:
         raise LaunchError(f"foundation artifact bucket mismatch: {artifact_bucket!r}")
-    security_group = network.get("security_group", {})
+    if resolved_workload == "distributed_validation":
+        security_group_key = DISTRIBUTED_SECURITY_GROUP_KEY
+        security_group_contract = SELF_REFERENCING_TCP_CONTRACT
+    else:
+        security_group_key = DEFAULT_SECURITY_GROUP_KEY
+        security_group_contract = ZERO_INGRESS_CONTRACT
+    security_group = network.get(security_group_key, {})
     ami = _select_pinned_ami(aws, foundation, resolved_workload)
-    if security_group.get("ingress_rule_count") != 0:
-        raise LaunchError("foundation does not assert a zero-ingress security group")
+    if not isinstance(security_group, Mapping):
+        raise LaunchError(f"foundation {security_group_key} must be an object")
+    if security_group_contract == ZERO_INGRESS_CONTRACT:
+        if security_group.get("ingress_rule_count") != 0:
+            raise LaunchError("foundation does not assert a zero-ingress security group")
+    elif (
+        security_group.get("ingress_rule_count") != 1
+        or security_group.get("ingress_contract") != SELF_REFERENCING_TCP_CONTRACT
+    ):
+        raise LaunchError(
+            "foundation does not assert the self-referencing TCP all-ports distributed security-group contract"
+        )
 
     return StaticInputs(
         config=config,
@@ -385,6 +415,7 @@ def load_static_inputs(
         subnet_id=selected_id,
         availability_zone=availability_zone,
         security_group_id=str(security_group.get("id", "")),
+        security_group_contract=security_group_contract,
         instance_profile_name=str(iam.get("instance_profile_name", "")),
         instance_role_name=str(iam.get("role_name", "")),
         artifact_bucket=artifact_bucket,
@@ -397,6 +428,38 @@ def load_static_inputs(
         ami_virtualization_type=str(ami["virtualization_type"]),
         ami_root_device_name=str(ami["root_device_name"]),
     )
+
+
+def _verify_live_security_group_ingress(inputs: StaticInputs, group: Mapping[str, Any]) -> None:
+    permissions = group.get("IpPermissions")
+    if not isinstance(permissions, list):
+        raise LaunchError("pinned security group returned an invalid inbound-rules collection")
+    if inputs.security_group_contract == ZERO_INGRESS_CONTRACT:
+        if permissions:
+            raise LaunchError("pinned security group now has inbound rules; refusing launch")
+        return
+    if inputs.security_group_contract != SELF_REFERENCING_TCP_CONTRACT:
+        raise LaunchError(f"unsupported security-group ingress contract: {inputs.security_group_contract}")
+    if len(permissions) != 1:
+        raise LaunchError("distributed security group must have exactly one inbound rule")
+    permission = permissions[0]
+    if not isinstance(permission, Mapping):
+        raise LaunchError("distributed security group returned an invalid inbound rule")
+    if permission.get("IpProtocol") != "tcp" or permission.get("FromPort") != 0 or permission.get("ToPort") != 65535:
+        raise LaunchError("distributed security group inbound rule must be TCP ports 0-65535")
+    for source_field in ("IpRanges", "Ipv6Ranges", "PrefixListIds"):
+        if permission.get(source_field):
+            raise LaunchError("distributed security group inbound rule contains a non-group source")
+    group_pairs = permission.get("UserIdGroupPairs")
+    if not isinstance(group_pairs, list) or len(group_pairs) != 1:
+        raise LaunchError("distributed security group inbound rule must have exactly one group source")
+    source = group_pairs[0]
+    if not isinstance(source, Mapping) or (
+        source.get("GroupId") != inputs.security_group_id or source.get("UserId") != EXPECTED_ACCOUNT
+    ):
+        raise LaunchError("distributed security group inbound rule is not an account-local self reference")
+    if source.get("VpcPeeringConnectionId") or source.get("PeeringStatus"):
+        raise LaunchError("distributed security group inbound rule must not use a peered group source")
 
 
 def verify_live_environment(aws: AwsCli, inputs: StaticInputs, instance_type: str) -> str:
@@ -420,8 +483,7 @@ def verify_live_environment(aws: AwsCli, inputs: StaticInputs, instance_type: st
         raise LaunchError("AWS returned the wrong security group")
     if group.get("VpcId") != inputs.foundation["network"]["vpc_id"]:
         raise LaunchError("security group VPC differs from the pinned foundation VPC")
-    if group.get("IpPermissions"):
-        raise LaunchError("pinned security group now has inbound rules; refusing launch")
+    _verify_live_security_group_ingress(inputs, group)
     if not group.get("IpPermissionsEgress"):
         raise LaunchError("pinned security group has no egress for SSM")
 
