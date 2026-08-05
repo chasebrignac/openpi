@@ -22,6 +22,7 @@ if __package__:
     from scripts.repro_checkpoint import resolve_checkpoint
     from scripts.repro_checkpoint import resolve_weights_directory
     from scripts.repro_checkpoint import validate_training_checkpoint
+    from scripts.repro_make_action_limits import TRACK_SPECS
     from scripts.repro_make_golden import canonical_sha256
     from scripts.repro_make_golden import config_provenance
     from scripts.repro_make_golden import sha256_file
@@ -31,6 +32,7 @@ else:
     from repro_checkpoint import resolve_checkpoint
     from repro_checkpoint import resolve_weights_directory
     from repro_checkpoint import validate_training_checkpoint
+    from repro_make_action_limits import TRACK_SPECS
     from repro_make_golden import canonical_sha256
     from repro_make_golden import config_provenance
     from repro_make_golden import sha256_file
@@ -207,6 +209,126 @@ SHALLOW_TEACHER_CONFIGS = {
     "pi05_droid_l09_expert_bc_25": "pi05_droid_jointpos",
     "pi05_droid_l09_expert_bc_50": "pi05_droid_jointpos",
 }
+ACTIVE_ACTION_TRACK_BY_CONFIG = {
+    "pi05_libero_l09_distill": "libero",
+    "pi05_libero_l09_snapflow": "libero",
+    "pi05_droid_l09_distill": "droid",
+    "pi05_droid_l09_expert_bc_25": "droid",
+    "pi05_droid_l09_expert_bc_50": "droid",
+    "pi05_droid_l09_snapflow": "droid",
+}
+
+
+def action_dimension_contract(config_name: str, model_action_dimensions: int) -> dict[str, Any]:
+    """Resolve the reviewed robot-action subspace and reject unknown evaluation configs."""
+
+    track = ACTIVE_ACTION_TRACK_BY_CONFIG.get(config_name)
+    if track is None:
+        raise ValueError(f"No reviewed active-action mapping for evaluation config {config_name!r}")
+    spec = TRACK_SPECS.get(track)
+    active_action_dimensions = None if spec is None else spec.get("active_dim")
+    if (
+        not isinstance(model_action_dimensions, int)
+        or isinstance(model_action_dimensions, bool)
+        or model_action_dimensions <= 0
+        or not isinstance(active_action_dimensions, int)
+        or isinstance(active_action_dimensions, bool)
+        or not 0 < active_action_dimensions <= model_action_dimensions
+    ):
+        raise ValueError(
+            "Invalid reviewed active-action contract: "
+            f"config={config_name!r}, track={track!r}, active={active_action_dimensions!r}, "
+            f"model={model_action_dimensions!r}"
+        )
+    return {
+        "track": track,
+        "contract_source": "scripts/repro_make_action_limits.py:TRACK_SPECS",
+        "model_action_dimensions": model_action_dimensions,
+        "evaluated_action_dimensions": active_action_dimensions,
+        "evaluated_dimension_indices": list(range(active_action_dimensions)),
+        "evidence_array_action_dimensions": model_action_dimensions,
+        "full_model_shape_evidence_arrays_preserved": True,
+    }
+
+
+def _active_action_view(
+    array: np.ndarray,
+    *,
+    contract: dict[str, Any],
+    name: str,
+) -> np.ndarray:
+    """Validate a full-shape evidence array and return its reviewed action subspace."""
+
+    array = np.asarray(array)
+    model_action_dimensions = contract["model_action_dimensions"]
+    active_action_dimensions = contract["evaluated_action_dimensions"]
+    if array.ndim != 3 or array.shape[-1] != model_action_dimensions:
+        raise ValueError(
+            f"{name} must have [samples, horizon, {model_action_dimensions}] full-model shape, got {array.shape}"
+        )
+    return array[..., :active_action_dimensions]
+
+
+def compute_active_action_metrics(
+    student: np.ndarray,
+    teacher: np.ndarray,
+    *,
+    ground_truth: np.ndarray,
+    contract: dict[str, Any],
+    normalization_low: float,
+    normalization_high: float,
+) -> dict[str, Any]:
+    """Compute robot-action metrics while retaining full-shape arrays outside this helper."""
+
+    student_active = _active_action_view(student, contract=contract, name="student")
+    teacher_active = _active_action_view(teacher, contract=contract, name="teacher")
+    ground_truth_active = _active_action_view(ground_truth, contract=contract, name="ground_truth")
+    active_action_dimensions = contract["evaluated_action_dimensions"]
+    return compute_metrics(
+        student_active,
+        teacher_active,
+        ground_truth=ground_truth_active,
+        action_low=np.full(active_action_dimensions, normalization_low, dtype=np.float32),
+        action_high=np.full(active_action_dimensions, normalization_high, dtype=np.float32),
+    )
+
+
+def compute_active_velocity_metrics(
+    student_velocity: np.ndarray,
+    teacher_velocity: np.ndarray,
+    *,
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Compute Shallow velocity metrics over the commands emitted to the robot."""
+
+    return compute_metrics(
+        _active_action_view(student_velocity, contract=contract, name="student_velocity"),
+        _active_action_view(teacher_velocity, contract=contract, name="teacher_velocity"),
+    )
+
+
+def compute_snapflow_metrics(
+    student: np.ndarray,
+    teacher: np.ndarray,
+    naive_one_step: np.ndarray,
+    *,
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Compute the SnapFlow error-gap gate only over commands emitted to the robot."""
+
+    student_active = _active_action_view(student, contract=contract, name="student")
+    teacher_active = _active_action_view(teacher, contract=contract, name="teacher")
+    naive_active = _active_action_view(naive_one_step, contract=contract, name="naive_one_step")
+    student_mse = float(np.mean(np.square(student_active.astype(np.float64) - teacher_active)))
+    naive_mse = float(np.mean(np.square(naive_active.astype(np.float64) - teacher_active)))
+    gap_fraction = gap_closed_fraction(student_mse=student_mse, naive_mse=naive_mse)
+    return {
+        "one_step_mse_to_ten_step_teacher": student_mse,
+        "naive_one_step_mse_to_ten_step_teacher": naive_mse,
+        "offline_error_gap_closed_fraction": gap_fraction,
+        "offline_error_gap_gate_minimum": 0.70,
+        "offline_error_gap_gate_pass": gap_fraction >= 0.70,
+    }
 
 
 def canonical_snapflow_golden_config(student_config_name: str, teacher_config_name: str) -> str:
@@ -328,6 +450,14 @@ def evaluate(
         teacher_config.action_dim,
     ):
         raise ValueError("Student and teacher action shapes differ")
+    action_dimensions = action_dimension_contract(student_config_name, student_config.action_dim)
+    evidence_array_keys = ["student", "teacher", "ground_truth"]
+    evidence_array_keys.append("naive_one_step" if is_snapflow else "student_velocity")
+    if not is_snapflow:
+        evidence_array_keys.append("teacher_velocity")
+    action_dimensions["full_model_shape_evidence_arrays"] = {
+        key: {"action_dimensions": student_config.action_dim} for key in evidence_array_keys
+    }
 
     snapflow_teacher_training = None
     student_initialization_lineage = None
@@ -421,14 +551,13 @@ def evaluate(
 
     student_array = np.concatenate(student_chunks)
     teacher_array = np.concatenate(teacher_chunks)
-    action_low_array = np.full(student_array.shape[-1], normalization_low, dtype=np.float32)
-    action_high_array = np.full(student_array.shape[-1], normalization_high, dtype=np.float32)
-    action_metrics = compute_metrics(
+    action_metrics = compute_active_action_metrics(
         student_array,
         teacher_array,
         ground_truth=arrays["actions"],
-        action_low=action_low_array,
-        action_high=action_high_array,
+        contract=action_dimensions,
+        normalization_low=normalization_low,
+        normalization_high=normalization_high,
     )
     student_weights = student_checkpoint / "model.safetensors"
     teacher_weights = teacher_checkpoint / "model.safetensors"
@@ -477,6 +606,7 @@ def evaluate(
             "source_config": metadata["resolved_config"],
         },
         "normalization_range": {"low": normalization_low, "high": normalization_high},
+        "action_dimension_contract": action_dimensions,
     }
     report: dict[str, Any] = {
         "schema_version": 1,
@@ -494,27 +624,21 @@ def evaluate(
     output_arrays = {"student": student_array, "teacher": teacher_array, "ground_truth": arrays["actions"]}
     if is_snapflow:
         naive_array = np.concatenate(naive_chunks)
-        naive_mse = float(np.mean(np.square(naive_array.astype(np.float64) - teacher_array)))
-        student_mse = action_metrics["kd_mse"]
-        report["snapflow_metrics"] = {
-            "one_step_mse_to_ten_step_teacher": student_mse,
-            "naive_one_step_mse_to_ten_step_teacher": naive_mse,
-            "offline_error_gap_closed_fraction": gap_closed_fraction(
-                student_mse=student_mse,
-                naive_mse=naive_mse,
-            ),
-            "offline_error_gap_gate_minimum": 0.70,
-            "offline_error_gap_gate_pass": gap_closed_fraction(
-                student_mse=student_mse,
-                naive_mse=naive_mse,
-            )
-            >= 0.70,
-        }
+        report["snapflow_metrics"] = compute_snapflow_metrics(
+            student_array,
+            teacher_array,
+            naive_array,
+            contract=action_dimensions,
+        )
         output_arrays["naive_one_step"] = naive_array
     else:
         student_velocity_array = np.concatenate(student_velocities)
         teacher_velocity_array = np.concatenate(teacher_velocities)
-        report["velocity_metrics"] = compute_metrics(student_velocity_array, teacher_velocity_array)
+        report["velocity_metrics"] = compute_active_velocity_metrics(
+            student_velocity_array,
+            teacher_velocity_array,
+            contract=action_dimensions,
+        )
         output_arrays["student_velocity"] = student_velocity_array
         output_arrays["teacher_velocity"] = teacher_velocity_array
     return report, output_arrays

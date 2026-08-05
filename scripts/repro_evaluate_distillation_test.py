@@ -33,6 +33,90 @@ def test_gap_closed_fraction_rejects_negative_errors():
         repro_evaluate_distillation.gap_closed_fraction(student_mse=-1.0, naive_mse=1.0)
 
 
+def test_droid_action_dimension_contract_evaluates_first_eight_of_32():
+    contract = repro_evaluate_distillation.action_dimension_contract("pi05_droid_l09_snapflow", 32)
+
+    assert contract["track"] == "droid"
+    assert contract["model_action_dimensions"] == 32
+    assert contract["evaluated_action_dimensions"] == 8
+    assert contract["evaluated_dimension_indices"] == list(range(8))
+    assert contract["evidence_array_action_dimensions"] == 32
+
+
+def test_libero_action_dimension_contract_evaluates_first_seven_of_32():
+    contract = repro_evaluate_distillation.action_dimension_contract("pi05_libero_l09_distill", 32)
+
+    assert contract["track"] == "libero"
+    assert contract["evaluated_action_dimensions"] == 7
+    assert contract["evaluated_dimension_indices"] == list(range(7))
+
+
+def test_action_dimension_contract_fails_closed_for_unreviewed_mapping():
+    with pytest.raises(ValueError, match="No reviewed active-action mapping"):
+        repro_evaluate_distillation.action_dimension_contract("pi05_unreviewed_l09_snapflow", 32)
+
+
+def test_action_and_snapflow_metrics_ignore_padded_dimensions():
+    contract = repro_evaluate_distillation.action_dimension_contract("pi05_droid_l09_snapflow", 32)
+    teacher = np.zeros((2, 3, 32), dtype=np.float32)
+    student = np.ones_like(teacher)
+    naive = np.full_like(teacher, 2.0)
+    ground_truth = np.zeros_like(teacher)
+    student[..., 8:] = 1_000.0
+    naive[..., 8:] = -2_000.0
+    ground_truth[..., 8:] = 3_000.0
+
+    action_metrics = repro_evaluate_distillation.compute_active_action_metrics(
+        student,
+        teacher,
+        ground_truth=ground_truth,
+        contract=contract,
+        normalization_low=-1.0,
+        normalization_high=1.0,
+    )
+    snapflow_metrics = repro_evaluate_distillation.compute_snapflow_metrics(
+        student,
+        teacher,
+        naive,
+        contract=contract,
+    )
+
+    assert action_metrics["joints"] == 8
+    assert action_metrics["kd_mse"] == pytest.approx(1.0)
+    assert action_metrics["ground_truth_mse"] == pytest.approx(1.0)
+    assert snapflow_metrics["one_step_mse_to_ten_step_teacher"] == pytest.approx(1.0)
+    assert snapflow_metrics["naive_one_step_mse_to_ten_step_teacher"] == pytest.approx(4.0)
+    assert snapflow_metrics["offline_error_gap_closed_fraction"] == pytest.approx(0.75)
+    assert snapflow_metrics["offline_error_gap_gate_pass"] is True
+    assert student.shape == teacher.shape == naive.shape == ground_truth.shape == (2, 3, 32)
+
+
+def test_velocity_metrics_ignore_droid_padding_and_require_full_model_shape():
+    contract = repro_evaluate_distillation.action_dimension_contract("pi05_droid_l09_distill", 32)
+    teacher_velocity = np.zeros((2, 3, 32), dtype=np.float32)
+    student_velocity = np.ones_like(teacher_velocity)
+    student_velocity[..., 8:] = 1_000.0
+
+    metrics = repro_evaluate_distillation.compute_active_velocity_metrics(
+        student_velocity,
+        teacher_velocity,
+        contract=contract,
+    )
+
+    assert contract["evaluated_action_dimensions"] == 8
+    assert metrics["joints"] == 8
+    assert metrics["kd_mse"] == pytest.approx(1.0)
+    assert metrics["action_chunk_rmse"] == pytest.approx(1.0)
+    assert student_velocity.shape == teacher_velocity.shape == (2, 3, 32)
+
+    with pytest.raises(ValueError, match="full-model shape"):
+        repro_evaluate_distillation.compute_active_velocity_metrics(
+            student_velocity[..., :8],
+            teacher_velocity[..., :8],
+            contract=contract,
+        )
+
+
 def golden_metadata(run_id: str = "run-001"):
     student = repro_make_golden.config_provenance(training_config.get_config("pi05_libero_l09_distill"))
     return {
