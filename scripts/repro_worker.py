@@ -474,6 +474,14 @@ SHALLOW_RESUME_ALLOWED_OPTIONS = {
     "--save-interval",
     "--seed",
 }
+LIBERO_G7E48_8GPU_LOCAL_PROCESSES = 8
+LIBERO_G7E48_8GPU_GLOBAL_MICROBATCH = 8
+LIBERO_G7E48_8GPU_GRADIENT_ACCUMULATION = 8
+LIBERO_G7E48_8GPU_SCRATCH_DEVICES = 4
+LIBERO_G7E48_8GPU_ALLOWED_OPTIONS = {
+    "--batch-size",
+    "--gradient-accumulation-steps",
+}
 SNAPFLOW_ALLOWED_OPTIONS = {
     "--batch-size",
     "--checkpoint-base-dir",
@@ -540,12 +548,13 @@ def validate_shallow_resume_training_contract(
 ) -> None:
     """Keep every Shallow resume on the reviewed checkpoint ladder.
 
-    The single-GPU corrective path is intentionally narrower than an ordinary
-    two-process Shallow worker. Its argv is matched byte-for-byte after
-    substituting the already validated config, experiment, seed, and target
-    step. DROID keeps disabled W&B from its accepted 2k checkpoint but drops
-    the diagnostic ``--num-workers 0`` override so the reviewed config's four
-    deterministic loader workers can overlap real-video decoding.
+    The single-GPU corrective path and the LIBERO 20k->30k eight-rank path are
+    intentionally narrower than an ordinary two-process Shallow worker. Their
+    argv is matched byte-for-byte after substituting the already validated
+    config, experiment, seed, and target step. DROID keeps disabled W&B from
+    its accepted 2k checkpoint but drops the diagnostic ``--num-workers 0``
+    override so the reviewed config's four deterministic loader workers can
+    overlap real-video decoding.
     """
 
     context = "Shallow resume training command"
@@ -555,6 +564,7 @@ def validate_shallow_resume_training_contract(
         raise WorkerError(f"{context} must follow the reviewed 2k->5k->10k->20k->30k ladder")
 
     train_index = command.index("scripts/train_pytorch.py")
+    processes = _torchrun_processes_per_node(command)
     training_arguments = command[train_index + 2 :]
     equals_options = [value for value in training_arguments if value.startswith("-") and "=" in value]
     if equals_options:
@@ -565,12 +575,15 @@ def validate_shallow_resume_training_contract(
     ]
     if negated_options:
         raise WorkerError(f"{context} forbids negated recipe options: {negated_options}")
+    allowed_options = SHALLOW_RESUME_ALLOWED_OPTIONS
+    if processes == LIBERO_G7E48_8GPU_LOCAL_PROCESSES:
+        allowed_options = allowed_options | LIBERO_G7E48_8GPU_ALLOWED_OPTIONS
     unreviewed_options = [
-        value for value in training_arguments if value.startswith("-") and value not in SHALLOW_RESUME_ALLOWED_OPTIONS
+        value for value in training_arguments if value.startswith("-") and value not in allowed_options
     ]
     if unreviewed_options:
         raise WorkerError(f"{context} forbids unreviewed options: {unreviewed_options}")
-    for option in SHALLOW_RESUME_ALLOWED_OPTIONS:
+    for option in allowed_options:
         maximum = 1
         if command.count(option) > maximum:
             raise WorkerError(f"{context} must not repeat {option}")
@@ -580,10 +593,44 @@ def validate_shallow_resume_training_contract(
     if "--log-interval" in command and _single_command_option(command, "--log-interval", context) != "10":
         raise WorkerError(f"{context} --log-interval override must be exactly 10")
 
-    processes = _torchrun_processes_per_node(command)
     if processes is not None:
-        if processes != 2:
-            raise WorkerError(f"{context} torchrun path requires exactly two local processes")
+        if processes == 2:
+            return
+        if processes != LIBERO_G7E48_8GPU_LOCAL_PROCESSES:
+            raise WorkerError(f"{context} torchrun path requires exactly two or eight local processes")
+        if training_config != "pi05_libero_l09_distill" or (source_step, target_step) != (20_000, 30_000):
+            raise WorkerError(f"{context} eight-rank path is restricted to LIBERO 20k->30k")
+        experiment = _single_command_option(command, "--exp-name", context)
+        seed = _single_command_option(command, "--seed", context)
+        expected = [
+            "torchrun",
+            "--standalone",
+            "--nnodes=1",
+            "--nproc-per-node=8",
+            "scripts/train_pytorch.py",
+            training_config,
+            "--exp-name",
+            experiment,
+            "--checkpoint-base-dir",
+            str(CONTAINER_INPUT_ROOT / "runs"),
+            "--resume",
+            "--seed",
+            seed,
+            "--num-train-steps",
+            str(target_step),
+            "--save-interval",
+            "5000",
+            "--log-interval",
+            "10",
+            "--batch-size",
+            str(LIBERO_G7E48_8GPU_GLOBAL_MICROBATCH),
+            "--gradient-accumulation-steps",
+            str(LIBERO_G7E48_8GPU_GRADIENT_ACCUMULATION),
+        ]
+        if list(command) != expected:
+            raise WorkerError(f"{context} eight-rank path must use the exact reviewed same-node argv")
+        if LIBERO_G7E48_8GPU_GLOBAL_MICROBATCH // processes != 1:
+            raise WorkerError(f"{context} eight-rank path must retain local microbatch one")
         return
 
     experiment = _single_command_option(command, "--exp-name", context)
@@ -610,6 +657,30 @@ def validate_shallow_resume_training_contract(
         expected.append("--no-wandb-enabled")
     if list(command) != expected:
         raise WorkerError(f"{context} single-GPU corrective path must use the exact reviewed direct-Python argv")
+
+
+def _uses_libero_g7e48_8gpu_resume(command: Sequence[str]) -> bool:
+    """Identify the narrow eight-rank profile after worker-spec validation."""
+
+    processes = _torchrun_processes_per_node(command)
+    train_positions = [index for index, value in enumerate(command) if value == "scripts/train_pytorch.py"]
+    return (
+        processes == LIBERO_G7E48_8GPU_LOCAL_PROCESSES
+        and len(train_positions) == 1
+        and train_positions[0] + 1 < len(command)
+        and command[train_positions[0] + 1] == "pi05_libero_l09_distill"
+        and command.count("--resume") == 1
+    )
+
+
+def _validate_resume_execution_recipe(spec: Mapping[str, Any], contract: Mapping[str, Any]) -> None:
+    """Bind restored optimizer state to the declared distributed recipe."""
+
+    if _uses_libero_g7e48_8gpu_resume(spec["container"]["command"]) and (
+        contract.get("batch_size") != LIBERO_G7E48_8GPU_GLOBAL_MICROBATCH
+        or contract.get("gradient_accumulation_steps") != LIBERO_G7E48_8GPU_GRADIENT_ACCUMULATION
+    ):
+        raise WorkerError("eight-rank LIBERO resume source must preserve global microbatch 8 and accumulation 8")
 
 
 def validate_fresh_snapflow_training_contract(
@@ -1171,6 +1242,7 @@ def validate_worker_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
     validate_compiled_pipeline_command(spec)
 
     resume = spec.get("resume_checkpoint")
+    eight_gpu_libero_resume = False
     if resume is None and train_positions and training_config.endswith("_snapflow"):
         validate_fresh_snapflow_training_contract(command, training_config, artifacts, expected_outputs)
     if resume is not None:
@@ -1240,8 +1312,11 @@ def validate_worker_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
                 source_step=source_step,
                 target_step=target_step,
             )
+            eight_gpu_libero_resume = _uses_libero_g7e48_8gpu_resume(command)
     elif train_positions and ("--resume" in command or "--overwrite" in command):
         raise WorkerError("fresh training worker commands forbid --resume and --overwrite; use a unique experiment ID")
+    if _torchrun_processes_per_node(command) == LIBERO_G7E48_8GPU_LOCAL_PROCESSES and not eight_gpu_libero_resume:
+        raise WorkerError("eight-rank training is restricted to the reviewed LIBERO 20k->30k resume")
 
     timing = spec.get("timing")
     if not isinstance(timing, dict):
@@ -1271,6 +1346,10 @@ def validate_worker_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
         raise WorkerError("scratch.expected_count must be a positive integer")
     if not isinstance(ordinal, int) or isinstance(ordinal, bool) or not 0 <= ordinal < expected_count:
         raise WorkerError("scratch.ordinal must select exactly one expected device")
+    if eight_gpu_libero_resume and (expected_count != LIBERO_G7E48_8GPU_SCRATCH_DEVICES or ordinal != 0):
+        raise WorkerError("eight-rank LIBERO resume requires exactly four local NVMe devices and scratch ordinal zero")
+    if not eight_gpu_libero_resume and expected_count == LIBERO_G7E48_8GPU_SCRATCH_DEVICES:
+        raise WorkerError("four-device scratch is reserved for the reviewed eight-rank LIBERO resume")
     return spec
 
 
@@ -1357,6 +1436,18 @@ def validate_launch_metadata(
         }
         if any(metadata.get(key) != value for key, value in expected_launch.items()):
             raise WorkerError("single-GPU Shallow resume requires corrective_run/shallow_training on g7e.4xlarge")
+    elif (
+        spec.get("resume_checkpoint") is not None
+        and isinstance(command, list)
+        and _uses_libero_g7e48_8gpu_resume(command)
+    ):
+        expected_launch = {
+            "category": "shallow_training",
+            "workload": "shallow_training",
+            "instance_type": "g7e.48xlarge",
+        }
+        if any(metadata.get(key) != value for key, value in expected_launch.items()):
+            raise WorkerError("eight-rank LIBERO resume requires shallow_training on one g7e.48xlarge")
     reservation_id = metadata.get("reservation_id")
     if not isinstance(reservation_id, str) or UUID_RE.fullmatch(reservation_id) is None:
         raise WorkerError("launch metadata has no valid cost-ledger reservation ID")
@@ -2194,6 +2285,7 @@ def restore_resume_checkpoint(spec: Mapping[str, Any], root: pathlib.Path) -> di
         or state.get("state_files") != ["metadata.pt", "model.safetensors", "optimizer.pt", "wandb_id.txt"]
     ):
         raise WorkerError("resume-state.json does not match the declared config, experiment, step, or state files")
+    _validate_resume_execution_recipe(spec, contract)
     if contract["config_name"].startswith(("pi05_libero_", "pi05_droid_")):
         revision = dataset.get("revision")
         normalization_sha256 = dataset.get("normalization_sha256")

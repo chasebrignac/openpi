@@ -83,3 +83,65 @@ def test_renderer_rejects_checkpoint_name_collision():
             target_step=10_000,
             run_id="libero-shallow-long-10000",
         )
+
+
+def test_renderer_builds_only_the_exact_libero_g7e48_eight_gpu_resume():
+    rendered = repro_render_shallow_resume.render_shallow_resume_spec(
+        base_spec("libero"),
+        accepted_checkpoint("libero", 20_000),
+        controller_source(),
+        track="libero",
+        target_step=30_000,
+        run_id="libero-shallow-eight-gpu-30000",
+        execution_profile=repro_render_shallow_resume.EXECUTION_PROFILE_LIBERO_G7E48_8GPU,
+    )
+
+    assert rendered["container"]["command"] == [
+        "torchrun",
+        "--standalone",
+        "--nnodes=1",
+        "--nproc-per-node=8",
+        "scripts/train_pytorch.py",
+        "pi05_libero_l09_distill",
+        "--exp-name",
+        "libero-shallow",
+        "--checkpoint-base-dir",
+        "/mnt/openpi/runs",
+        "--resume",
+        "--seed",
+        "42",
+        "--num-train-steps",
+        "30000",
+        "--save-interval",
+        "5000",
+        "--log-interval",
+        "10",
+        "--batch-size",
+        "8",
+        "--gradient-accumulation-steps",
+        "8",
+    ]
+    assert rendered["scratch"]["expected_count"] == 4
+    assert rendered["scratch"]["ordinal"] == 0
+    assert rendered["resume_checkpoint"]["target"] == ("pi05_libero_l09_distill/libero-shallow/20000")
+    assert rendered["expected_outputs"][0]["publish_destination"] == ("pi05_libero_l09_distill/libero-shallow/30000")
+
+
+@pytest.mark.parametrize(
+    ("track", "source_step", "target_step"),
+    [
+        ("libero", 10_000, 20_000),
+        ("droid", 20_000, 30_000),
+    ],
+)
+def test_renderer_rejects_any_other_eight_gpu_transition(track, source_step, target_step):
+    with pytest.raises(repro_render_shallow_resume.RenderError, match="restricted to the LIBERO 20k->30k"):
+        repro_render_shallow_resume.render_shallow_resume_spec(
+            base_spec(track),
+            accepted_checkpoint(track, source_step),
+            controller_source(),
+            track=track,
+            target_step=target_step,
+            run_id=f"{track}-shallow-eight-gpu-{target_step}",
+            execution_profile=repro_render_shallow_resume.EXECUTION_PROFILE_LIBERO_G7E48_8GPU,
+        )

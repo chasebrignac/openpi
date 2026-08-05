@@ -195,6 +195,30 @@ def make_single_gpu_shallow_resume_spec(
     return spec
 
 
+def make_eight_gpu_libero_resume_spec(tmp_path: pathlib.Path) -> dict:
+    spec = make_single_gpu_shallow_resume_spec(
+        tmp_path,
+        source_step=20_000,
+        target_step=30_000,
+        track="libero",
+    )
+    command = spec["container"]["command"]
+    spec["container"]["command"] = [
+        "torchrun",
+        "--standalone",
+        "--nnodes=1",
+        "--nproc-per-node=8",
+        *command[1:],
+        "--batch-size",
+        "8",
+        "--gradient-accumulation-steps",
+        "8",
+    ]
+    spec["scratch"]["expected_count"] = 4
+    spec["scratch"]["ordinal"] = 0
+    return spec
+
+
 def make_snapflow_spec(tmp_path: pathlib.Path, *, diagnostic: bool = False) -> dict:
     spec = make_spec(tmp_path)
     source = {
@@ -854,6 +878,44 @@ def test_instance_store_selection_proves_non_root_model_count_and_serial():
         )
 
 
+def test_four_device_g7e48_scratch_selection_counts_all_nvme_and_uses_ordinal_zero():
+    document = lsblk_fixture(second_instance_store=True)
+    for index, serial in ((3, "AWS-local-c"), (4, "AWS-local-d")):
+        document["blockdevices"].append(
+            {
+                "name": f"nvme{index}n1",
+                "kname": f"nvme{index}n1",
+                "path": f"/dev/nvme{index}n1",
+                "type": "disk",
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "serial": serial,
+                "fstype": None,
+                "label": None,
+                "mountpoints": [None],
+            }
+        )
+
+    selected = repro_worker.select_instance_store_device(
+        document,
+        "/dev/nvme0n1p1",
+        expected_count=4,
+        ordinal=0,
+    )
+    assert selected == repro_worker.ScratchSelection(
+        path="/dev/nvme1n1",
+        serial="AWS-local-a",
+        reuse=False,
+    )
+
+    with pytest.raises(repro_worker.WorkerError, match=r"expected exactly 4.*found 3"):
+        repro_worker.select_instance_store_device(
+            {"blockdevices": document["blockdevices"][:-1]},
+            "/dev/nvme0n1p1",
+            expected_count=4,
+            ordinal=0,
+        )
+
+
 def test_owned_ext4_can_be_reused_but_unknown_filesystem_fails_closed():
     selected = repro_worker.select_instance_store_device(
         lsblk_fixture(scratch_fstype="ext4", scratch_label="PI05_SCRATCH"),
@@ -1400,6 +1462,88 @@ def test_single_gpu_droid_shallow_resume_restores_reviewed_parallel_loader(tmp_p
         repro_worker.validate_worker_spec(serialized_loader)
 
 
+def test_eight_gpu_libero_resume_binds_topology_recipe_and_four_nvme_devices(tmp_path):
+    validated = repro_worker.validate_worker_spec(make_eight_gpu_libero_resume_spec(tmp_path))
+    command = validated["container"]["command"]
+
+    assert command[:5] == [
+        "torchrun",
+        "--standalone",
+        "--nnodes=1",
+        "--nproc-per-node=8",
+        "scripts/train_pytorch.py",
+    ]
+    assert command[command.index("--batch-size") + 1] == "8"
+    assert command[command.index("--gradient-accumulation-steps") + 1] == "8"
+    assert 8 // 8 == 1
+    assert validated["scratch"]["expected_count"] == 4
+    assert validated["scratch"]["ordinal"] == 0
+
+    docker_command = repro_worker.build_docker_command(
+        validated,
+        tmp_path / "source",
+        tmp_path / "scratch",
+    )
+    assert "NCCL_SOCKET_IFNAME=lo" in docker_command
+    assert "NCCL_CUMEM_ENABLE=0" in docker_command
+    assert docker_command[docker_command.index("--network") + 1] == "none"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda command: command.__setitem__(3, "--nproc-per-node=4"), "forbids unreviewed options"),
+        (lambda command: command.__setitem__(2, "--nnodes=2"), "exact reviewed same-node argv"),
+        (
+            lambda command: command.__setitem__(command.index("--batch-size") + 1, "16"),
+            "exact reviewed same-node argv",
+        ),
+        (
+            lambda command: command.__setitem__(command.index("--gradient-accumulation-steps") + 1, "4"),
+            "exact reviewed same-node argv",
+        ),
+    ],
+)
+def test_eight_gpu_libero_resume_rejects_topology_or_recipe_drift(tmp_path, mutation, message):
+    spec = make_eight_gpu_libero_resume_spec(tmp_path)
+    mutation(spec["container"]["command"])
+    with pytest.raises(repro_worker.WorkerError, match=message):
+        repro_worker.validate_worker_spec(spec)
+
+
+def test_eight_gpu_libero_resume_rejects_wrong_ladder_track_and_scratch_shape(tmp_path):
+    wrong_source = make_eight_gpu_libero_resume_spec(tmp_path)
+    wrong_source["resume_checkpoint"]["target"] = "pi05_libero_l09_distill/libero-shallow/10000"
+    wrong_source["artifacts"][1]["destination"] = wrong_source["resume_checkpoint"]["target"]
+    target_index = wrong_source["container"]["command"].index("--num-train-steps") + 1
+    wrong_source["container"]["command"][target_index] = "20000"
+    wrong_source["expected_outputs"][0]["path"] = "checkpoints/pi05_libero_l09_distill/libero-shallow/20000"
+    wrong_source["expected_outputs"][0]["publish_destination"] = "pi05_libero_l09_distill/libero-shallow/20000"
+    with pytest.raises(repro_worker.WorkerError, match="eight-rank path is restricted to LIBERO 20k->30k"):
+        repro_worker.validate_worker_spec(wrong_source)
+
+    wrong_track = make_eight_gpu_libero_resume_spec(tmp_path)
+    config_index = wrong_track["container"]["command"].index("pi05_libero_l09_distill")
+    wrong_track["container"]["command"][config_index] = "pi05_droid_l09_distill"
+    with pytest.raises(repro_worker.WorkerError, match="requires LeRobot v3"):
+        repro_worker.validate_worker_spec(wrong_track)
+
+    wrong_count = make_eight_gpu_libero_resume_spec(tmp_path)
+    wrong_count["scratch"]["expected_count"] = 1
+    with pytest.raises(repro_worker.WorkerError, match="exactly four local NVMe"):
+        repro_worker.validate_worker_spec(wrong_count)
+
+    wrong_ordinal = make_eight_gpu_libero_resume_spec(tmp_path)
+    wrong_ordinal["scratch"]["ordinal"] = 1
+    with pytest.raises(repro_worker.WorkerError, match="scratch ordinal zero"):
+        repro_worker.validate_worker_spec(wrong_ordinal)
+
+    unrelated_four_devices = make_spec(tmp_path)
+    unrelated_four_devices["scratch"]["expected_count"] = 4
+    with pytest.raises(repro_worker.WorkerError, match="reserved for the reviewed eight-rank"):
+        repro_worker.validate_worker_spec(unrelated_four_devices)
+
+
 def test_single_gpu_shallow_resume_requires_corrective_g7e_launch_metadata(tmp_path):
     now = dt.datetime.now(dt.UTC)
     metadata = {
@@ -1418,8 +1562,39 @@ def test_single_gpu_shallow_resume_requires_corrective_g7e_launch_metadata(tmp_p
             ("instance_type", "g7e.12xlarge"),
         ):
             wrong = {**metadata, field: value}
-            with pytest.raises(repro_worker.WorkerError, match="corrective_run/shallow_training on g7e.4xlarge"):
+            with pytest.raises(repro_worker.WorkerError, match=r"corrective_run/shallow_training on g7e\.4xlarge"):
                 repro_worker.validate_launch_metadata(spec, wrong, now=now)
+
+
+def test_eight_gpu_libero_resume_requires_ordinary_g7e48_launch_metadata(tmp_path):
+    now = dt.datetime.now(dt.UTC)
+    metadata = {
+        **make_launch_metadata((now + dt.timedelta(hours=12)).isoformat()),
+        "category": "shallow_training",
+        "workload": "shallow_training",
+        "instance_type": "g7e.48xlarge",
+    }
+    spec = repro_worker.validate_worker_spec(make_eight_gpu_libero_resume_spec(tmp_path))
+    repro_worker.validate_launch_metadata(spec, metadata, now=now)
+
+    for field, value in (
+        ("category", "corrective_run"),
+        ("workload", "evaluation"),
+        ("instance_type", "g7e.12xlarge"),
+    ):
+        wrong = {**metadata, field: value}
+        with pytest.raises(repro_worker.WorkerError, match=r"on one g7e\.48xlarge"):
+            repro_worker.validate_launch_metadata(spec, wrong, now=now)
+
+
+def test_eight_gpu_libero_resume_restored_state_preserves_global_recipe(tmp_path):
+    spec = repro_worker.validate_worker_spec(make_eight_gpu_libero_resume_spec(tmp_path))
+    contract = {"batch_size": 8, "gradient_accumulation_steps": 8}
+    repro_worker._validate_resume_execution_recipe(spec, contract)  # noqa: SLF001
+
+    for key, value in (("batch_size", 16), ("gradient_accumulation_steps", 4)):
+        with pytest.raises(repro_worker.WorkerError, match="global microbatch 8 and accumulation 8"):
+            repro_worker._validate_resume_execution_recipe(spec, {**contract, key: value})  # noqa: SLF001
 
 
 def test_fresh_snapflow_contract_binds_accepted_source_recipe_and_output(tmp_path):

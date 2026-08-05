@@ -56,12 +56,12 @@ SELF_REFERENCING_TCP_CONTRACT = "self_referencing_tcp_all_ports"
 # but it may change hardware only through an explicit fallback below.
 WORKLOAD_MATRIX: dict[str, dict[str, int]] = {
     "workbench_setup": {"g6e.4xlarge": 1},
-    # Every documented Shallow command is one-node, two-process DDP.  Keep the
-    # launch guard aligned with that contract: g7e.4xlarge has only one GPU and
-    # this launcher does not implement a multi-node rendezvous.  A separately
-    # budgeted single-process fallback is admitted below only as a corrective
-    # run after a failed two-GPU runtime gate.
-    "shallow_training": {"g7e.12xlarge": 1},
+    # Ordinary Shallow work is one-node DDP.  The g7e.48xlarge admission is a
+    # narrow same-node eight-rank path; the worker independently binds it to
+    # the LIBERO 20k->30k resume contract before training can start.  A
+    # separately budgeted single-process fallback is admitted below only as a
+    # corrective run after a failed multi-GPU runtime gate.
+    "shallow_training": {"g7e.12xlarge": 1, "g7e.48xlarge": 1},
     "snapflow_bc": {"g7e.2xlarge": 2},
     "export_compile_quantize": {"g7e.4xlarge": 1},
     "evaluation": {"g6e.4xlarge": 4},

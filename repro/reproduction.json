@@ -26,7 +26,11 @@
         "hourly_usd": 3.99816,
         "purpose": "export/compile/latency and corrective single-GPU Shallow"
       },
-      "g7e.12xlarge": {"hourly_usd": 8.28608, "purpose": "two-GPU Shallow training"}
+      "g7e.12xlarge": {"hourly_usd": 8.28608, "purpose": "two-GPU Shallow training"},
+      "g7e.48xlarge": {
+        "hourly_usd": 33.14432,
+        "purpose": "guarded eight-GPU LIBERO Shallow 20k-to-30k continuation"
+      }
     },
     "base_ami": {
       "id": "ami-01901bc01d5d9bb55",

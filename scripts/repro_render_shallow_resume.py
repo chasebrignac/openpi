@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the next one-GPU Shallow checkpoint-ladder worker."""
+"""Render the next fail-closed Shallow checkpoint-ladder worker."""
 
 from __future__ import annotations
 
@@ -31,6 +31,12 @@ TRACKS: dict[str, dict[str, str]] = {
     },
 }
 TRANSITIONS = {(2_000, 5_000), (5_000, 10_000), (10_000, 20_000), (20_000, 30_000)}
+EXECUTION_PROFILE_SINGLE_GPU = "single-gpu"
+EXECUTION_PROFILE_LIBERO_G7E48_8GPU = "libero-g7e48-8gpu"
+EXECUTION_PROFILES = {
+    EXECUTION_PROFILE_SINGLE_GPU,
+    EXECUTION_PROFILE_LIBERO_G7E48_8GPU,
+}
 
 
 class RenderError(ValueError):
@@ -67,11 +73,14 @@ def render_shallow_resume_spec(
     track: str,
     target_step: int,
     run_id: str,
+    execution_profile: str = EXECUTION_PROFILE_SINGLE_GPU,
 ) -> dict[str, Any]:
-    """Build and validate one exact direct-Python Shallow continuation."""
+    """Build and validate one exact Shallow continuation."""
 
     if track not in TRACKS:
         raise RenderError(f"unsupported track: {track!r}")
+    if execution_profile not in EXECUTION_PROFILES:
+        raise RenderError(f"unsupported execution profile: {execution_profile!r}")
     if not run_id or "/" in run_id:
         raise RenderError("run ID must be one non-empty path component")
     track_config = TRACKS[track]
@@ -79,6 +88,9 @@ def render_shallow_resume_spec(
     experiment, source_step = _source_identity(accepted, track_config["config"])
     if (source_step, target_step) not in TRANSITIONS:
         raise RenderError("Shallow continuation must follow 2k->5k->10k->20k->30k")
+    eight_gpu_libero = execution_profile == EXECUTION_PROFILE_LIBERO_G7E48_8GPU
+    if eight_gpu_libero and (track, source_step, target_step) != ("libero", 20_000, 30_000):
+        raise RenderError("eight-GPU Shallow is restricted to the LIBERO 20k->30k continuation")
 
     base = copy.deepcopy(dict(base_spec))
     artifacts = base.get("artifacts")
@@ -96,24 +108,34 @@ def render_shallow_resume_spec(
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise RenderError("base spec must contain a non-negative integer seed")
     config = track_config["config"]
-    command = [
-        "python",
-        "scripts/train_pytorch.py",
-        config,
-        "--exp-name",
-        experiment,
-        "--checkpoint-base-dir",
-        "/mnt/openpi/runs",
-        "--resume",
-        "--seed",
-        str(seed),
-        "--num-train-steps",
-        str(target_step),
-        "--save-interval",
-        "5000",
-        "--log-interval",
-        "10",
-    ]
+    command = []
+    if eight_gpu_libero:
+        command.extend(["torchrun", "--standalone", "--nnodes=1", "--nproc-per-node=8"])
+    else:
+        command.append("python")
+    command.extend(
+        [
+            "scripts/train_pytorch.py",
+            config,
+            "--exp-name",
+            experiment,
+            "--checkpoint-base-dir",
+            "/mnt/openpi/runs",
+            "--resume",
+            "--seed",
+            str(seed),
+            "--num-train-steps",
+            str(target_step),
+            "--save-interval",
+            "5000",
+            "--log-interval",
+            "10",
+        ]
+    )
+    if eight_gpu_libero:
+        # These explicit values bind eight ranks to local microbatch one while
+        # preserving the accepted optimizer batch of 8 * 8 = 64.
+        command.extend(["--batch-size", "8", "--gradient-accumulation-steps", "8"])
     if track == "droid":
         command.append("--no-wandb-enabled")
 
@@ -126,6 +148,12 @@ def render_shallow_resume_spec(
         "environment": {"WANDB_MODE": "offline"},
         "shm_size_gib": 64,
     }
+    if eight_gpu_libero:
+        scratch = base.get("scratch")
+        if not isinstance(scratch, dict):
+            raise RenderError("eight-GPU base spec must contain a scratch contract")
+        scratch["expected_count"] = 4
+        scratch["ordinal"] = 0
     publish_destination = f"{config}/{experiment}/{target_step}"
     base["expected_outputs"] = [
         {
@@ -155,6 +183,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--controller-source", type=pathlib.Path, required=True)
     parser.add_argument("--target-step", type=int, required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--execution-profile",
+        choices=sorted(EXECUTION_PROFILES),
+        default=EXECUTION_PROFILE_SINGLE_GPU,
+    )
     parser.add_argument("--output", type=pathlib.Path, required=True)
     return parser.parse_args()
 
@@ -170,6 +203,7 @@ def main() -> int:
         track=args.track,
         target_step=args.target_step,
         run_id=args.run_id,
+        execution_profile=args.execution_profile,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(rendered, indent=2, sort_keys=True) + "\n")

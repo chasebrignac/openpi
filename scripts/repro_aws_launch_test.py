@@ -77,6 +77,7 @@ def config():
                 "g7e.2xlarge": {"hourly_usd": 3.36312},
                 "g7e.4xlarge": {"hourly_usd": 3.99816},
                 "g7e.12xlarge": {"hourly_usd": 8.28608},
+                "g7e.48xlarge": {"hourly_usd": 33.14432},
             },
             "base_ami": dict(BASE_AMI),
             "evaluation_ami": dict(EVALUATION_AMI),
@@ -257,7 +258,7 @@ def test_distributed_validation_requires_pinned_self_only_contract(tmp_path, con
             )
 
 
-def test_shallow_training_rejects_single_gpu_fallback(tmp_path, config, foundation):
+def test_shallow_training_admits_one_guarded_g7e48_and_rejects_single_gpu_fallback(tmp_path, config, foundation):
     config_path, foundation_path = write_inputs(tmp_path, config, foundation)
 
     primary = repro_aws_launch.load_static_inputs(
@@ -270,6 +271,26 @@ def test_shallow_training_rejects_single_gpu_fallback(tmp_path, config, foundati
     )
     assert primary.availability_zone == "us-east-2a"
 
+    eight_gpu = repro_aws_launch.load_static_inputs(
+        config_path,
+        foundation_path,
+        subnet_id=None,
+        category="shallow_training",
+        instance_type="g7e.48xlarge",
+        instance_count=1,
+    )
+    assert eight_gpu.workload == "shallow_training"
+
+    with pytest.raises(repro_aws_launch.LaunchError, match="instance count must be exactly 1"):
+        repro_aws_launch.load_static_inputs(
+            config_path,
+            foundation_path,
+            subnet_id=None,
+            category="shallow_training",
+            instance_type="g7e.48xlarge",
+            instance_count=2,
+        )
+
     with pytest.raises(repro_aws_launch.LaunchError, match="not approved for category shallow_training"):
         repro_aws_launch.load_static_inputs(
             config_path,
@@ -277,6 +298,17 @@ def test_shallow_training_rejects_single_gpu_fallback(tmp_path, config, foundati
             subnet_id=None,
             category="shallow_training",
             instance_type="g7e.4xlarge",
+            instance_count=1,
+        )
+
+    with pytest.raises(repro_aws_launch.LaunchError, match="not approved for category corrective_run"):
+        repro_aws_launch.load_static_inputs(
+            config_path,
+            foundation_path,
+            subnet_id=None,
+            category="corrective_run",
+            workload="shallow_training",
+            instance_type="g7e.48xlarge",
             instance_count=1,
         )
 
@@ -482,6 +514,30 @@ def test_plan_reserves_boot_margin_and_worker_must_have_command(tmp_path, config
             instance_type="g7e.12xlarge",
             retain_after_command=True,
         )
+
+
+def test_g7e48_shallow_plan_uses_live_ohio_on_demand_rate(tmp_path, config, foundation):
+    inputs = make_inputs(
+        tmp_path,
+        config,
+        foundation,
+        category="shallow_training",
+        workload="shallow_training",
+        instance_type="g7e.48xlarge",
+    )
+    plan = make_plan(
+        tmp_path,
+        inputs,
+        category="shallow_training",
+        workload="shallow_training",
+        instance_type="g7e.48xlarge",
+        max_runtime_hours=12,
+    )
+
+    assert plan.instance_count == 1
+    assert plan.reserved_hours == 12.25
+    assert plan.projected_usd == pytest.approx(406.01792)
+    assert plan.shutdown_behavior == "terminate"
 
 
 def test_run_request_is_on_demand_hardened_and_tagged(tmp_path, config, foundation):
