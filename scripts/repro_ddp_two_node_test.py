@@ -126,6 +126,7 @@ def test_network_interface_uses_route_device(monkeypatch) -> None:
 
 def test_docker_base_binds_two_node_tcp_and_disables_unneeded_transports(tmp_path: pathlib.Path) -> None:
     values = _values()
+    identity = repro_ddp_two_node._prepare_nonroot_identity(tmp_path / "contract")
     command = repro_ddp_two_node._docker_base(
         values,
         name="test",
@@ -135,6 +136,7 @@ def test_docker_base_binds_two_node_tcp_and_disables_unneeded_transports(tmp_pat
         output_dir=tmp_path,
         smoke_path=tmp_path / "smoke.py",
         port=29400,
+        nonroot_identity=identity,
     )
     rendered = " ".join(command)
     assert "--network host" in rendered
@@ -144,3 +146,88 @@ def test_docker_base_binds_two_node_tcp_and_disables_unneeded_transports(tmp_pat
     assert "NCCL_CUMEM_ENABLE=0" in rendered
     assert "--nnodes=2" in rendered
     assert "--node-rank=1" in rendered
+    assert "--user 1000:1000" in rendered
+    assert "dst=/etc/passwd,readonly" in rendered
+    assert "dst=/etc/group,readonly" in rendered
+    assert "HOME=/output/.home" in rendered
+    assert "USER=pi05" in rendered
+    assert "TORCHINDUCTOR_CACHE_DIR=/output/.torchinductor-cache" in rendered
+
+
+def test_nonroot_identity_is_minimal_readonly_and_create_once(tmp_path: pathlib.Path) -> None:
+    root = tmp_path / "attempt"
+    identity = repro_ddp_two_node._prepare_nonroot_identity(root)
+    assert identity["passwd_path"].read_text() == repro_ddp_two_node.PASSWD_CONTENT
+    assert identity["group_path"].read_text() == repro_ddp_two_node.GROUP_CONTENT
+    assert identity["passwd_path"].stat().st_mode & 0o777 == 0o444
+    assert identity["group_path"].stat().st_mode & 0o777 == 0o444
+    repro_ddp_two_node._validate_nonroot_identity(identity)
+    with pytest.raises(FileExistsError):
+        repro_ddp_two_node._prepare_nonroot_identity(root)
+
+
+def test_identity_preflight_is_networkless_and_checks_pwd_contract(tmp_path: pathlib.Path) -> None:
+    values = _values()
+    identity = repro_ddp_two_node._prepare_nonroot_identity(tmp_path / "contract")
+    command = repro_ddp_two_node._identity_preflight_command(
+        values,
+        name="identity-preflight",
+        output_dir=tmp_path / "output",
+        nonroot_identity=identity,
+    )
+    rendered = " ".join(command)
+    assert "--network none" in rendered
+    assert "--gpus" not in command
+    assert "getent passwd 1000" in rendered
+    assert "pwd.getpwuid(os.getuid())" in rendered
+    assert "nonroot_identity_preflight=PASS" in rendered
+
+
+def test_openpi_debug_uses_compatible_full_width_vlm_and_disables_compile(tmp_path, monkeypatch) -> None:
+    values = _values()
+    identity = repro_ddp_two_node._prepare_nonroot_identity(tmp_path / "contract")
+    captured = {}
+
+    def fake_run(arguments, name, log_path, timeout_seconds):
+        captured.update(arguments=arguments, name=name, log_path=log_path, timeout_seconds=timeout_seconds)
+        return 1.25
+
+    monkeypatch.setattr(repro_ddp_two_node, "_run_container", fake_run)
+    seconds = repro_ddp_two_node._run_openpi_debug(
+        values,
+        rank=0,
+        master_ip="172.31.1.11",
+        interface="ens5",
+        actual_root=tmp_path / "actual",
+        smoke_path=tmp_path / "smoke.py",
+        port=30475,
+        nonroot_identity=identity,
+        experiment="debug-compatible",
+        container_label="compatible-a1",
+        log_path=tmp_path / "openpi.log",
+    )
+
+    assert seconds == 1.25
+    command = captured["arguments"]
+    assert command[command.index("--model.paligemma-variant") + 1] == "gemma_2b"
+    assert command[command.index("--model.action-expert-variant") + 1] == "dummy"
+    assert command[command.index("--model.pytorch-compile-mode") + 1] == "None"
+
+
+@pytest.mark.parametrize("attempt", ["x", "UPPER-a1", "bad_underscore", "-starts-hyphen", "ends-"])
+def test_recovery_attempt_rejects_unsafe_slugs(attempt: str) -> None:
+    with pytest.raises(repro_ddp_two_node.ValidationError):
+        repro_ddp_two_node._validate_recovery_attempt(attempt)
+
+
+def test_recovery_prefix_and_port_are_fresh_and_deterministic() -> None:
+    attempt = "uid1000-a1"
+    run_id = _values()["PI05_RUN_ID"]
+    assert repro_ddp_two_node._validate_recovery_attempt(attempt) == attempt
+    port = repro_ddp_two_node._recovery_port(attempt)
+    assert 29500 <= port <= 30499
+    assert port not in {29400, 29401}
+    assert port == repro_ddp_two_node._recovery_port(attempt)
+    assert repro_ddp_two_node._recovery_prefix(run_id, attempt) == (
+        f"diagnostics/two-node-ddp/{run_id}/recoveries/{attempt}"
+    )
